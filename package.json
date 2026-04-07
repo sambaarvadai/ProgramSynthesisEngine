@@ -1,0 +1,32 @@
+{
+  "name": "program-execution-engine",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "cli": "tsx src/cli.ts",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d",
+    "db:psql": "docker exec -it pee_postgres psql -U pee_user -d pee_dev",
+    "db:verify": "tsx src/scripts/verify-db.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.0",
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.4.1",
+    "pg": "^8.20.0",
+    "uuid": "^9.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/dotenv": "^6.1.1",
+    "@types/pg": "^8.20.0",
+    "@types/uuid": "^9.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

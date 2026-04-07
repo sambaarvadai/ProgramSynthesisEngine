@@ -1,0 +1,106 @@
+What's Well Covered
+Data retrieval        → QueryNode (full SQL expressibility)
+Row transformation    → TransformNode (map, filter, rename, cast, dedup)
+AI enrichment         → LLMNode (per-row or per-batch)
+External calls        → HttpNode (defined, not fully implemented)
+Control flow          → ConditionalNode, LoopNode, MergeNode, ParallelNode
+Pipeline composition  → SubPipelineNode (defined, not implemented)
+What's Missing or Incomplete
+1. Data Sources Beyond Postgres
+Right now the only way to get data into a pipeline is via QueryNode hitting Postgres. Real workflows pull from many sources:
+FileNode             → read CSV, JSON, Parquet, Excel from disk or S3
+StreamNode           → consume from Kafka, Redis pub/sub, WebSocket
+EmailNode            → read from Gmail/Outlook inbox (you're connected to Gmail)
+CalendarNode         → read events from Google Calendar (you're connected)
+WebScrapeNode        → fetch and parse a webpage
+DatabaseNode         → generic SQL for MySQL, SQLite, other Postgres instances
+2. Data Sinks — Writing Output Somewhere
+Everything outputs to the CLI right now. Real pipelines write results:
+WriteFileNode        → write CSV, JSON, Parquet to disk or S3
+WebhookNode          → POST results to a URL
+EmailSendNode        → send results as email (you have Gmail MCP)
+DatabaseWriteNode    → INSERT/UPDATE/UPSERT back to Postgres
+SlackNode            → post to a Slack channel
+NotificationNode     → generic push notification
+3. Data Quality and Validation
+No node type handles data quality today:
+ValidateNode         → assert schema constraints, throw on violations
+DeduplicateNode      → cross-batch dedup (TransformNode.dedup is in-memory only)
+FillNullNode         → fill missing values with defaults or computed values
+SampleNode           → random sample N rows or X% of dataset
+AssertNode           → pipeline-level assertions, fail if condition not met
+ProfilingNode        → compute statistics (min, max, mean, nulls, cardinality)
+4. Data Reshaping
+TransformNode handles row-level operations but not structural reshaping:
+PivotNode            → rows to columns (status → pending_count, completed_count)
+UnpivotNode          → columns to rows (wide → long format)
+FlattenNode          → unnest arrays or JSON fields into rows
+AggregateNode        → group-by outside of SQL (post-fetch aggregation)
+WindowNode           → rolling averages, rank, lag/lead over sorted rows
+5. Control Flow Gaps
+SwitchNode           → multi-way conditional (like switch/case, not just if/else)
+                       "route by segment: enterprise→A, smb→B, startup→C"
+TryCatchNode         → catch errors from a sub-pipeline, run recovery branch
+RetryNode            → retry a failing sub-pipeline N times with backoff
+WaitNode             → sleep for duration or until a condition is true
+ThrottleNode         → rate limit execution (max N rows/sec to downstream)
+BatchNode            → collect N rows then emit as single batch
+6. ML and Vector Operations
+Given your PTM research background these are natural extensions:
+EmbedNode            → embed text fields into vectors (via Voyage/OpenAI)
+VectorSearchNode     → similarity search against ChromaDB/pgvector
+ClassifyNode         → run a classification model on rows
+ScoreNode            → apply a scoring function (sigmoid, softmax, custom)
+ClusterNode          → k-means or similar clustering on row vectors
+7. Time and Scheduling
+No temporal awareness in the engine today:
+ScheduleNode         → run pipeline on cron schedule
+WindowTimeNode       → filter/group by time windows (last 7 days, this month)
+WatermarkNode        → track pipeline last-run watermark for incremental loads
+8. Human-in-the-Loop
+The confirmation step exists in CLI but not as a first-class node:
+ApprovalNode         → pause execution, wait for human confirmation
+                       "before sending 500 emails, show preview and wait"
+ReviewNode           → surface N samples for human inspection mid-pipeline
+FeedbackNode         → collect human rating/correction, feed back to LLM
+9. Observability and Side Effects
+LogNode              → emit structured log events mid-pipeline
+MetricsNode          → record a metric value (Prometheus, StatsD)
+AuditNode            → write immutable audit trail per row
+CacheNode            → cache output by input hash, skip if cache hit
+CheckpointNode       → save intermediate results to resume from on failure
+
+
+1. HttpNode — call external APIs inside pipelines
+   → enrich customer data from Clearbit, send Slack alerts, post to webhooks
+   → straightforward to build given the existing node pattern
+
+2. Pipeline persistence (SQLite)
+   → save named pipelines, rerun without replanning
+   → "save this as 'weekly revenue report'" → reruns with npm run cli weekly
+
+3. Session context / memory
+   → "show me the same report but for last month"
+   → pronoun resolution across turns in the cli
+
+4. SubPipelineNode
+   → compose pipelines from other pipelines
+   → build a library of reusable pipeline components
+
+5. Streaming output
+   → yield rows as they arrive rather than collecting everything
+   → essential for large datasets and long-running LLM enrichments
+
+6. Physical operator improvements
+   → push ORDER BY into Postgres scan (huge latency win for large tables)
+   → hash join spill to disk for large joins
+   
+7. REST API layer
+   → POST /pipeline/plan, POST /pipeline/execute
+   → exposes the engine over HTTP
+   → lets other tools (dashboards, Slack bots) drive it
+
+8. Visualization layer (what you mentioned early on)
+   → render PipelineGraph as interactive canvas
+   → edit nodes, reconnect edges, re-execute
+   → the graph JSON is already fully serializable
