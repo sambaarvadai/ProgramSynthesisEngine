@@ -46,6 +46,11 @@ export class FilterOperator extends BasePhysicalOperator {
     // Keep pulling batches until we accumulate `size` passing rows
     // or input is exhausted
     while (this.currentBatch.length < size && !this.inputExhausted) {
+      // Check if input is exhausted before pulling batch
+      if (this.opts.input.state !== 'open') {
+        this.inputExhausted = true;
+        break;
+      }
       const inputBatch = await this.opts.input.nextBatch(size);
       
       if (inputBatch.rows.length === 0) {
@@ -58,7 +63,9 @@ export class FilterOperator extends BasePhysicalOperator {
         this.cachedSchema = inputBatch.schema;
       }
 
-      // Evaluate predicate for each row
+      
+      // Evaluate filter for each row
+      let passedCount = 0;
       for (const row of inputBatch.rows) {
         try {
           const result = this.opts.evaluator.evaluate(
@@ -70,6 +77,7 @@ export class FilterOperator extends BasePhysicalOperator {
           // Keep row if result is true
           if (result === true) {
             this.currentBatch.push(row);
+            passedCount++;
             
             // Stop as soon as we have `size` passing rows
             if (this.currentBatch.length >= size) {

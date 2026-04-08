@@ -4,7 +4,9 @@
 import type { SchedulerConfig, ExecutionState, NodeExecutionState, SchedulerEvent, ExecutionResult } from './types.js';
 import type { PipelineGraph, NodeId, PipelineNode } from '../core/graph/index.js';
 import type { ExecutionContext } from '../core/context/execution-context.js';
-import type { Value, RowSet, Row } from '../core/types/value.js';
+import type { DataValue, DataValueKind } from '../core/types/data-value.js';
+import { tabular, record, scalar, collection, void_, isCollection, isVoid } from '../core/types/data-value.js';
+import type { RowSet, Row } from '../core/types/value.js';
 import type { NodeDefinition } from '../core/registry/node-registry.js';
 import { validateGraph, topologicalSort, getNodeInputs, getOutgoingDataEdges, getOutgoingControlEdges, getIncomingDataEdges, isControlPathActive, shouldSkipNode, activateEdge, deactivateEdge, getNodesOnInactiveBranches } from './graph-utils.js';
 import { forkStateForIteration, toIterableArray, updateAccumulator, initAccumulator, getSubgraphOutput } from './loop-helpers.js';
@@ -57,7 +59,7 @@ function markNodeRunning(state: ExecutionState, nodeId: NodeId): void {
   }
 }
 
-function markNodeCompleted(state: ExecutionState, nodeId: NodeId, output: Value): void {
+function markNodeCompleted(state: ExecutionState, nodeId: NodeId, output: DataValue): void {
   const nodeState = state.nodeStates.get(nodeId);
   if (nodeState) {
     nodeState.status = 'completed';
@@ -83,6 +85,51 @@ function markNodeSkipped(state: ExecutionState, nodeId: NodeId, reason: string):
   }
 }
 
+/**
+ * Wraps a legacy Value in DataValue if not already wrapped.
+ * Compatibility shim for nodes that return Value instead of DataValue.
+ */
+function wrapLegacyValue(v: unknown): DataValue {
+  // Already DataValue
+  if (v && typeof v === 'object' && 'kind' in v) {
+    const kind = (v as any).kind;
+    if (['tabular', 'record', 'scalar', 'collection', 'void'].includes(kind)) {
+      return v as DataValue;
+    }
+  }
+
+  // RowSet (has rows and schema)
+  if (v && typeof v === 'object' && !Array.isArray(v) && 'rows' in v && 'schema' in v) {
+    const rowSet = v as RowSet;
+    return tabular(rowSet, rowSet.schema);
+  }
+
+  // Scalar
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || v === null) {
+    return scalar(v, { kind: v === null ? 'null' : typeof v as 'string' | 'number' | 'boolean' });
+  }
+
+  // Array → collection
+  if (Array.isArray(v)) {
+    return collection(v.map(wrapLegacyValue), 'any' as DataValueKind);
+  }
+
+  // Plain Record → record
+  if (v && typeof v === 'object' && !Array.isArray(v)) {
+    const schema = {
+      columns: Object.keys(v).map(name => ({
+        name,
+        type: { kind: 'any' as const } as import('../core/types/engine-type.js').EngineType,
+        nullable: true
+      }))
+    };
+    return record(v as import('../core/types/value.js').Row, schema);
+  }
+
+  // undefined/null → void
+  return void_;
+}
+
 async function executeWithRetry(
   node: PipelineNode,
   def: NodeDefinition<any, any, any>,
@@ -90,7 +137,7 @@ async function executeWithRetry(
   ctx: ExecutionContext,
   config: SchedulerConfig,
   state: ExecutionState
-): Promise<Value> {
+): Promise<DataValue> {
   const maxRetries = node.errorPolicy.maxRetries || 0;
   const retryDelayMs = node.errorPolicy.retryDelayMs || 1000;
   let lastError: Error | undefined;
@@ -98,7 +145,9 @@ async function executeWithRetry(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await def.execute(node.payload, inputs, ctx);
+      const result = await def.execute(node.payload, inputs, ctx);
+      // Wrap legacy Value outputs in DataValue for backward compatibility
+      return wrapLegacyValue(result);
     } catch (error) {
       lastError = error as Error;
       // Increment retry count
@@ -272,11 +321,45 @@ export class Scheduler {
     }
 
     // 5. Collect outputs
-    const outputs = new Map<string, Value>();
-    for (const exitNodeId of graph.exitNodes) {
-      const exitState = state.nodeStates.get(exitNodeId);
-      if (exitState?.output !== undefined) {
-        outputs.set(exitNodeId, exitState.output);
+    const outputs = new Map<string, DataValue>();
+    const outputNode = graph.nodes.get('_output');
+    const outputNodeExecuted = outputNode && state.nodeStates.get('_output')?.status === 'completed';
+
+    // Check if _output node has actual data
+    let outputNodeHasData = false;
+    if (outputNodeExecuted) {
+      const outputState = state.nodeStates.get('_output');
+      outputNodeHasData = outputState?.output !== undefined && 
+                         outputState.output.kind !== 'void';
+    }
+
+    // If _output node was executed and has data, collect its output
+    if (outputNodeExecuted && outputNodeHasData) {
+      const outputState = state.nodeStates.get('_output');
+      if (outputState?.output !== undefined) {
+        outputs.set('_output', outputState.output);
+      }
+    } else {
+      // Otherwise, collect from all exit nodes (including _output if it exists but has no data)
+      for (const exitNodeId of graph.exitNodes) {
+        const exitState = state.nodeStates.get(exitNodeId);
+                if (exitState?.output !== undefined) {
+          outputs.set(exitNodeId, exitState.output);
+        }
+      }
+      
+      // Special case: if _output node exists but wasn't executed, collect from its inputs
+      if (outputNode && outputNode.kind === 'output') {
+        const incomingEdges = getIncomingDataEdges(graph, '_output');
+        for (const edge of incomingEdges) {
+          const sourceState = state.nodeStates.get(edge.from);
+          if (sourceState?.output !== undefined) {
+            // Use the edge's outputKey if specified, otherwise use 'result'
+            const outputKey = (outputNode.payload as any)?.outputKey ?? 'result';
+            outputs.set(outputKey, sourceState.output);
+            break; // Only take the first input
+          }
+        }
       }
     }
 
@@ -378,22 +461,36 @@ export class Scheduler {
       const inputs = getNodeInputs(nodeId, graph, state);
       const payload = node.payload as any;
       
-      // Calculate timeout for this node
-      const remaining = budgetRemaining(state.ctx.budget);
-      const timeoutMs = Math.min(remaining.timeMs, 30000); // Cap at 30s per node
+      // Collect additional fields from previous transform steps
+      const additionalFields = this.collectAdditionalFields(nodeId, graph, state);
+      
+      // Create execution context
+      const ctx: ExecutionContext = {
+        executionId: state.ctx.executionId,
+        pipelineId: state.ctx.pipelineId || '',
+        sessionId: state.ctx.sessionId || '',
+        trace: state.ctx.trace,
+        budget: state.ctx.budget,
+        scope: { id: 'query', kind: 'global', bindings: new Map(), parent: null },
+        nodeOutputs: new Map(),
+        params: {},
+      };
       
       // QueryNode doesn't use input, but we pass it for consistency
-      const result = await executeWithTimeout(
-        this.config.queryExecutor.execute(payload.intent, state.ctx),
-        timeoutMs,
+      const queryResult = await executeWithTimeout(
+        this.config.queryExecutor.execute(payload.intent, state.ctx, additionalFields),
+        30000, // 30 second timeout
         nodeId
       );
       
-      markNodeCompleted(state, nodeId, result);
+      // Wrap QueryResult as DataValue
+      const wrappedResult: DataValue = wrapLegacyValue(queryResult);
+      
+      markNodeCompleted(state, nodeId, wrappedResult);
       this.emit({
         kind: 'node_complete',
         nodeId,
-        output: result,
+        output: wrappedResult,
         timestamp: Date.now()
       });
       return;
@@ -483,7 +580,7 @@ export class Scheduler {
     startNodeId: NodeId,
     graph: PipelineGraph,
     state: ExecutionState,
-    input?: Value
+    input?: DataValue
   ): Promise<void> {
     // Set input for start node if provided
     if (input !== undefined) {
@@ -559,8 +656,6 @@ export class Scheduler {
     // Start from loop's outgoing data edge targets
     const startEdges = getOutgoingDataEdges(graph, loopNodeId);
     for (const edge of startEdges) {
-      // Skip if target is an exit node of the graph
-      if (graph.exitNodes.includes(edge.to)) continue;
       queue.push(edge.to);
     }
 
@@ -575,9 +670,6 @@ export class Scheduler {
       // (i.e., from a node not in visited and not the loopNodeId)
       const outEdges = getOutgoingDataEdges(graph, nodeId);
       for (const edge of outEdges) {
-        // Skip graph.exitNodes - never include exit nodes in body
-        if (graph.exitNodes.includes(edge.to)) continue;
-
         const targetIncomingEdges = getIncomingDataEdges(graph, edge.to);
         const hasExternalIncoming = targetIncomingEdges.some(
           e => e.from !== loopNodeId && !visited.has(e.from) && !queue.includes(e.from)
@@ -606,24 +698,33 @@ export class Scheduler {
     const inputs = getNodeInputs(nodeId, graph, state);
     const input = inputs['input'];
 
+    
     // Extract current row context for predicate evaluation
-    // If input is a RowSet with one row, use that row
-    // If input is a single Row (Record), use it directly
+    // Input is now a DataValue - extract the row data
     let currentRow: Row | undefined = undefined;
-    if (input && typeof input === 'object' && !Array.isArray(input)) {
-      if ('rows' in input && 'schema' in input) {
-        // It's a RowSet — use first row as predicate context
-        const rs = input as RowSet;
-        currentRow = rs.rows.length > 0 ? rs.rows[0] : undefined;
-      } else {
-        // It's a plain Record — use directly as row
-        currentRow = input as Row;
+    if (input && typeof input === 'object' && 'kind' in input) {
+      const dv = input as DataValue;
+      if (dv.kind === 'tabular') {
+        // Use first row as predicate context
+        currentRow = dv.data.rows.length > 0 ? dv.data.rows[0] : undefined;
+      } else if (dv.kind === 'record') {
+        // Use record data directly
+        currentRow = dv.data;
+      } else if (dv.kind === 'scalar') {
+        // Wrap scalar in a row
+        currentRow = { value: dv.data };
       }
+    } else if (input && typeof input === 'object' && !Array.isArray(input)) {
+      // Legacy: plain Row object
+      currentRow = input as Row;
     }
 
     // 2. Get the node definition and execute predicate with row context
     const payload = node.payload as any;
     const result = this.config.evaluator.evaluate(payload.predicate, state.ctx.scope, currentRow);
+    
+    // Debug: Log conditional evaluation
+    console.log(`Conditional ${nodeId}: predicate=${JSON.stringify(payload.predicate)} result=${result} for row=${JSON.stringify(currentRow)?.slice(0,50)}`);
     
     if (typeof result !== 'boolean') {
       throw new TypeError(`ConditionalNode predicate must return boolean, got ${typeof result}`);
@@ -702,14 +803,14 @@ export class Scheduler {
     // Stop BFS when reaching nodes with external incoming edges (e.g. MergeNode after loop)
     const bodyNodeIds = this.getBodyNodeIds(nodeId, graph);
 
-    // Initialize accumulator
-    let accumulated: Value = initAccumulator(payload.accumulator);
+    // Initialize accumulator as DataValue
+    let accumulated: DataValue = wrapLegacyValue(initAccumulator(payload.accumulator));
     let iterCount = 0;
 
     if (payload.mode === 'forEach') {
       // Resolve the iterable
       const iterable = this.config.evaluator.evaluate(payload.over, state.ctx.scope);
-      const items = toIterableArray(iterable);
+      const items = toIterableArray(wrapLegacyValue(iterable));
 
       for (const item of items) {
         if (iterCount >= maxIter) {
@@ -733,8 +834,11 @@ export class Scheduler {
         // Collect body output
         const bodyOutput = getSubgraphOutput(bodyNodeIds, graph, iterState);
 
-        // Update accumulator (always accumulate even if bodyOutput is null/undefined)
-        accumulated = updateAccumulator(payload.accumulator, accumulated, bodyOutput ?? null, iterCtx, this.config.evaluator);
+        // Debug: Trace what bodyOutput is for each iteration
+        console.log(`iter ${iterCount}: bodyOutput=${JSON.stringify(bodyOutput)?.slice(0,80)} accumulated.length=${isCollection(accumulated) ? (accumulated as any).data.length : 'N/A'}`);
+
+        // Update accumulator (always accumulate even if bodyOutput is undefined)
+        accumulated = updateAccumulator(payload.accumulator, accumulated, bodyOutput ?? void_, iterCtx, this.config.evaluator);
 
         incrementIterationBudget(state.ctx);
         iterCount++;
@@ -742,7 +846,7 @@ export class Scheduler {
     } else if (payload.mode === 'while') {
       // Get loop input for while mode (processes full input each iteration)
       const inputs = getNodeInputs(nodeId, graph, state);
-      const loopInput = inputs['input'] ?? null;
+      const loopInput = inputs['input'] ?? void_;
       
       while (true) {
         if (iterCount >= maxIter) {
@@ -779,8 +883,8 @@ export class Scheduler {
         await this.executeSubgraph(bodyStartNodeId, graph, iterState);
 
         const bodyOutput = getSubgraphOutput(bodyNodeIds, graph, iterState);
-        // Update accumulator (always accumulate even if bodyOutput is null/undefined)
-        accumulated = updateAccumulator(payload.accumulator, accumulated, bodyOutput ?? null, iterCtx, this.config.evaluator);
+        // Update accumulator (always accumulate even if bodyOutput is undefined)
+        accumulated = updateAccumulator(payload.accumulator, accumulated, bodyOutput ?? void_, iterCtx, this.config.evaluator);
 
         incrementIterationBudget(state.ctx);
         iterCount++;
@@ -809,32 +913,65 @@ export class Scheduler {
     });
   }
 
+  private collectAdditionalFields(nodeId: NodeId, graph: PipelineGraph, state: ExecutionState): Map<string, { name: string; type: any }[]> {
+    const additionalFields = new Map<string, { name: string; type: any }[]>();
+    
+    // Find all incoming edges to this node
+    for (const edge of graph.edges.values()) {
+      if (edge.to === nodeId && edge.kind === 'data') {
+        const fromNode = graph.nodes.get(edge.from);
+        if (fromNode?.kind === 'transform') {
+          // This is a transform step - collect its added fields
+          const transformPayload = fromNode.payload as any;
+          if (transformPayload?.operations) {
+            const addedFields: { name: string; type: any }[] = [];
+            for (const op of transformPayload.operations) {
+              if (op.kind === 'addField') {
+                addedFields.push({
+                  name: op.name,
+                  type: { kind: 'string' } // Default type, could be improved
+                });
+              }
+            }
+            if (addedFields.length > 0) {
+              additionalFields.set(edge.from, addedFields);
+            }
+          }
+        }
+      }
+    }
+    
+    return additionalFields;
+  }
+
   private async executeMerge(
     nodeId: NodeId,
     graph: PipelineGraph,
     state: ExecutionState
   ): Promise<void> {
-    const node = graph.nodes.get(nodeId);
-    if (!node) {
-      throw new Error(`Node ${nodeId} not found`);
-    }
-
+    const node = graph.nodes.get(nodeId)!;
+    const inputs = getNodeInputs(nodeId, graph, state);
     const payload = node.payload as any;
 
     // Collect inputs from all incoming data edges
     const incomingEdges = getIncomingDataEdges(graph, nodeId);
     
-    const inputs: Value[] = [];
+    const inputValues: DataValue[] = [];
+    console.log(`Merge ${nodeId}: processing ${incomingEdges.length} incoming edges`);
     for (const edge of incomingEdges) {
       const sourceState = state.nodeStates.get(edge.from);
       if (!sourceState) {
+        console.log(`Merge ${nodeId}: edge ${edge.from} has no state`);
         continue;
       }
 
-      if (sourceState.status === 'completed') {
-        inputs.push(sourceState.output!);
+      console.log(`Merge ${nodeId}: edge ${edge.from} status=${sourceState.status} hasOutput=${!!sourceState.output}`);
+      if (sourceState.status === 'completed' && sourceState.output) {
+        console.log(`Merge ${nodeId}: adding input from ${edge.from} with ${sourceState.output.kind} containing ${isCollection(sourceState.output) ? (sourceState.output as any).data.length : 'N/A'} items`);
+        inputValues.push(sourceState.output);
       } else if (sourceState.status === 'skipped') {
-        // skipped branch — don't include, don't error
+        // skipped branch - don't include, don't error
+        console.log(`Merge ${nodeId}: skipping edge ${edge.from} (branch skipped)`);
         continue;
       } else if (payload.waitForAll) {
         // waitForAll is true but node hasn't completed (pending/running/failed)
@@ -842,28 +979,36 @@ export class Scheduler {
       }
     }
 
-    if (inputs.length === 0) {
+    if (inputValues.length === 0) {
       throw new Error('MergeNode received no inputs — all branches skipped or failed');
     }
 
     // Single input (one branch taken): pass through directly
-    if (inputs.length === 1) {
-      markNodeCompleted(state, nodeId, inputs[0]);
+    if (inputValues.length === 1) {
+      const output = inputValues[0];
+      // Never return void from a merge - if the single input is void,
+      // return an empty tabular instead
+      const safeOutput = isVoid(output as DataValue)
+        ? tabular({ schema: { columns: [] }, rows: [] }, { columns: [] })
+        : output;
+      
+      markNodeCompleted(state, nodeId, safeOutput);
       this.emit({
         kind: 'node_complete',
         nodeId,
-        output: inputs[0],
+        output: safeOutput,
         timestamp: Date.now()
       });
       return;
     }
 
     // Multiple inputs: apply merge strategy
-    // Delegate to merge-node definition's execute
+    // Wrap inputs in collection DataValue for merge node
+    const collectionInput = { kind: 'collection', data: inputValues };
     const def = this.config.nodeRegistry.get(node.kind);
     markNodeRunning(state, nodeId);
 
-    const output = await def.execute(payload, inputs, state.ctx);
+    const output = await def.execute(payload, collectionInput, state.ctx);
     
     markNodeCompleted(state, nodeId, output);
     this.emit({
@@ -876,7 +1021,7 @@ export class Scheduler {
     this.emit({
       kind: 'branch_merge',
       mergeNodeId: nodeId,
-      branchCount: inputs.length,
+      branchCount: inputValues.length,
       timestamp: Date.now()
     });
   }
@@ -912,9 +1057,13 @@ export class Scheduler {
       case 'skip':
         // Pass through input as output
         const inputs = getNodeInputs(nodeId, graph, state);
-        const inputToPass = def.inputPorts.length === 1 && def.inputPorts[0].key === 'input' 
-          ? inputs['input'] 
-          : inputs;
+        let inputToPass: DataValue;
+        if (def.inputPorts.length === 1 && def.inputPorts[0].key === 'input') {
+          inputToPass = inputs['input'] ?? void_;
+        } else {
+          // Wrap the Record<string, DataValue> as a collection
+          inputToPass = collection(Object.values(inputs), 'any' as DataValueKind);
+        }
         markNodeSkipped(state, nodeId, error.message);
         if (nodeState) {
           nodeState.output = inputToPass;

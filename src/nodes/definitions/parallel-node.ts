@@ -2,15 +2,15 @@
 
 import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { ParallelPayload } from '../payloads.js';
-import type { RowSet, EngineType } from '../../core/types/index.js';
+import type { DataType, DataValue } from '../../core/types/data-value.js';
 import type { ExecutionContext } from '../../core/context/execution-context.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
 
-export const parallelNodeDefinition: NodeDefinition<ParallelPayload, RowSet, RowSet> = {
+export const parallelNodeDefinition: NodeDefinition<ParallelPayload, DataValue, DataValue> = {
   kind: 'parallel',
   displayName: 'Parallel',
-  inputPorts: [{ key: 'input', label: 'Input', type: 'infer', required: true }],
-  outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+  inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'any' }, required: true }],
+  outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'any' }, required: true }],
 
   validate(payload: unknown) {
     const p = payload as ParallelPayload;
@@ -27,11 +27,11 @@ export const parallelNodeDefinition: NodeDefinition<ParallelPayload, RowSet, Row
     return validationOk();
   },
 
-  inferOutputSchema(payload: ParallelPayload, inputSchema: EngineType): EngineType {
-    return inputSchema;
+  inferOutputType(payload: ParallelPayload, inputType: DataType): DataType {
+    return inputType;
   },
 
-  async execute(payload: ParallelPayload, input: RowSet, ctx: ExecutionContext): Promise<RowSet> {
+  async execute(payload: ParallelPayload, input: DataValue, ctx: ExecutionContext): Promise<DataValue> {
     // ParallelNode execution is handled entirely by Scheduler
     // The node itself is a marker — execute just returns input unchanged
     // Scheduler sees ParallelNode and forks branches

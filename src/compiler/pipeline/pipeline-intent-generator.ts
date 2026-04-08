@@ -165,6 +165,54 @@ Example mappings:
   'mark orders as high/low value' → ONE transform step with addField using conditional expr
   'for each customer generate AI summary' → query + loop + llm
 
+SIMPLICITY RULES - always prefer the simpler plan:
+
+1. Row-level classification/tagging -> ONE transform step with addField
+   using a Conditional expression. Never use conditional->branch->merge
+   for operations that apply to every row.
+   
+   WRONG for 'mark rows as X or Y':
+     conditional -> transform(markX) -> transform(markY) -> merge
+   
+   RIGHT for 'mark rows as X or Y':
+     transform with addField: { kind: 'Conditional', condition: ..., then: 'X', else: 'Y' }
+
+2. Splitting then immediately merging -> pointless. If you split data
+   into branches only to merge them back, use a single transform instead.
+   
+   WRONG: transform(addField) -> transform(filterA) -> transform(filterB) -> merge
+   RIGHT: transform(addField) - the merge adds nothing
+
+3. Use conditional branching ONLY when the two branches do genuinely
+   different things that cannot be expressed as a single row operation.
+   
+   IMPORTANT: ConditionalNode routes the ENTIRE dataset based on one
+   condition evaluated against the first row. It is for pipeline-level
+   routing, not row-level filtering.
+
+   For per-row conditional logic (different treatment per row):
+   -> use LoopNode to iterate over rows
+   -> use ConditionalNode INSIDE the loop body for per-row branching
+   -> OR use TransformNode with Conditional ExprAST for simple cases
+
+   ConditionalNode is appropriate when:
+   - 'if the total count > 1000, send an alert' (scalar condition)
+   - 'if any critical tickets exist, escalate the whole batch' (batch condition)
+   
+   ConditionalNode is NOT appropriate when:
+   - 'for each row, if X do A else do B' -> use loop+conditional or transform
+
+   Example of VALID conditional (pipeline-level):
+     true branch: call LLM to analyze entire dataset
+     false branch: add a null analysis field
+   Example of INVALID conditional (row-level):
+     true branch: filter to urgent tickets  
+     false branch: filter to normal tickets
+     (these should be a single addField with conditional expression or loop+conditional)
+
+4. Minimum steps principle: if the same result can be achieved in
+   N steps or N+1 steps, always choose N steps.
+
 Additional rules:
 - Every step must have a unique snake_case id
 - dependsOn must reference valid step ids

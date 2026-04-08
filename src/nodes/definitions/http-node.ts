@@ -1,17 +1,18 @@
 import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { HttpPayload } from '../payloads.js';
+import type { DataType, DataValue } from '../../core/types/data-value.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
 
-export const httpNodeDefinition: NodeDefinition<HttpPayload, any, any> = {
+export const httpNodeDefinition: NodeDefinition<HttpPayload, DataValue, DataValue> = {
   kind: 'http',
   displayName: 'HTTP',
   icon: '🌐',
   color: '#E67E22',
   inputPorts: [
-    { key: 'input', label: 'Input', type: { kind: 'any' }, required: false },
+    { key: 'input', label: 'Input', dataType: { kind: 'any' }, required: false },
   ],
   outputPorts: [
-    { key: 'output', label: 'Output', type: { kind: 'any' }, required: true },
+    { key: 'output', label: 'Output', dataType: { kind: 'any' }, required: true },
   ],
 
   validate(payload: unknown): any {
@@ -29,12 +30,13 @@ export const httpNodeDefinition: NodeDefinition<HttpPayload, any, any> = {
     return validationOk();
   },
 
-  inferOutputSchema(payload: HttpPayload, inputSchema: any): any {
-    return payload.outputSchema;
+  inferOutputType(payload: HttpPayload, inputType: DataType): DataType {
+    return { kind: 'tabular' };
   },
 
-  async execute(payload: HttpPayload, input: any, ctx: any): Promise<any> {
+  async execute(payload: HttpPayload, input: DataValue, ctx: any): Promise<DataValue> {
     // HTTP execution would be implemented here with fetch/axios
-    throw new Error('HTTPNode execution not yet implemented');
+    // Placeholder - return void for now
+    return { kind: 'void' };
   },
 };

@@ -53,10 +53,10 @@ export function registerAllNodes(
       displayName: 'LLM',
       icon: '🤖',
       color: '#7C3AED',
-      inputPorts: [{ key: 'input', label: 'Input', type: { kind: 'any' }, required: true }],
-      outputPorts: [{ key: 'output', label: 'Output', type: { kind: 'any' }, required: true }],
+      inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'any' }, required: true }],
+      outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'any' }, required: true }],
       validate: () => validationFail([{ code: 'MISSING_API_KEY', message: 'LLMNode requires anthropicApiKey' }]),
-      inferOutputSchema: () => ({ kind: 'any' }),
+      inferOutputType: () => ({ kind: 'any' }),
       execute: async () => {
         throw new Error('LLMNode requires anthropicApiKey to be provided');
       },

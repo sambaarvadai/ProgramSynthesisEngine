@@ -3,7 +3,9 @@
 
 import type { PipelineGraph, NodeId, EdgeId, PipelineEdge } from '../core/graph/index.js';
 import type { ExecutionState, NodeExecutionState, NodeExecutionStatus } from './types.js';
-import type { Value } from '../core/types/value.js';
+import type { DataValue, DataValueKind } from '../core/types/data-value.js';
+import { tabular, record, scalar, collection, void_ } from '../core/types/data-value.js';
+import type { RowSet } from '../core/types/value.js';
 import type { ValidationResult, ValidationError } from '../core/types/validation.js';
 import { validationOk, validationFail } from '../core/types/validation.js';
 
@@ -256,12 +258,59 @@ export function isReadyToExecute(nodeId: NodeId, state: ExecutionState): boolean
  * - Key = edge.inputKey ?? 'input'
  * - Value = source node's output (possibly sliced by edge.outputKey)
  */
+/**
+ * Wraps a legacy Value in DataValue if not already wrapped.
+ * Compatibility shim for existing nodes that return Value instead of DataValue.
+ */
+function wrapLegacyValue(v: unknown): DataValue {
+  // Already DataValue
+  if (v && typeof v === 'object' && 'kind' in v) {
+    const kind = (v as any).kind;
+    if (['tabular', 'record', 'scalar', 'collection', 'void'].includes(kind)) {
+      return v as DataValue;
+    }
+  }
+
+  // RowSet (has rows and schema)
+  if (v && typeof v === 'object' && !Array.isArray(v) && 'rows' in v && 'schema' in v) {
+    const rowSet = v as RowSet;
+    return tabular(rowSet, rowSet.schema);
+  }
+
+  // Scalar
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || v === null) {
+    return scalar(v, { kind: v === null ? 'null' : typeof v as 'string' | 'number' | 'boolean' });
+  }
+
+  // Array → collection
+  if (Array.isArray(v)) {
+    return collection(v.map(wrapLegacyValue), 'any' as DataValueKind);
+  }
+
+  // Plain Record → record
+  if (v && typeof v === 'object' && !Array.isArray(v)) {
+    // Infer simple schema from object keys
+    const schema = {
+      columns: Object.keys(v).map(name => ({
+        name,
+        type: { kind: 'any' as const } as import('../core/types/engine-type.js').EngineType,
+        nullable: true
+      }))
+    };
+    return record(v as import('../core/types/value.js').Row, schema);
+  }
+
+  // undefined/null → void
+  return void_;
+}
+
+
 export function getNodeInputs(
   nodeId: NodeId,
   graph: PipelineGraph,
   state: ExecutionState
-): Record<string, Value> {
-  const inputs: Record<string, Value> = {};
+): Record<string, DataValue> {
+  const inputs: Record<string, DataValue> = {};
   const incomingDataEdges = getIncomingDataEdges(graph, nodeId);
 
   for (const edge of incomingDataEdges) {
@@ -274,9 +323,11 @@ export function getNodeInputs(
     let value = sourceState.output;
 
     // Slice by outputKey if specified
-    if (edge.outputKey && typeof value === 'object' && value !== null) {
-      if (edge.outputKey in value) {
-        value = (value as any)[edge.outputKey];
+    if (edge.outputKey && value.kind === 'record') {
+      const rowValue = value.data;
+      if (edge.outputKey in rowValue) {
+        const extracted = rowValue[edge.outputKey];
+        value = wrapLegacyValue(extracted);
       }
     }
 
@@ -334,7 +385,7 @@ export function validateGraph(graph: PipelineGraph, nodeRegistry?: any): Validat
     });
   }
 
-  // Check exit nodes exist and have no outgoing data edges
+  // Check exit nodes exist
   for (const exitNodeId of graph.exitNodes) {
     if (!graph.nodes.has(exitNodeId)) {
       errors.push({
@@ -342,13 +393,17 @@ export function validateGraph(graph: PipelineGraph, nodeRegistry?: any): Validat
         message: `Exit node '${exitNodeId}' does not exist in graph`
       });
     }
+  }
 
-    const exitOutgoingData = getOutgoingDataEdges(graph, exitNodeId);
-    if (exitOutgoingData.length > 0) {
+  // Special check for _output node: it should have no outgoing data edges
+  const outputNode = graph.nodes.get('_output');
+  if (outputNode) {
+    const outputOutgoingData = getOutgoingDataEdges(graph, '_output');
+    if (outputOutgoingData.length > 0) {
       errors.push({
         code: 'EXIT_NODE_HAS_OUTPUTS',
-        message: `Exit node '${exitNodeId}' should have no outgoing data edges`,
-        nodeId: exitNodeId
+        message: `Exit node '_output' should have no outgoing data edges`,
+        nodeId: '_output'
       });
     }
   }

@@ -39,6 +39,10 @@ export class LimitOperator extends BasePhysicalOperator {
     // Emit rows until rowsEmitted >= limit
     const outputRows: Row[] = [];
     while (this.rowsEmitted < this.opts.limit) {
+      // Check if input is exhausted before pulling batch
+      if (this.opts.input.state !== 'open') {
+        break;
+      }
       const inputBatch = await this.opts.input.nextBatch(size);
       
       if (inputBatch.rows.length === 0) {

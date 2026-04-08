@@ -2,19 +2,17 @@
 
 import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { OutputPayload } from '../payloads.js';
-import type { Value, EngineType } from '../../core/types/index.js';
+import type { DataType, DataValue } from '../../core/types/data-value.js';
+import { tabular, toTabular } from '../../core/types/data-value.js';
 import type { ExecutionContext } from '../../core/context/execution-context.js';
 import { contextSetOutput } from '../../core/context/execution-context.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
-import { ExprEvaluator } from '../../executors/expr-evaluator.js';
-import { FunctionRegistry } from '../../core/registry/function-registry.js';
-import { normalizeToRowSet } from '../../core/types/row.js';
 
-export const outputNodeDefinition: NodeDefinition<OutputPayload, Value, Value> = {
+export const outputNodeDefinition: NodeDefinition<OutputPayload, DataValue, DataValue> = {
   kind: 'output',
   displayName: 'Output',
-  inputPorts: [{ key: 'input', label: 'Input', type: 'infer', required: true }],
-  outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+  inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'any' }, required: true }],
+  outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'tabular' }, required: true }],
 
   validate(payload: unknown) {
     const p = payload as OutputPayload;
@@ -31,26 +29,24 @@ export const outputNodeDefinition: NodeDefinition<OutputPayload, Value, Value> =
     return validationOk();
   },
 
-  inferOutputSchema(payload: OutputPayload, inputSchema: EngineType): EngineType {
-    return inputSchema;
+  inferOutputType(payload: OutputPayload, inputType: DataType): DataType {
+    return inputType;
   },
 
-  async execute(payload: OutputPayload, input: Value, ctx: ExecutionContext): Promise<Value> {
-    const fnRegistry = new FunctionRegistry();
-    const evaluator = new ExprEvaluator(fnRegistry);
+  async execute(payload: OutputPayload, input: DataValue, ctx: ExecutionContext): Promise<DataValue> {
+    // Convert input to tabular for storage and display
+    // toTabular handles all DataValue kinds:
+    //   - tabular: pass through
+    //   - record: single-row RowSet
+    //   - collection: flatten all items into one RowSet
+    //   - scalar: single-cell RowSet
+    //   - void: empty RowSet
+    const asTabular = toTabular(input);
 
-    const value = payload.transform
-      ? evaluator.evaluate(payload.transform, ctx.scope)
-      : input;
+    // Store in context output (for pipeline result collection)
+    contextSetOutput(ctx, payload.outputKey ?? 'result', asTabular);
 
-    // Normalize to RowSet before setting output
-    // This handles loop accumulator outputs (arrays, records) and other Value types
-    const normalizedValue = normalizeToRowSet(value);
-
-    const updatedCtx = contextSetOutput(ctx, payload.outputKey, normalizedValue);
-    // Note: We can't actually update ctx since it's immutable, but this is the pattern
-    // In a real scheduler, the scheduler would handle this
-
-    return normalizedValue;
+    // Return as tabular DataValue
+    return tabular(asTabular, asTabular.schema);
   }
 };

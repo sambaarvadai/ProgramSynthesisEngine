@@ -2,19 +2,21 @@
 
 import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { TransformPayload, TransformOp } from '../payloads.js';
-import type { RowSet, Row, EngineType, Value } from '../../core/types/index.js';
+import type { RowSet, Row, Value } from '../../core/types/index.js';
+import type { DataType, DataValue } from '../../core/types/data-value.js';
+import { toTabular, tabular } from '../../core/types/data-value.js';
 import type { ExecutionContext } from '../../core/context/execution-context.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
 import { ExprEvaluator } from '../../executors/expr-evaluator.js';
 import { FunctionRegistry } from '../../core/registry/function-registry.js';
 import { TypeMismatchError, CastError } from '../../executors/expr-evaluator.js';
-import { normalizeToRowSet } from '../../core/types/row.js';
+import type { RowSchema } from '../../core/types/schema.js';
 
-export const transformNodeDefinition: NodeDefinition<TransformPayload, RowSet, RowSet> = {
+export const transformNodeDefinition: NodeDefinition<TransformPayload, DataValue, DataValue> = {
   kind: 'transform',
   displayName: 'Transform',
-  inputPorts: [{ key: 'input', label: 'Input', type: 'infer', required: true }],
-  outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+  inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'tabular' }, required: true }],
+  outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'tabular' }, required: true }],
 
   validate(payload: unknown) {
     const p = payload as TransformPayload;
@@ -79,21 +81,22 @@ export const transformNodeDefinition: NodeDefinition<TransformPayload, RowSet, R
     return validationOk();
   },
 
-  inferOutputSchema(payload: TransformPayload, inputSchema: EngineType): EngineType {
-    // For simplicity, return inputSchema unchanged
-    // A full implementation would walk through operations and derive the schema
-    return inputSchema;
+  inferOutputType(payload: TransformPayload, inputType: DataType): DataType {
+    // For simplicity, return inputType unchanged
+    // A full implementation would walk through operations and derive the type
+    return inputType;
   },
 
-  async execute(payload: TransformPayload, input: RowSet, ctx: ExecutionContext): Promise<RowSet> {
+  async execute(payload: TransformPayload, input: DataValue, ctx: ExecutionContext): Promise<DataValue> {
     const fnRegistry = new FunctionRegistry();
     const evaluator = new ExprEvaluator(fnRegistry);
     
-    // Normalize input to RowSet in case it's not already (e.g., loop accumulator output)
-    const normalizedInput = normalizeToRowSet(input);
+    // Convert DataValue to RowSet for processing
+    // toTabular handles all DataValue kinds (tabular, record, collection, scalar, void)
+    const normalizedInput = toTabular(input);
     
     let rows: Row[] = [...normalizedInput.rows];
-    let schema = normalizedInput.schema;
+    let schema: RowSchema = normalizedInput.schema;
 
     for (const op of payload.operations) {
       switch (op.kind) {
@@ -118,7 +121,7 @@ export const transformNodeDefinition: NodeDefinition<TransformPayload, RowSet, R
           // Remove column from schema
           schema = {
             ...schema,
-            columns: schema.columns.filter(col => col.name !== op.name)
+            columns: schema.columns.filter((col: { name: string }) => col.name !== op.name)
           };
           break;
 
@@ -135,7 +138,7 @@ export const transformNodeDefinition: NodeDefinition<TransformPayload, RowSet, R
           // Rename column in schema
           schema = {
             ...schema,
-            columns: schema.columns.map(col => 
+            columns: schema.columns.map((col: { name: string; type: import('../../core/types/engine-type.js').EngineType; nullable: boolean }) => 
               col.name === op.from ? { ...col, name: op.to } : col
             )
           };
@@ -169,8 +172,8 @@ export const transformNodeDefinition: NodeDefinition<TransformPayload, RowSet, R
           // Update column type in schema
           schema = {
             ...schema,
-            columns: schema.columns.map(col => 
-              col.name === op.name ? { ...col, type: op.to } : col
+            columns: schema.columns.map((col: { name: string; type: import('../../core/types/engine-type.js').EngineType; nullable: boolean }) => 
+              col.name === op.name ? { ...col, type: op.to as import('../../core/types/engine-type.js').EngineType } : col
             )
           };
           break;
@@ -218,6 +221,7 @@ export const transformNodeDefinition: NodeDefinition<TransformPayload, RowSet, R
       }
     }
 
-    return { schema, rows };
+    const result: RowSet = { schema, rows };
+    return tabular(result, schema);
   }
 };

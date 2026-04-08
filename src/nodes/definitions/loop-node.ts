@@ -2,15 +2,15 @@
 
 import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { LoopPayload } from '../payloads.js';
-import type { RowSet, EngineType } from '../../core/types/index.js';
+import type { DataType, DataValue, DataValueKind } from '../../core/types/data-value.js';
 import type { ExecutionContext } from '../../core/context/execution-context.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
 
-export const loopNodeDefinition: NodeDefinition<LoopPayload, RowSet, RowSet> = {
+export const loopNodeDefinition: NodeDefinition<LoopPayload, DataValue, DataValue> = {
   kind: 'loop',
   displayName: 'Loop',
-  inputPorts: [{ key: 'input', label: 'Input', type: 'infer', required: true }],
-  outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+  inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'any' }, required: true }],
+  outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'collection', itemKind: 'tabular' as DataValueKind }, required: true }],
 
   validate(payload: unknown) {
     const p = payload as LoopPayload;
@@ -39,11 +39,11 @@ export const loopNodeDefinition: NodeDefinition<LoopPayload, RowSet, RowSet> = {
     return validationOk();
   },
 
-  inferOutputSchema(payload: LoopPayload, inputSchema: EngineType): EngineType {
-    return inputSchema;
+  inferOutputType(payload: LoopPayload, inputType: DataType): DataType {
+    return inputType;
   },
 
-  async execute(payload: LoopPayload, input: RowSet, ctx: ExecutionContext): Promise<RowSet> {
+  async execute(payload: LoopPayload, input: DataValue, ctx: ExecutionContext): Promise<DataValue> {
     // LoopNode execution is handled by Scheduler
     // Like ParallelNode, Scheduler owns loop execution entirely
     throw new Error('LoopNode execution is handled by Scheduler');

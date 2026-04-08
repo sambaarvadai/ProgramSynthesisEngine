@@ -13,6 +13,7 @@ import {
   Value,
 } from './index.js';
 import { PostgresBackend, SQLiteTempStore } from './storage/index.js';
+import { stripHallucinatedFieldRefs } from './compiler/pipeline/expr-sanitizer.js';
 import { PipelineIntentGenerator } from './compiler/pipeline/index.js';
 import { PipelineCompiler } from './compiler/pipeline/index.js';
 import { QueryIntentGenerator as QueryIntentGeneratorClass, TablePreSelector } from './compiler/query/index.js';
@@ -336,6 +337,9 @@ export class PipelineEngine {
     intent: PipelineIntent,
     schema: SchemaConfig,
   ): Promise<void> {
+    // Track available fields for each step to prevent hallucination
+    const fieldMap = new Map<string, string[]>(); // stepId -> field names
+
     for (const [nodeId, node] of graph.nodes) {
       const step = intent.steps.find(s => s.id === nodeId);
       if (!step) continue;
@@ -349,16 +353,26 @@ export class PipelineEngine {
           // Update the node payload in-place
           (node.payload as QueryPayload).intent = queryIntent;
           (node.payload as QueryPayload).datasource = 'default';
+
+          // Track field names from query output
+          const fieldNames = queryIntent.columns.map((c: any) => c.alias || c.field);
+          fieldMap.set(step.id, fieldNames);
           break;
         }
 
         case 'transform': {
           // Generate transform operations from step.description
-          // For now: if description mentions aggregation/groupby/sort
-          // that should be in a query node — log a warning and leave empty
-          // Real transform enrichment added in next prompt
           if (step.description) {
-            node.payload = await this.enrichTransformNode(step, node.payload as TransformPayload, intent.steps);
+            const availableFields = this.getAvailableFields(step.id, intent, fieldMap);
+            node.payload = await this.enrichTransformNode(step, node.payload as TransformPayload, availableFields);
+            
+            // Track output fields from transform operations
+            const operations = (node.payload as TransformPayload).operations ?? [];
+            const addedFields = operations
+              .filter(op => op.kind === 'addField')
+              .map(op => (op as any).name);
+            
+            fieldMap.set(step.id, [...availableFields, ...addedFields]);
           }
           break;
         }
@@ -366,7 +380,8 @@ export class PipelineEngine {
         case 'conditional': {
           // Generate predicate ExprAST from step.condition description
           if (step.condition) {
-            node.payload = await this.enrichConditionalNode(step, node.payload as ConditionalPayload);
+            const availableFields = this.getAvailableFields(step.id, intent, fieldMap);
+            node.payload = await this.enrichConditionalNode(step, node.payload as ConditionalPayload, availableFields);
           }
           break;
         }
@@ -385,26 +400,119 @@ export class PipelineEngine {
     }
   }
 
-  private async enrichTransformNode(
-    step: PipelineStepIntent,
-    payload: TransformPayload,
-    steps: PipelineStepIntent[],
-  ): Promise<TransformPayload> {
-    // Get available fields from previous step if exists
-    const previousStep = steps.find((s: PipelineStepIntent) => s.id === step.dependsOn?.[0]);
-    let availableFields: string[] = [];
-    
-    if (previousStep && previousStep.kind === 'query') {
-      // For query steps, we can infer fields from the query intent
-      // This is a simplification - in production we'd track actual output schema
-      const queryIntent = previousStep as any; // Access QueryIntent if available
-      if (queryIntent.columns) {
-        availableFields = queryIntent.columns.map((c: any) => c.alias || c.field);
+  private getAvailableFields(
+    stepId: string,
+    intent: PipelineIntent,
+    fieldMap: Map<string, string[]>
+  ): string[] {
+    const step = intent.steps.find(s => s.id === stepId);
+    if (!step?.dependsOn) return [];
+
+    const allFields: string[] = [];
+    for (const depId of step.dependsOn) {
+      const depFields = fieldMap.get(depId) ?? [];
+      allFields.push(...depFields);
+    }
+
+    // Remove duplicates
+    return [...new Set(allFields)];
+  }
+
+  private stripHallucinatedFields(
+    operations: any[],
+    availableFields: string[]
+  ): any[] {
+    if (!availableFields?.length) return operations;
+
+    const fieldSet = new Set(availableFields);
+    const cleaned: any[] = [];
+
+    for (const op of operations) {
+      let isValid = true;
+
+      switch (op.kind) {
+        case 'filterRows':
+          // Check if predicate references unknown fields
+          if (this.referencesUnknownField(op.predicate, fieldSet)) {
+            console.warn('[Transform] Stripping filterRows operation with unknown field reference');
+            isValid = false;
+          }
+          break;
+
+        case 'addField':
+          // Check if expr references unknown fields
+          if (this.referencesUnknownField(op.expr, fieldSet)) {
+            console.warn('[Transform] Replacing unknown field references in addField with null');
+            op.expr = { kind: 'Literal', value: null, type: { kind: 'any' } };
+          }
+          break;
+
+        case 'removeField':
+        case 'renameField':
+        case 'castField':
+          // These operations should reference existing fields
+          if (!fieldSet.has(op.name)) {
+            console.warn(`[Transform] Stripping ${op.kind} operation for unknown field: ${op.name}`);
+            isValid = false;
+          }
+          break;
+
+        case 'sortRows':
+          // Check sort keys
+          if (op.keys?.some((key: any) => this.referencesUnknownField(key.expr, fieldSet))) {
+            console.warn('[Transform] Stripping sortRows operation with unknown field reference');
+            isValid = false;
+          }
+          break;
+
+        case 'dedup':
+          // Check dedup fields
+          if (op.on?.some((field: string) => !fieldSet.has(field))) {
+            console.warn('[Transform] Stripping dedup operation with unknown field');
+            isValid = false;
+          }
+          break;
+      }
+
+      if (isValid) {
+        cleaned.push(op);
       }
     }
 
-    const fieldsContext = availableFields.length > 0 
-      ? `\n\nAvailable fields from previous step: ${availableFields.join(', ')}\nIMPORTANT: Use ONLY these field names in FieldRef. Do not invent new field names.`
+    return cleaned;
+  }
+
+  private referencesUnknownField(expr: any, availableFields: Set<string>): boolean {
+    if (!expr) return false;
+
+    switch (expr.kind) {
+      case 'FieldRef':
+        return !availableFields.has(expr.field);
+      
+      case 'BinaryOp':
+        return this.referencesUnknownField(expr.left, availableFields) || 
+               this.referencesUnknownField(expr.right, availableFields);
+      
+      case 'Conditional':
+        return this.referencesUnknownField(expr.condition, availableFields) ||
+               this.referencesUnknownField(expr.then, availableFields) ||
+               this.referencesUnknownField(expr.else, availableFields);
+      
+      case 'FunctionCall':
+        return expr.args?.some((arg: any) => this.referencesUnknownField(arg, availableFields));
+      
+      default:
+        return false;
+    }
+  }
+
+  private async enrichTransformNode(
+    step: PipelineStepIntent,
+    payload: TransformPayload,
+    availableFields: string[],
+  ): Promise<TransformPayload> {
+    const fieldsContext = availableFields?.length 
+      ? `\n\nAvailable fields in the input data: ${availableFields.join(', ')}\nIMPORTANT: Use ONLY these exact field names in FieldRef expressions. Do not invent field names.`
       : '';
 
     const prompt = `Convert this data transformation description into a JSON array of transform operations.
@@ -420,6 +528,19 @@ Available operation kinds:
 - sortRows: { kind: "sortRows", keys: [{ expr: ExprAST, direction: "ASC"|"DESC" }] }
 - dedup: { kind: "dedup", on: ["field1", "field2"] }
 - limit: { kind: "limit", count: N }
+
+IMPORTANT: If the description mentions "keep only X, Y, Z fields":
+- First add any new fields mentioned (like computed fields)
+- Then ONLY remove fields that are NOT in the keep list
+- DO NOT remove fields that are explicitly mentioned in the keep list
+- Example: "keep only name, segment, arr, and tier" means remove fields like 'id', 'created_at', etc. but KEEP name, segment, arr, tier
+
+For steps that just add a null/default field:
+Generate ONLY: [{ kind: 'addField', name: '<fieldName>', 
+expr: { kind: 'Literal', value: null, type: { kind: 'string' } } }]
+Do NOT generate filterRows or complex conditionals for passthrough steps.
+Do NOT reference fields that represent values (like 'enterprise' or 'critical')
+as FieldRef - those are values to compare against, not field names.
 
 ExprAST types:
 - Literal: { kind: "Literal", value: <value>, type: { kind: "string"|"number"|"boolean" } }
@@ -446,7 +567,11 @@ Return ONLY a JSON array of operations, no markdown, no explanation.`;
     try {
       const operations = JSON.parse(clean);
       if (!Array.isArray(operations)) return payload;
-      return { ...payload, operations };
+      
+      // Strip hallucinated field references
+      const safeOps = stripHallucinatedFieldRefs(operations, availableFields ?? []);
+      
+      return { ...payload, operations: safeOps };
     } catch {
       return payload; // if parse fails, leave empty (node passes through)
     }
@@ -455,10 +580,26 @@ Return ONLY a JSON array of operations, no markdown, no explanation.`;
   private async enrichConditionalNode(
     step: PipelineStepIntent,
     payload: ConditionalPayload,
+    availableFields?: string[],
   ): Promise<ConditionalPayload> {
-    const prompt = `Convert this condition description into an ExprAST JSON object.
+    const fieldsContext = availableFields?.length 
+    ? `\nAvailable field names: ${availableFields.join(', ')}\nUse ONLY these exact field names in FieldRef. Never use spaces in field names. Never invent field names.` 
+    : '';
 
-Condition: "${step.condition}"
+  const prompt = `Convert this condition description into an ExprAST JSON object.
+
+Condition: "${step.condition}"${fieldsContext}
+
+CRITICAL: field names must be single words matching exactly the
+available fields list. 'customer segment' is NOT a valid field name.
+'segment' IS valid. 'priority' IS valid. 'customer name' is NOT valid.
+'customer_name' IS valid.
+
+Map natural language to exact field names:
+'customer segment' -> segment
+'customer name' -> customer_name
+'ticket priority' -> priority
+'ticket subject' -> subject
 
 ExprAST types:
 - Literal: { kind: "Literal", value: <value>, type: { kind: "string"|"number"|"boolean" } }
@@ -512,8 +653,15 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
     }
 
     try {
-      const predicate = stripTablePrefixes(JSON.parse(clean));
-      return { ...payload, predicate };
+      const rawPredicate = stripTablePrefixes(JSON.parse(clean));
+      
+      // Strip hallucinated field references
+      const safePredicate = stripHallucinatedFieldRefs(
+        [{ kind: 'addField', name: '_', expr: rawPredicate }],
+        availableFields ?? []
+      )[0]?.expr ?? rawPredicate;
+      
+      return { ...payload, predicate: safePredicate };
     } catch {
       return payload; // leave as Literal(true) if parse fails
     }

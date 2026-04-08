@@ -623,13 +623,22 @@ export class PipelineCompiler {
     edges: Map<EdgeId, PipelineEdge>,
     intent: PipelineIntent,
   ): PipelineGraph {
+    // Automatically detect exit nodes: nodes with no outgoing data edges
+    const exitNodes: string[] = [];
+    for (const [nodeId, node] of nodes) {
+      const outgoingEdges = Array.from(edges.values()).filter(e => e.from === nodeId && e.kind === 'data');
+      if (outgoingEdges.length === 0) {
+        exitNodes.push(nodeId);
+      }
+    }
+        
     return {
       id: `pipeline_${Date.now()}`,
       version: 1,
       nodes,
       edges,
       entryNode: '_input',
-      exitNodes: ['_output'],
+      exitNodes: exitNodes.length > 0 ? exitNodes : ['_output'],
       metadata: {
         description: intent.description,
         createdAt: Date.now(),

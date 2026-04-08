@@ -76,6 +76,14 @@ export class ProjectOperator extends BasePhysicalOperator {
       throw new Error('ProjectOperator not opened');
     }
 
+    // Check if input is exhausted before pulling batch
+    if (this.opts.input.state !== 'open') {
+      return {
+        rows: [],
+        schema: this.outputSchema
+      };
+    }
+
     // Pull batch from input
     const inputBatch = await this.opts.input.nextBatch(size);
     

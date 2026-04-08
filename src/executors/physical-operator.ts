@@ -163,7 +163,12 @@ export async function collectAll(
   let lastSchema: any = undefined;
 
   try {
-    while (op.state === 'open') {
+    while (true) {
+      // Check if operator is exhausted before calling nextBatch
+      if (op.state !== 'open') {
+        break;
+      }
+      
       const batch = await op.nextBatch(batchSize);
       
       if (batch.rows.length === 0) {

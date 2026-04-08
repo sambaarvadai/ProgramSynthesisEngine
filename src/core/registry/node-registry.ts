@@ -1,17 +1,18 @@
 // Defines node registry for managing available nodes
 
-import type { EngineType } from '../types/engine-type.js';
+import type { DataType, DataValue } from '../types/data-value.js';
 import type { ValidationResult } from '../types/validation.js';
 import type { ExecutionContext } from '../context/execution-context.js';
 
 export interface PortDefinition {
   key: string;
   label: string;
-  type: EngineType | 'infer';
+  dataType: DataType | 'infer';    // replaces type: EngineType | 'infer'
   required: boolean;
+  description?: string;
 }
 
-export interface NodeDefinition<TPayload, TInput, TOutput> {
+export interface NodeDefinition<TPayload, TInput extends DataValue, TOutput extends DataValue> {
   kind: string;
   displayName: string;
   icon?: string;
@@ -19,7 +20,7 @@ export interface NodeDefinition<TPayload, TInput, TOutput> {
   inputPorts: PortDefinition[];
   outputPorts: PortDefinition[];
   validate: (payload: unknown) => ValidationResult;
-  inferOutputSchema: (payload: TPayload, inputSchema: EngineType) => EngineType;
+  inferOutputType: (payload: TPayload, inputType: DataType) => DataType;  // replaces inferOutputSchema
   execute: (payload: TPayload, input: TInput, ctx: ExecutionContext) => Promise<TOutput>;
 }
 
@@ -33,7 +34,7 @@ export class UnknownNodeKindError extends Error {
 export class NodeRegistry {
   private defs: Map<string, NodeDefinition<any, any, any>> = new Map();
 
-  register<P, I, O>(def: NodeDefinition<P, I, O>): void {
+  register<P, I extends DataValue, O extends DataValue>(def: NodeDefinition<P, I, O>): void {
     if (this.defs.has(def.kind)) {
       throw new Error(`Node kind '${def.kind}' is already registered`);
     }

@@ -3,19 +3,20 @@ import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { LLMPayload } from '../payloads.js';
 import type { RowSet, Row } from '../../core/types/value.js';
 import type { RowSchema } from '../../core/types/schema.js';
+import type { DataType, DataValue } from '../../core/types/data-value.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
 import { MODELS } from '../../config/models.js';
 
 export function createLLMNodeDefinition(
   client: Anthropic,
-): NodeDefinition<LLMPayload, RowSet, RowSet> {
+): NodeDefinition<LLMPayload, DataValue, DataValue> {
   return {
     kind: 'llm',
     displayName: 'LLM',
     icon: '🤖',
     color: '#7C3AED',
-    inputPorts: [{ key: 'input', label: 'Input', type: { kind: 'any' }, required: true }],
-    outputPorts: [{ key: 'output', label: 'Output', type: { kind: 'any' }, required: true }],
+    inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'tabular' }, required: true }],
+    outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'tabular' }, required: true }],
 
     validate(payload: unknown) {
       const p = payload as LLMPayload;
@@ -32,18 +33,31 @@ export function createLLMNodeDefinition(
       return validationOk();
     },
 
-    inferOutputSchema(payload: LLMPayload, inputSchema: any) {
-      return { kind: 'rowset', schema: payload.outputSchema };
+    inferOutputType(payload: LLMPayload, inputType: DataType): DataType {
+      return { kind: 'tabular' };
     },
 
-    async execute(payload, input: RowSet, ctx): Promise<RowSet> {
-      if (!input?.rows?.length) {
-        return { schema: payload.outputSchema, rows: [] };
+    async execute(payload, input: DataValue, ctx): Promise<DataValue> {
+      // Unwrap DataValue to access RowSet
+      // Tabular: use data directly
+      // Record: wrap as single-row RowSet
+      // Others: empty RowSet
+      let inputRowSet: RowSet;
+      if (input.kind === 'tabular') {
+        inputRowSet = input.data;
+      } else if (input.kind === 'record') {
+        inputRowSet = { schema: input.schema, rows: [input.data] };
+      } else {
+        inputRowSet = { schema: { columns: [] }, rows: [] } as RowSet;
+      }
+
+      if (!inputRowSet.rows?.length) {
+        return { kind: 'tabular', schema: payload.outputSchema, data: { schema: payload.outputSchema, rows: [] } };
       }
 
       const outputRows: Row[] = [];
 
-      for (const row of input.rows) {
+      for (const row of inputRowSet.rows) {
         // Build user prompt from template parts
         // For literal parts: use the text
         // For expr parts: serialize the row as JSON
@@ -92,14 +106,15 @@ export function createLLMNodeDefinition(
       // Output schema: original row columns + declared output fields (avoid duplicates)
       const outputSchema: RowSchema = {
         columns: [
-          ...(input.schema?.columns ?? []),
+          ...(inputRowSet.schema?.columns ?? []),
           ...payload.outputSchema.columns.filter(c =>
-            !input.schema?.columns?.some(ic => ic.name === c.name),
+            !inputRowSet.schema?.columns?.some((ic: {name: string}) => ic.name === c.name),
           ),
         ],
       };
 
-      return { schema: outputSchema, rows: outputRows };
+      const outputRowSet: RowSet = { schema: outputSchema, rows: outputRows };
+      return { kind: 'tabular', data: outputRowSet, schema: outputSchema };
     },
   };
 }

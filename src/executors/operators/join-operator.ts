@@ -85,6 +85,7 @@ export class JoinOperator extends BasePhysicalOperator {
       
       const probeBatch = result.value;
       
+            
       // Capture probe schema on first batch
       if (this.probeSchema.columns.length === 0) {
         this.probeSchema = probeBatch.schema;

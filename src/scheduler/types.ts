@@ -10,7 +10,7 @@ import type { EdgeId } from '../core/graph/edge.js';
 import type { ExecutionContext } from '../core/context/execution-context.js';
 import type { ExecutionTrace } from '../core/context/execution-trace.js';
 import type { ExecutionBudget } from '../core/context/execution-budget.js';
-import type { Value } from '../core/types/value.js';
+import type { DataValue } from '../core/types/data-value.js';
 
 // ============================================================================
 // Scheduler Configuration
@@ -40,7 +40,7 @@ export type NodeExecutionState = {
   status: NodeExecutionStatus;
   startedAt?: number;
   completedAt?: number;
-  output?: Value;
+  output?: DataValue;  // was: Value | undefined
   error?: Error;
   retryCount: number;
 };
@@ -63,12 +63,12 @@ export type ExecutionState = {
 
 export type SchedulerEvent =
   | { kind: 'node_start'; nodeId: NodeId; timestamp: number }
-  | { kind: 'node_complete'; nodeId: NodeId; output: Value; timestamp: number }
+  | { kind: 'node_complete'; nodeId: NodeId; output: DataValue; timestamp: number }
   | { kind: 'node_skip'; nodeId: NodeId; reason: string; timestamp: number }
   | { kind: 'node_error'; nodeId: NodeId; error: Error; willRetry: boolean; timestamp: number }
   | { kind: 'branch_fork'; parentNodeId: NodeId; branchNodeIds: NodeId[]; timestamp: number }
   | { kind: 'branch_merge'; mergeNodeId: NodeId; branchCount: number; timestamp: number }
-  | { kind: 'pipeline_complete'; outputs: Map<string, Value>; timestamp: number }
+  | { kind: 'pipeline_complete'; outputs: Map<string, DataValue>; timestamp: number }
   | { kind: 'pipeline_error'; error: Error; timestamp: number };
 
 export type SchedulerEventHandler = (event: SchedulerEvent) => void;
@@ -79,7 +79,7 @@ export type SchedulerEventHandler = (event: SchedulerEvent) => void;
 
 export type ExecutionResult = {
   status: 'success' | 'partial' | 'failed';
-  outputs: Map<string, Value>;
+  outputs: Map<string, DataValue>;
   trace: ExecutionTrace;
   budgetUsed: ExecutionBudget;
   nodeStates: Map<NodeId, NodeExecutionState>;

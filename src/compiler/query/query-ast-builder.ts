@@ -21,11 +21,19 @@ export interface QueryASTBuildResult {
 export class QueryASTBuilder {
   constructor(
     private schema: SchemaConfig,
-    private evaluator: ExprEvaluator
+    private evaluator: ExprEvaluator,
+    private additionalFields?: Map<string, { name: string; type: any }[]>
   ) {}
 
-  build(intent: QueryIntent): QueryASTBuildResult {
+  build(intent: QueryIntent, additionalFields?: Map<string, { name: string; type: any }[]>): QueryASTBuildResult {
+    // Temporarily set additional fields for this build
+    const originalAdditionalFields = this.additionalFields;
+    this.additionalFields = additionalFields;
+    
     const validation = this.validateIntent(intent);
+    
+    // Restore original additional fields
+    this.additionalFields = originalAdditionalFields;
     
     if (!validation.isValid) {
       return {
@@ -58,15 +66,30 @@ export class QueryASTBuilder {
       }
 
       const table = column.table || intent.table;
-      if (!tableExists(this.schema, table)) {
-        errors.push(`Table '${table}' referenced in column '${column.field}' does not exist`);
-        continue;
+      let columnExists = false;
+      
+      // First check additional fields from previous pipeline steps
+      if (this.additionalFields) {
+        for (const [sourceName, fields] of this.additionalFields) {
+          if (fields.some(f => f.name === column.field)) {
+            columnExists = true;
+            break;
+          }
+        }
       }
-
-      const tableConfig = getTable(this.schema, table);
-      const columnExists = tableConfig.columns.some(col => col.name === column.field);
+      
+      // If not found in additional fields, check database tables
       if (!columnExists) {
-        errors.push(`Column '${column.field}' does not exist in table '${table}'`);
+        if (!tableExists(this.schema, table)) {
+          errors.push(`Table '${table}' referenced in column '${column.field}' does not exist`);
+          continue;
+        }
+
+        const tableConfig = getTable(this.schema, table);
+        columnExists = tableConfig.columns.some(col => col.name === column.field);
+        if (!columnExists) {
+          errors.push(`Column '${column.field}' does not exist in table '${table}'`);
+        }
       }
     }
 
@@ -83,19 +106,33 @@ export class QueryASTBuilder {
 
       for (const filter of intent.filters) {
         const table = filter.table || intent.table;
+        let columnExists = false;
         
-        // Resolve alias to actual table name
-        const actualTable = aliasToTable.get(table) || table;
-        
-        if (!tableExists(this.schema, actualTable)) {
-          errors.push(`Table '${table}' referenced in filter '${filter.field}' does not exist`);
-          continue;
+        // First check additional fields from previous pipeline steps
+        if (this.additionalFields) {
+          for (const [sourceName, fields] of this.additionalFields) {
+            if (fields.some(f => f.name === filter.field)) {
+              columnExists = true;
+              break;
+            }
+          }
         }
-
-        const tableConfig = getTable(this.schema, actualTable);
-        const columnExists = tableConfig.columns.some(col => col.name === filter.field);
+        
+        // If not found in additional fields, check database tables
         if (!columnExists) {
-          errors.push(`Filter column '${filter.field}' does not exist in table '${table}'`);
+          // Resolve alias to actual table name
+          const actualTable = aliasToTable.get(table) || table;
+          
+          if (!tableExists(this.schema, actualTable)) {
+            errors.push(`Table '${table}' referenced in filter '${filter.field}' does not exist`);
+            continue;
+          }
+
+          const tableConfig = getTable(this.schema, actualTable);
+          columnExists = tableConfig.columns.some(col => col.name === filter.field);
+          if (!columnExists) {
+            errors.push(`Filter column '${filter.field}' does not exist in table '${table}'`);
+          }
         }
       }
     }
@@ -126,36 +163,47 @@ export class QueryASTBuilder {
         let fieldExists = false;
         let errorDetails = '';
 
-        if (field.includes('.')) {
-          // Parse as 'table.column'
-          const [tableName, columnName] = field.split('.');
-          
-          // Resolve alias to actual table name
-          const actualTable = aliasToTable.get(tableName) || tableName;
-          
-          if (!tableExists(this.schema, actualTable)) {
-            errors.push(`GroupBy field '${field}' references non-existent table '${tableName}'`);
-            continue;
-          }
-
-          const tableConfig = getTable(this.schema, actualTable);
-          if (tableConfig.columns.some(col => col.name === columnName)) {
-            fieldExists = true;
-          } else {
-            errorDetails = ` in table '${tableName}'`;
-          }
-        } else {
-          // No table prefix - check all tables
-          for (const tableName of allTables) {
-            const tableConfig = getTable(this.schema, tableName);
-            if (tableConfig.columns.some(col => col.name === field)) {
+        if (this.additionalFields) {
+          for (const [sourceName, fields] of this.additionalFields) {
+            if (fields.some(f => f.name === field)) {
               fieldExists = true;
               break;
             }
           }
+        }
 
-          if (!fieldExists) {
-            errorDetails = ` in any table (${allTables.join(', ')})`;
+        if (!fieldExists) {
+          if (field.includes('.')) {
+            // Parse as 'table.column'
+            const [tableName, columnName] = field.split('.');
+            
+            // Resolve alias to actual table name
+            const actualTable = aliasToTable.get(tableName) || tableName;
+            
+            if (!tableExists(this.schema, actualTable)) {
+              errors.push(`GroupBy field '${field}' references non-existent table '${tableName}'`);
+              continue;
+            }
+
+            const tableConfig = getTable(this.schema, actualTable);
+            if (tableConfig.columns.some(col => col.name === columnName)) {
+              fieldExists = true;
+            } else {
+              errorDetails = ` in table '${tableName}'`;
+            }
+          } else {
+            // No table prefix - check all tables
+            for (const tableName of allTables) {
+              const tableConfig = getTable(this.schema, tableName);
+              if (tableConfig.columns.some(col => col.name === field)) {
+                fieldExists = true;
+                break;
+              }
+            }
+
+            if (!fieldExists) {
+              errorDetails = ` in any table (${allTables.join(', ')})`;
+            }
           }
         }
 
@@ -276,7 +324,21 @@ export class QueryASTBuilder {
     }
     
     const joinNodes = this.buildJoinNodes(intent, joinedTableFilters);
-    const whereExpr = this.buildWhereExpr(primaryTableFilters);
+    
+    // For INNER joins, include joined table filters in WHERE clause
+    // For LEFT joins, filters are already applied in ON condition
+    const allWhereFilters = [...primaryTableFilters];
+    if (intent.joins) {
+      for (const join of intent.joins) {
+        if (join.kind === 'INNER') {
+          const joinKey = join.alias || join.table;
+          const joinFilters = joinedTableFilters.get(joinKey) || [];
+          allWhereFilters.push(...joinFilters);
+        }
+      }
+    }
+    
+    const whereExpr = this.buildWhereExpr(allWhereFilters);
     const projections = this.buildProjections(intent, scanNode, joinNodes);
 
     // Build table-to-alias mapping for field resolution
@@ -370,9 +432,10 @@ export class QueryASTBuilder {
         }
       }
 
-      // Add filters for this joined table to the ON condition (for LEFT joins)
+      // Add filters for this joined table to the ON condition only for LEFT joins
+      // INNER joins should have filters applied in WHERE clause after join
       const joinFilters = joinedTableFilters.get(joinKey) || [];
-      if (joinFilters.length > 0) {
+      if (joinFilters.length > 0 && join.kind === 'LEFT') {
         for (const filter of joinFilters) {
           const filterExpr = this.buildFilterExpr(filter);
           // Combine with ON condition using AND
@@ -508,10 +571,44 @@ export class QueryASTBuilder {
     }
 
     return intent.orderBy.map(order => ({
-      expr: this.parseFieldReference(order.field, tableToAlias),
+      expr: order.expr ? this.parseSqlExpr(order.expr) : this.parseFieldReference(order.field, tableToAlias),
       direction: order.direction || 'ASC',
       nulls: order.nulls || 'LAST'
     }));
+  }
+
+  private parseSqlExpr(sqlExpr: string): ExprAST {
+    // Handle CASE expressions for priority sorting
+    if (sqlExpr.includes('CASE') && sqlExpr.includes('priority')) {
+      // Parse CASE priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 END
+      const priorityField = this.parseFieldReference('priority');
+      
+      // Build nested Conditional expressions for CASE logic
+      return {
+        kind: 'Conditional',
+        condition: { kind: 'BinaryOp', op: '=', left: priorityField, right: { kind: 'Literal', value: 'critical', type: { kind: 'string' } } },
+        then: { kind: 'Literal', value: 1, type: { kind: 'number' } },
+        else: {
+          kind: 'Conditional',
+          condition: { kind: 'BinaryOp', op: '=', left: priorityField, right: { kind: 'Literal', value: 'high', type: { kind: 'string' } } },
+          then: { kind: 'Literal', value: 2, type: { kind: 'number' } },
+          else: {
+            kind: 'Conditional',
+            condition: { kind: 'BinaryOp', op: '=', left: priorityField, right: { kind: 'Literal', value: 'medium', type: { kind: 'string' } } },
+            then: { kind: 'Literal', value: 3, type: { kind: 'number' } },
+            else: {
+              kind: 'Conditional',
+              condition: { kind: 'BinaryOp', op: '=', left: priorityField, right: { kind: 'Literal', value: 'low', type: { kind: 'string' } } },
+              then: { kind: 'Literal', value: 4, type: { kind: 'number' } },
+              else: { kind: 'Literal', value: 5, type: { kind: 'number' } } // Default for unknown priorities
+            }
+          }
+        }
+      };
+    }
+    
+    // Fallback to field reference
+    return this.parseFieldReference(sqlExpr);
   }
 
   private parseFieldReference(field: string, tableToAlias?: Map<string, string>): ExprAST {

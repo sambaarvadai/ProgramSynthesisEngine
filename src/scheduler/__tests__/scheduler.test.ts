@@ -79,10 +79,10 @@ function buildScheduler(): Scheduler {
   nodeRegistry.register({
     kind: 'failing',
     displayName: 'Failing Node',
-    inputPorts: [{ key: 'input', label: 'Input', type: 'infer', required: true }],
-    outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+    inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'any' }, required: true }],
+    outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'any' }, required: true }],
     validate: () => ({ ok: true }),
-    inferOutputSchema: (_p, s) => s,
+    inferOutputType: () => ({ kind: 'any' }),
     execute: async () => {
       throw new Error('Mock failure');
     }
@@ -91,10 +91,10 @@ function buildScheduler(): Scheduler {
   nodeRegistry.register({
     kind: 'flaky',
     displayName: 'Flaky Node',
-    inputPorts: [{ key: 'input', label: 'Input', type: 'infer', required: true }],
-    outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+    inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'any' }, required: true }],
+    outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'any' }, required: true }],
     validate: () => ({ ok: true }),
-    inferOutputSchema: (_p, s) => s,
+    inferOutputType: () => ({ kind: 'tabular' }),
     execute: async () => {
       if ((global as any).__flakyCallCount === undefined) {
         (global as any).__flakyCallCount = 0;
@@ -103,20 +103,20 @@ function buildScheduler(): Scheduler {
       if ((global as any).__flakyCallCount < 3) {
         throw new Error('Flaky failure');
       }
-      return { rows: [], schema: { columns: [] } };
+      return { kind: 'tabular', data: { rows: [], schema: { columns: [] } }, schema: { columns: [] } };
     }
   });
 
   nodeRegistry.register({
     kind: 'slow',
     displayName: 'Slow Node',
-    inputPorts: [{ key: 'input', label: 'Input', type: 'infer', required: true }],
-    outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+    inputPorts: [{ key: 'input', label: 'Input', dataType: { kind: 'any' }, required: true }],
+    outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'any' }, required: true }],
     validate: () => ({ ok: true }),
-    inferOutputSchema: (_p, s) => s,
+    inferOutputType: () => ({ kind: 'tabular' }),
     execute: async () => {
       await new Promise(resolve => setTimeout(resolve, 1));
-      return { rows: [], schema: { columns: [] } };
+      return { kind: 'tabular', data: { rows: [], schema: { columns: [] } }, schema: { columns: [] } };
     }
   });
 
@@ -212,7 +212,9 @@ test('Linear pipeline — Input → Transform → Output', async () => {
   assert.strictEqual(result.status, 'success');
   assert.ok(result.outputs.has('output'));
   
-  const output = result.outputs.get('output') as RowSet;
+  const outputDv = result.outputs.get('output')!;
+  assert.strictEqual(outputDv.kind, 'tabular');
+  const output = (outputDv as { kind: 'tabular'; data: RowSet }).data;
   assert.strictEqual(output.rows.length, 5);
   
   for (const row of output.rows) {
@@ -501,7 +503,9 @@ test('Parallel branches', async () => {
   assert.strictEqual(result.status, 'success');
   assert.ok(result.outputs.has('output'));
   
-  const output = result.outputs.get('output') as RowSet;
+  const outputDv = result.outputs.get('output')!;
+  assert.strictEqual(outputDv.kind, 'tabular');
+  const output = (outputDv as { kind: 'tabular'; data: RowSet }).data;
   assert.ok(output.rows.length > 0);
 });
 
@@ -822,7 +826,9 @@ test('ConditionalNode — true branch taken', async () => {
   assert.strictEqual(result.status, 'success');
   assert.ok(result.outputs.has('output'));
   
-  const output = result.outputs.get('output') as RowSet;
+  const outputDv = result.outputs.get('output')!;
+  assert.strictEqual(outputDv.kind, 'tabular');
+  const output = (outputDv as { kind: 'tabular'; data: RowSet }).data;
   assert.strictEqual(output.rows.length, 1);
   assert.strictEqual((output.rows[0] as any).branch, 'high');
   
@@ -971,7 +977,9 @@ test('ConditionalNode — false branch taken', async () => {
   assert.strictEqual(result.status, 'success');
   assert.ok(result.outputs.has('output'));
   
-  const output = result.outputs.get('output') as RowSet;
+  const outputDv = result.outputs.get('output')!;
+  assert.strictEqual(outputDv.kind, 'tabular');
+  const output = (outputDv as { kind: 'tabular'; data: RowSet }).data;
   assert.strictEqual(output.rows.length, 1);
   assert.strictEqual((output.rows[0] as any).branch, 'low');
   
@@ -1059,11 +1067,12 @@ test('LoopNode — forEach over RowSet rows', async () => {
   assert.strictEqual(loopState.status, 'completed');
   
   const output = loopState.output as any;
-  // Collect accumulator returns array of RowSets
-  assert.ok(Array.isArray(output), 'output is array');
-  assert.strictEqual(output.length, 3, '3 iterations');
+  // Collect accumulator returns DataValue collection
+  assert.strictEqual(output.kind, 'collection', 'output is collection DataValue');
+  assert.strictEqual(output.data.length, 3, '3 iterations');
   
-  const rows = output.map((rs: any) => rs.rows[0]);
+  // Each item in collection is a tabular DataValue from transform
+  const rows = output.data.map((dv: any) => dv.data.rows[0]);
   assert.strictEqual(rows[0].doubled, 20);
   assert.strictEqual(rows[1].doubled, 40);
   assert.strictEqual(rows[2].doubled, 60);
@@ -1147,10 +1156,11 @@ test('LoopNode — while loop', async () => {
   assert.strictEqual(loopState.status, 'completed');
   
   const output = loopState.output as any;
-  assert.ok(Array.isArray(output));
-  assert.strictEqual(output.length, 3);
+  assert.strictEqual(output.kind, 'collection', 'output is collection DataValue');
+  assert.strictEqual(output.data.length, 3);
   
-  const rows = output.map((rs: any) => rs.rows?.[0] ?? rs);
+  // Each item is a tabular DataValue from transform
+  const rows = output.data.map((dv: any) => dv.data.rows?.[0] ?? dv.data);
   assert.strictEqual(rows[0].iteration, 0);
   assert.strictEqual(rows[1].iteration, 1);
   assert.strictEqual(rows[2].iteration, 2);
@@ -1237,13 +1247,13 @@ test('LoopNode — maxIterations hard cap', async () => {
   const output = loopState.output as any;
   
   // Capped at 5 iterations over 20 rows
-  // Collect accumulator returns array of RowSets
-  assert.ok(Array.isArray(output));
-  assert.strictEqual(output.length, 5);
+  // Collect accumulator returns DataValue collection
+  assert.strictEqual(output.kind, 'collection', 'output is collection DataValue');
+  assert.strictEqual(output.data.length, 5);
   
-  // Each RowSet has one row
-  assert.strictEqual(output[0].rows.length, 1);
-  assert.strictEqual(output[0].rows[0].processed, true);
+  // Each item is a tabular DataValue with one row
+  assert.strictEqual(output.data[0].data.rows.length, 1);
+  assert.strictEqual(output.data[0].data.rows[0].processed, true);
 });
 
 test('Nested: ConditionalNode inside LoopNode', async () => {
@@ -1399,12 +1409,15 @@ test('Nested: ConditionalNode inside LoopNode', async () => {
   
   const output = loopState.output as any;
   // 4 iterations (4 rows in input)
-  assert.ok(Array.isArray(output));
-  assert.strictEqual(output.length, 4);
+  assert.strictEqual(output.kind, 'collection', 'output is collection DataValue');
+  assert.strictEqual(output.data.length, 4);
   
-  const allRows = output.flatMap((rs: any) => 
-    Array.isArray(rs) ? rs.flatMap((r: any) => r.rows ?? [r]) : (rs.rows ?? [rs])
-  );
+  // Each item is a tabular DataValue from the merge node
+  const allRows = output.data.flatMap((dv: any) => {
+    if (dv.kind === 'tabular') return dv.data.rows;
+    if (dv.kind === 'record') return [dv.data];
+    return [];
+  });
   const passing = allRows.filter((r: any) => r.grade === 'pass');
   const failing = allRows.filter((r: any) => r.grade === 'fail');
   assert.strictEqual(passing.length, 2);
@@ -1513,19 +1526,19 @@ test('LoopNode — scope isolation between iterations', async () => {
   
   const output = loopState.output as any;
   // 3 iterations
-  // Collect accumulator returns array of RowSets
-  assert.ok(Array.isArray(output));
-  assert.strictEqual(output.length, 3);
+  // Collect accumulator returns DataValue collection
+  assert.strictEqual(output.kind, 'collection', 'output is collection DataValue');
+  assert.strictEqual(output.data.length, 3);
   
-  // Each RowSet has one row
-  assert.strictEqual(output[0].rows.length, 1);
-  assert.strictEqual(output[1].rows.length, 1);
-  assert.strictEqual(output[2].rows.length, 1);
+  // Each item is a tabular DataValue with one row
+  assert.strictEqual(output.data[0].data.rows.length, 1);
+  assert.strictEqual(output.data[1].data.rows.length, 1);
+  assert.strictEqual(output.data[2].data.rows.length, 1);
   
   // Scope isolation is tested by ensuring each iteration's transforms work independently
-  assert.strictEqual(output[0].rows[0].captured, output[0].rows[0].also_captured);
-  assert.strictEqual(output[1].rows[0].captured, output[1].rows[0].also_captured);
-  assert.strictEqual(output[2].rows[0].captured, output[2].rows[0].also_captured);
+  assert.strictEqual(output.data[0].data.rows[0].captured, output.data[0].data.rows[0].also_captured);
+  assert.strictEqual(output.data[1].data.rows[0].captured, output.data[1].data.rows[0].also_captured);
+  assert.strictEqual(output.data[2].data.rows[0].captured, output.data[2].data.rows[0].also_captured);
 });
 
 console.log('Scheduler tests defined');

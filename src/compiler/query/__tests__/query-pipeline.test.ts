@@ -324,15 +324,22 @@ test('QueryPlanner - predicate pushdown', () => {
   // The plan should have optimizations array
   assert.ok(Array.isArray(plan.optimizations), 'Plan should have optimizations array');
   
-  // Find scan and filter nodes
+  // Find scan and filter nodes (after predicate pushdown, filter may be in scan)
   let hasScan = false;
   let hasFilter = false;
+  let scanHasPredicate = false;
   for (const node of plan.nodes.values()) {
-    if (node.kind === 'Scan') hasScan = true;
+    if (node.kind === 'Scan') {
+      hasScan = true;
+      if ((node.payload as any).predicate) {
+        scanHasPredicate = true;
+      }
+    }
     if (node.kind === 'Filter') hasFilter = true;
   }
   assert.ok(hasScan, 'Plan should have Scan node');
-  assert.ok(hasFilter, 'Plan should have Filter node');
+  // After predicate pushdown optimization, filter should be in scan node
+  assert.ok(scanHasPredicate || hasFilter, 'Plan should have filter (either as Filter node or in Scan predicate)');
 });
 
 // ============================================================================
@@ -409,7 +416,7 @@ test('QueryExecutor - full pipeline', async () => {
   // All rows should have status = 'completed'
   result.rows.forEach((row: any, index: number) => {
     const status = row.status || row['o.status'] || row['orders.status'];
-    assert.ok(status === 'completed', `Row ${index} should have status='completed'`);
+    assert.ok(status === 'completed', `Row ${index} should have status='completed', got ${JSON.stringify(status)}`);
   });
 });
 

@@ -2,7 +2,8 @@
 
 import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { InputPayload } from '../payloads.js';
-import type { RowSet, EngineType } from '../../core/types/index.js';
+import type { RowSet } from '../../core/types/index.js';
+import type { DataType, DataValue } from '../../core/types/data-value.js';
 import type { ExecutionContext } from '../../core/context/execution-context.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
 
@@ -13,11 +14,11 @@ class MissingParamError extends Error {
   }
 }
 
-export const inputNodeDefinition: NodeDefinition<InputPayload, never, RowSet> = {
+export const inputNodeDefinition: NodeDefinition<InputPayload, DataValue, DataValue> = {
   kind: 'input',
   displayName: 'Input',
   inputPorts: [],
-  outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+  outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'tabular' }, required: true }],
 
   validate(payload: unknown) {
     const p = payload as InputPayload;
@@ -44,11 +45,11 @@ export const inputNodeDefinition: NodeDefinition<InputPayload, never, RowSet> = 
     return validationOk();
   },
 
-  inferOutputSchema(payload: InputPayload, _inputSchema: EngineType): EngineType {
-    return { kind: 'rowset', schema: payload.schema };
+  inferOutputType(payload: InputPayload, _inputType: DataType): DataType {
+    return { kind: 'tabular' };
   },
 
-  async execute(payload: InputPayload, _input: never, ctx: ExecutionContext): Promise<RowSet> {
+  async execute(payload: InputPayload, _input: DataValue, ctx: ExecutionContext): Promise<DataValue> {
     if (payload.source.kind === 'param') {
       const value = ctx.params[payload.source.paramKey];
       if (value === undefined) {
@@ -59,10 +60,13 @@ export const inputNodeDefinition: NodeDefinition<InputPayload, never, RowSet> = 
         throw new TypeError(`Parameter ${payload.source.paramKey} must be a RowSet`);
       }
 
-      return value as RowSet;
+      // Wrap RowSet as tabular DataValue
+      const rs = value as RowSet;
+      return { kind: 'tabular', data: rs, schema: rs.schema };
     } else {
       // static source
-      return payload.source.data;
+      const rs = payload.source.data;
+      return { kind: 'tabular', data: rs, schema: rs.schema };
     }
   }
 };

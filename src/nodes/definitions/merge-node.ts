@@ -2,7 +2,8 @@
 
 import type { NodeDefinition } from '../../core/registry/node-registry.js';
 import type { MergePayload, MergeStrategy } from '../payloads.js';
-import type { RowSet, EngineType } from '../../core/types/index.js';
+import type { RowSet } from '../../core/types/value.js';
+import type { DataType, DataValue } from '../../core/types/data-value.js';
 import type { ExecutionContext } from '../../core/context/execution-context.js';
 import { validationOk, validationFail } from '../../core/types/validation.js';
 
@@ -62,11 +63,11 @@ function hashJoin(inputs: RowSet[], joinOn: string[]): RowSet {
   return { schema: { columns }, rows: joinedRows };
 }
 
-export const mergeNodeDefinition: NodeDefinition<MergePayload, RowSet[], RowSet> = {
+export const mergeNodeDefinition: NodeDefinition<MergePayload, DataValue, DataValue> = {
   kind: 'merge',
   displayName: 'Merge',
-  inputPorts: [{ key: 'inputs', label: 'Inputs', type: 'infer', required: true }],
-  outputPorts: [{ key: 'output', label: 'Output', type: 'infer', required: true }],
+  inputPorts: [{ key: 'inputs', label: 'Inputs', dataType: { kind: 'collection', itemKind: 'tabular' }, required: true }],
+  outputPorts: [{ key: 'output', label: 'Output', dataType: { kind: 'any' }, required: true }],
 
   validate(payload: unknown) {
     const p = payload as MergePayload;
@@ -83,28 +84,44 @@ export const mergeNodeDefinition: NodeDefinition<MergePayload, RowSet[], RowSet>
     return validationOk();
   },
 
-  inferOutputSchema(payload: MergePayload, inputSchema: EngineType): EngineType {
-    return inputSchema;
+  inferOutputType(payload: MergePayload, inputType: DataType): DataType {
+    return { kind: 'tabular' };
   },
 
-  async execute(payload: MergePayload, inputs: RowSet[], ctx: ExecutionContext): Promise<RowSet> {
+  async execute(payload: MergePayload, input: DataValue, ctx: ExecutionContext): Promise<DataValue> {
+    // Extract RowSet array from collection DataValue
+    const inputs: RowSet[] = [];
+    if (input.kind === 'collection') {
+      for (const item of input.data) {
+        if (item.kind === 'tabular') {
+          inputs.push(item.data);
+        }
+      }
+    } else if (input.kind === 'tabular') {
+      inputs.push(input.data);
+    }
     const nonNullInputs = inputs.filter(i => i !== null && i !== undefined);
 
+    let result: RowSet;
     switch (payload.strategy) {
       case 'union':
         if (nonNullInputs.length === 0) {
-          return { schema: { columns: [] }, rows: [] };
+          result = { schema: { columns: [] }, rows: [] };
+        } else {
+          // Concatenate all rows, use schema from first non-empty input
+          const firstInput = nonNullInputs[0];
+          const allRows = nonNullInputs.flatMap(i => i.rows);
+          result = { schema: firstInput.schema, rows: allRows };
         }
-        // Concatenate all rows, use schema from first non-empty input
-        const firstInput = nonNullInputs[0];
-        const allRows = nonNullInputs.flatMap(i => i.rows);
-        return { schema: firstInput.schema, rows: allRows };
+        break;
 
       case 'first':
-        return nonNullInputs[0] || { schema: { columns: [] }, rows: [] };
+        result = nonNullInputs[0] || { schema: { columns: [] }, rows: [] };
+        break;
 
       case 'last':
-        return nonNullInputs[nonNullInputs.length - 1] || { schema: { columns: [] }, rows: [] };
+        result = nonNullInputs[nonNullInputs.length - 1] || { schema: { columns: [] }, rows: [] };
+        break;
 
       case 'join':
         if (!payload.joinOn || payload.joinOn.length === 0) {
@@ -116,10 +133,14 @@ export const mergeNodeDefinition: NodeDefinition<MergePayload, RowSet[], RowSet>
         }
 
         // Simple hash join implementation
-        return hashJoin(nonNullInputs, payload.joinOn);
+        result = hashJoin(nonNullInputs, payload.joinOn);
+        break;
 
       default:
         throw new Error(`Unknown merge strategy: ${payload.strategy}`);
     }
+    
+    // Wrap result as tabular DataValue
+    return { kind: 'tabular', data: result, schema: result.schema };
   }
 };

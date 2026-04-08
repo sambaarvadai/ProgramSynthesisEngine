@@ -1,6 +1,6 @@
 // Defines graph edge structures and edge operations
 
-import type { EngineType } from '../types/engine-type.js';
+import type { DataType } from '../types/data-value.js';
 
 export type EdgeId = string;
 
@@ -16,7 +16,7 @@ export interface PipelineEdge {
   // data edge fields
   outputKey?: string;
   inputKey?: string;
-  schema?: EngineType;
+  dataType?: DataType;        // replaces schema?: EngineType
   // control edge fields
   condition?: ControlCondition;
 }

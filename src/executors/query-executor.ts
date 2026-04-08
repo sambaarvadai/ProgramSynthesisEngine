@@ -53,9 +53,9 @@ export class QueryExecutor {
     );
   }
 
-  async execute(intent: QueryIntent, ctx: ExecutionContext): Promise<QueryResult> {
+  async execute(intent: QueryIntent, ctx: ExecutionContext, additionalFields?: Map<string, { name: string; type: any }[]>): Promise<QueryResult> {
     // 1. Build AST with validation
-    const { ast, validation } = this.astBuilder.build(intent);
+    const { ast, validation } = this.astBuilder.build(intent, additionalFields);
     
     if (!validation.isValid) {
       throw new QueryValidationError(validation.errors);

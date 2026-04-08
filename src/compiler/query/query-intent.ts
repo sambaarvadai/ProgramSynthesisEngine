@@ -31,6 +31,7 @@ export interface QueryIntentOrderBy {
   table?: string;
   direction?: 'ASC' | 'DESC';
   nulls?: 'FIRST' | 'LAST';
+  expr?: string; // SQL expression for complex sorting
 }
 
 export interface QueryIntent {
