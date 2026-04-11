@@ -3,7 +3,7 @@
 
 import type { ExprAST } from '../core/ast/expr-ast.js';
 import type { EngineType, RowSchema, Value, RowSet } from '../core/types/index.js';
-import type { QueryIntent } from '../compiler/query/query-intent.js';
+import type { QueryIntent } from '../compiler/query-ast/query-intent.js';
 
 // ============================================================================
 // Template String
@@ -126,4 +126,20 @@ export type SubPipelinePayload = {
   pipelineId: string;
   inputMap: Record<string, ExprAST>;
   outputMap: Record<string, string>;
+};
+
+export type WriteMode = 'insert' | 'update' | 'upsert' | 'insert_ignore' | 'delete';
+
+export type WritePayload = {
+  table: string;
+  mode: WriteMode;
+  columns: string[];
+  staticValues?: Record<string, unknown>;
+  staticWhere?: Record<string, unknown>;
+  conflictColumns?: string[];
+  updateColumns?: string[];
+  whereColumns?: string[];
+  returning?: string[];
+  batchSize?: number;
+  datasource: string;
 };

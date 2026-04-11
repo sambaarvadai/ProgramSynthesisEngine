@@ -12,6 +12,7 @@ import {
   ExecutionResult,
   Value,
 } from './index.js';
+import { CalciteClient } from './compiler/calcite/index.js';
 import { PostgresBackend, SQLiteTempStore } from './storage/index.js';
 import { stripHallucinatedFieldRefs } from './compiler/pipeline/expr-sanitizer.js';
 import { PipelineIntentGenerator } from './compiler/pipeline/index.js';
@@ -29,7 +30,7 @@ import type {
   PipelineNode,
 } from './core/graph/index.js';
 import type { SchemaConfig } from './compiler/schema/index.js';
-import type { QueryPayload, TransformPayload, ConditionalPayload, LLMPayload } from './nodes/payloads.js';
+import type { QueryPayload, TransformPayload, ConditionalPayload, LLMPayload, HttpPayload, WritePayload } from './nodes/payloads.js';
 import { MODELS } from './config/models.js';
 
 export type PipelineEngineConfig = {
@@ -80,6 +81,7 @@ export class PipelineEngine {
   private queryExecutor: QueryExecutor;
   private storageBackend: StorageBackend;
   private tempStore: TempStore;
+  public calciteClient: CalciteClient;
 
   constructor(private config: PipelineEngineConfig) {
     // Initialize Anthropic client for transform enrichment
@@ -106,6 +108,13 @@ export class PipelineEngine {
       preSelector,
     });
 
+    // Initialize storage backend
+    this.storageBackend =
+      config.storageBackend ??
+      (config.postgresUrl
+        ? new PostgresBackend(config.postgresUrl)
+        : new PostgresBackend('postgresql://localhost:5432/default'));
+
     // Initialize registries
     this.nodeRegistry = new NodeRegistry();
     this.fnRegistry = new FunctionRegistry();
@@ -114,20 +123,31 @@ export class PipelineEngine {
     // Initialize evaluator
     this.evaluator = new ExprEvaluator(this.fnRegistry);
 
+    // Initialize temp store
+    this.tempStore = new SQLiteTempStore(':memory:');
+
+    // Initialize CalciteClient
+    this.calciteClient = new CalciteClient(
+      process.env.CALCITE_URL ?? 'http://localhost:8765'
+    );
+    
+    // Non-blocking availability check
+    this.calciteClient.isAvailable().then(available => {
+      if (available) {
+        console.log('Calcite compiler: connected at', process.env.CALCITE_URL ?? 'http://localhost:8765')
+      } else {
+        console.log('Calcite compiler: not available - using fallback SQL builder')
+      }
+    });
+
     // Register nodes with dependencies
     registerAllNodes(this.nodeRegistry, {
       anthropicApiKey: config.anthropicApiKey,
+      evaluator: this.evaluator,
+      storageBackend: this.storageBackend,
+      schema: config.schema,
+      calciteClient: this.calciteClient,
     });
-
-    // Initialize storage backend
-    this.storageBackend =
-      config.storageBackend ??
-      (config.postgresUrl
-        ? new PostgresBackend(config.postgresUrl)
-        : new PostgresBackend('postgresql://localhost:5432/default'));
-
-    // Initialize temp store
-    this.tempStore = new SQLiteTempStore(':memory:');
 
     // Initialize query executor
     this.queryExecutor = new QueryExecutor({
@@ -136,6 +156,7 @@ export class PipelineEngine {
       tempStore: this.tempStore,
       evaluator: this.evaluator,
       batchSize: config.defaultBatchSize || 100,
+      calciteClient: this.calciteClient,
     });
 
     // Initialize scheduler
@@ -392,6 +413,45 @@ export class PipelineEngine {
           // Generate real prompt template from step.description
           node.payload = await this.enrichLLMNode(step, node.payload as LLMPayload);
           break;
+        }
+
+        case 'http': {
+          const url = step.config?.url as string
+                   ?? step.config?.endpoint as string
+                   ?? ''
+          const method = (step.config?.method as string ?? 'POST').toUpperCase()
+          const authHeader = step.config?.authHeader as string ?? 'Authorization'
+          const authToken = step.config?.authToken as string
+                         ?? step.config?.apiKey as string
+                         ?? ''
+          
+          // Resolve auth token from env if it looks like an env var name
+          const resolvedToken = authToken.startsWith('process.env.')
+            ? process.env[authToken.replace('process.env.', '')] ?? ''
+            : authToken.startsWith('$')
+            ? process.env[authToken.slice(1)] ?? ''
+            : authToken
+          
+          node.payload = {
+            url: { parts: [{ kind: 'literal', text: url }] },
+            method: method as 'GET' | 'POST' | 'PUT' | 'DELETE',
+            headers: resolvedToken ? {
+              [authHeader]: { parts: [{ kind: 'literal', text: resolvedToken }] }
+            } : {},
+            body: {
+              kind: 'VarRef',
+              name: 'input'
+            },
+            outputSchema: { kind: 'any' },
+            retryPolicy: { maxRetries: 2, backoffMs: 1000 }
+          } as HttpPayload
+          break
+        }
+
+        case 'write': {
+          const writeConfig = await this.enrichWriteNode(step, fieldMap)
+          node.payload = writeConfig
+          break
         }
 
         // loop, merge, parallel: structural nodes — no enrichment needed
@@ -699,5 +759,106 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
       maxTokens: 500,
       cacheBy: ['id'], // cache by id field if present to avoid duplicate LLM calls
     };
+  }
+
+  private async enrichWriteNode(
+    step: PipelineStepIntent,
+    fieldMap: Map<string, string[]>
+  ): Promise<WritePayload> {
+    const availableFields = this.getAvailableFields(step.id, { description: '', steps: [step], budget: {} }, fieldMap);
+    
+    const prompt = `Extract database write configuration from this step description:
+"${step.description}"
+
+Identify:
+1. 'columns': field names that come FROM input data rows (dynamic SET values)
+2. 'staticValues': literal SET values mentioned in the description
+3. 'whereColumns': field names from input rows used in WHERE
+4. 'staticWhere': literal WHERE values mentioned in the description
+                  (e.g., 'ID=2', 'where id is 5', 'ticket 3')
+
+Examples:
+'update ticket ID=2 status to in_progress'
+-> columns: []
+-> staticValues: { 'status': 'in_progress' }
+-> whereColumns: []
+-> staticWhere: { 'id': 2 }
+
+'for each order set status to completed where order_id matches'
+-> columns: []
+-> staticValues: { 'status': 'completed' }
+-> whereColumns: ['order_id']
+-> staticWhere: {}
+
+'update the email for customer_id from the row, where id is from the row'
+-> columns: ['email']
+-> staticValues: {}
+-> whereColumns: ['id']
+-> staticWhere: {}
+
+Available tables: ${Array.from(this.config.schema?.tables.keys() ?? []).join(', ')}
+Available input fields: ${availableFields.join(', ')}
+
+Return JSON:
+{
+  'table': 'table_name',
+  'mode': 'update',
+  'columns': [],
+  'staticValues': { 'field': 'value' },
+  'staticWhere': { 'field': value },
+  'whereColumns': [],
+  'conflictColumns': []
+}
+
+IMPORTANT:
+- Only put field names in "columns" if they exist in availableFields
+- Put hardcoded/literal values in "staticValues"
+- For NOW() timestamps, use the string "NOW()"
+Return ONLY raw JSON.`;
+
+    const response = await this.client.messages.create({
+      model: MODELS.LLM_NODE,
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const raw = response.content[0].type === 'text' ? response.content[0].text : '{}';
+    console.log('[Write Enrichment LLM Output]', raw);
+    const clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+    try {
+      const config = JSON.parse(clean);
+      
+      // Detect log tables and default to insert_ignore for safety
+      const tableName = config.table ?? step.config?.table as string ?? 'output';
+      const isLogTable = tableName.includes('_log') || 
+                         tableName.includes('_audit') ||
+                         tableName.includes('notification');
+      
+      let mode = config.mode ?? (step.config?.mode as string ?? 'insert') as 'insert' | 'update' | 'upsert' | 'insert_ignore' | 'delete';
+      if (isLogTable && mode === 'insert') {
+        mode = 'insert_ignore';
+      }
+      
+      return {
+        table: tableName,
+        mode,
+        columns: config.columns ?? [],
+        staticValues: config.staticValues ?? {},
+        staticWhere: config.staticWhere ?? {},
+        conflictColumns: config.conflictColumns as string[],
+        updateColumns: config.updateColumns as string[],
+        whereColumns: config.whereColumns as string[],
+        datasource: 'default'
+      };
+    } catch {
+      // Fallback to basic configuration
+      return {
+        table: step.config?.table as string ?? 'output',
+        mode: (step.config?.mode as string ?? 'insert') as 'insert' | 'update' | 'upsert' | 'insert_ignore' | 'delete',
+        columns: availableFields,
+        datasource: 'default'
+      };
+    }
   }
 }
