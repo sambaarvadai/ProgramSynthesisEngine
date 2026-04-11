@@ -80,7 +80,7 @@ export function findJoinPath(schema: SchemaConfig, from: string, to: string): Fo
   const adjacency = new Map<string, ForeignKeyConfig[]>();
   
   // Initialize adjacency map
-  for (const table of schema.tables.keys()) {
+  for (const table of Array.from(schema.tables.keys())) {
     adjacency.set(table, []);
   }
 

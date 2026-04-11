@@ -40,6 +40,7 @@ async function main() {
   console.log('\ud83d\udd52 Connected to Postgres:', process.env.DATABASE_URL?.replace(/:\/\/.*@/, '://***@'));
   console.log('\ud83d\udcca Schema:', [...crmSchema.tables.keys()].join(', '));
   console.log(`\ud83d\udd11 Session ID: ${sessionManager.getSessionId()}`);
+  console.log('\ud83d\udce7 Email: Resend API', process.env.RESEND_API_KEY ? '??' : '?? (set RESEND_API_KEY)');
   console.log();
 
   process.on('SIGINT', async () => {

@@ -18,5 +18,20 @@ services:
       timeout: 5s
       retries: 5
 
+  calcite:
+    build:
+      context: ./calcite-service
+      dockerfile: Dockerfile
+    container_name: pee_calcite
+    ports:
+      - "8765:8765"
+    environment:
+      PORT: 8765
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
 volumes:
   pee_postgres_data:

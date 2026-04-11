@@ -28,4 +28,7 @@ export interface StorageBackend {
   // metadata operations
   tableExists(table: string): Promise<boolean>;
   getSchema(table: string): Promise<RowSchema>;
+
+  // raw SQL query execution
+  rawQuery(sql: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }>;
 }

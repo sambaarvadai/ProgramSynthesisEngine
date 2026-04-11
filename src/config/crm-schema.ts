@@ -234,6 +234,70 @@ export const crmSchema: SchemaConfig = {
         ],
       },
     ],
+    [
+      'email_log',
+      {
+        name: 'email_log',
+        description: 'Email communications sent to customers',
+        primaryKey: ['id'],
+        columns: [
+          {
+            name: 'id',
+            type: { kind: 'number' },
+            nullable: false,
+            description: 'Unique email log ID',
+          },
+          {
+            name: 'order_id',
+            type: { kind: 'number' },
+            nullable: false,
+            description: 'References orders.id',
+          },
+          {
+            name: 'customer_id',
+            type: { kind: 'number' },
+            nullable: false,
+            description: 'References customers.id',
+          },
+          {
+            name: 'email',
+            type: { kind: 'string' },
+            nullable: false,
+            description: 'Recipient email address',
+          },
+          {
+            name: 'subject',
+            type: { kind: 'string' },
+            nullable: false,
+            description: 'Email subject line',
+          },
+          {
+            name: 'status',
+            type: { kind: 'string' },
+            nullable: false,
+            description: 'Email delivery status',
+          },
+          {
+            name: 'sent_at',
+            type: { kind: 'datetime' },
+            nullable: false,
+            description: 'When email was sent',
+          },
+          {
+            name: 'provider',
+            type: { kind: 'string' },
+            nullable: true,
+            description: 'Email service provider used',
+          },
+          {
+            name: 'provider_id',
+            type: { kind: 'string' },
+            nullable: true,
+            description: 'Provider-specific message ID',
+          },
+        ],
+      },
+    ],
   ]),
   foreignKeys: [
     {
@@ -263,6 +327,20 @@ export const crmSchema: SchemaConfig = {
       toTable: 'customers',
       toColumn: 'id',
       description: 'Ticket belongs to customer',
+    },
+    {
+      fromTable: 'email_log',
+      fromColumn: 'order_id',
+      toTable: 'orders',
+      toColumn: 'id',
+      description: 'Email log belongs to order',
+    },
+    {
+      fromTable: 'email_log',
+      fromColumn: 'customer_id',
+      toTable: 'customers',
+      toColumn: 'id',
+      description: 'Email log belongs to customer',
     },
   ],
 };

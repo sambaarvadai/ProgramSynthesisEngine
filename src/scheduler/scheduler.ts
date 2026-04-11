@@ -499,6 +499,17 @@ export class Scheduler {
     // Standard node execution
     try {
       const inputs = getNodeInputs(nodeId, graph, state);
+      
+      // Debug: Log node execution start
+      console.log(`[Scheduler] Executing node ${nodeId} (${node.kind}) with inputs:`, {
+        inputKeys: Object.keys(inputs),
+        inputSample: inputs['input'] ? 
+          (inputs['input'].kind === 'tabular' ? 
+            `${inputs['input'].data.rows.length} rows` : 
+            inputs['input'].kind) : 
+          'none'
+      });
+      
       markNodeRunning(state, nodeId);
 
       // Calculate timeout for this node
@@ -515,11 +526,23 @@ export class Scheduler {
         actualInput = inputs;
       }
 
+      // Debug: For write nodes, log payload details
+      if (node.kind === 'write') {
+        console.log(`[Scheduler] WriteNode ${nodeId} payload:`, JSON.stringify(node.payload, null, 2));
+        console.log(`[Scheduler] WriteNode ${nodeId} input type:`, actualInput?.kind);
+        if (actualInput?.kind === 'tabular') {
+          console.log(`[Scheduler] WriteNode ${nodeId} input rows:`, actualInput.data.rows.length);
+        }
+      }
+
       const output = await executeWithTimeout(
         executeWithRetry(node, def, actualInput, state.ctx, this.config, state),
         timeoutMs,
         nodeId
       );
+
+      // Debug: Log successful completion
+      console.log(`[Scheduler] Node ${nodeId} completed successfully, output type:`, output?.kind);
 
       // Increment LLM budget after successful LLM execution
       if (node.kind === 'llm') {
@@ -535,6 +558,8 @@ export class Scheduler {
       });
 
     } catch (error) {
+      console.error(`[Scheduler] Node ${nodeId} failed with error:`, (error as Error).message);
+      console.error(`[Scheduler] Node ${nodeId} error stack:`, (error as Error).stack);
       await this.handleNodeError(node, error as Error, graph, state);
     }
   }
@@ -811,6 +836,11 @@ export class Scheduler {
       // Resolve the iterable
       const iterable = this.config.evaluator.evaluate(payload.over, state.ctx.scope);
       const items = toIterableArray(wrapLegacyValue(iterable));
+      
+      console.log(`[Loop] forEach mode: ${items.length} items to iterate`);
+      if (items.length === 0) {
+        console.log(`[Loop] No items to iterate, loop will not execute body`);
+      }
 
       for (const item of items) {
         if (iterCount >= maxIter) {
@@ -819,29 +849,35 @@ export class Scheduler {
           break;
         }
 
-        // Fork scope for this iteration
-        const iterCtx = contextPushScope(state.ctx, 'loop');
-        scopeSet(iterCtx.scope, payload.iterVar, item);
-        if (payload.indexVar) {
-          scopeSet(iterCtx.scope, payload.indexVar, iterCount);
+        try {
+          // Fork scope for this iteration
+          const iterCtx = contextPushScope(state.ctx, 'loop');
+          scopeSet(iterCtx.scope, payload.iterVar, item);
+          if (payload.indexVar) {
+            scopeSet(iterCtx.scope, payload.indexVar, iterCount);
+          }
+
+          // Execute body subgraph with forked context
+          // Pass current item (wrapped as RowSet) for data edge
+          const iterState = forkStateForIteration(state, iterCtx, bodyNodeIds, nodeId, item);
+          await this.executeSubgraph(bodyStartNodeId, graph, iterState);
+
+          // Collect body output
+          const bodyOutput = getSubgraphOutput(bodyNodeIds, graph, iterState);
+
+          // Debug: Trace what bodyOutput is for each iteration
+          console.log(`iter ${iterCount}: bodyOutput=${JSON.stringify(bodyOutput)?.slice(0,80)} accumulated.length=${isCollection(accumulated) ? (accumulated as any).data.length : 'N/A'}`);
+
+          // Update accumulator (always accumulate even if bodyOutput is undefined)
+          accumulated = updateAccumulator(payload.accumulator, accumulated, bodyOutput ?? void_, iterCtx, this.config.evaluator);
+
+          incrementIterationBudget(state.ctx);
+          iterCount++;
+        } catch (err) {
+          console.error(`iter ${iterCount} error:`, (err as Error).message);
+          // For now: rethrow. Later: respect errorPolicy.
+          throw err;
         }
-
-        // Execute body subgraph with forked context
-        // Pass current item (wrapped as RowSet) for data edge
-        const iterState = forkStateForIteration(state, iterCtx, bodyNodeIds, nodeId, item);
-        await this.executeSubgraph(bodyStartNodeId, graph, iterState);
-
-        // Collect body output
-        const bodyOutput = getSubgraphOutput(bodyNodeIds, graph, iterState);
-
-        // Debug: Trace what bodyOutput is for each iteration
-        console.log(`iter ${iterCount}: bodyOutput=${JSON.stringify(bodyOutput)?.slice(0,80)} accumulated.length=${isCollection(accumulated) ? (accumulated as any).data.length : 'N/A'}`);
-
-        // Update accumulator (always accumulate even if bodyOutput is undefined)
-        accumulated = updateAccumulator(payload.accumulator, accumulated, bodyOutput ?? void_, iterCtx, this.config.evaluator);
-
-        incrementIterationBudget(state.ctx);
-        iterCount++;
       }
     } else if (payload.mode === 'while') {
       // Get loop input for while mode (processes full input each iteration)

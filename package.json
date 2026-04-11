@@ -11,12 +11,19 @@
     "db:down": "docker compose down",
     "db:reset": "docker compose down -v && docker compose up -d",
     "db:psql": "docker exec -it pee_postgres psql -U pee_user -d pee_dev",
-    "db:verify": "tsx src/scripts/verify-db.ts"
+    "db:migrate": "docker exec -i pee_postgres psql -U pee_user -d pee_dev",
+    "db:verify": "tsx src/scripts/verify-db.ts",
+    "calcite:build": "cd calcite-service && mvn package -q",
+    "calcite:start": "java -jar calcite-service/target/calcite-service-1.0.0.jar",
+    "calcite:dev": "npm run calcite:build && npm run calcite:start",
+    "services:up": "docker compose up -d",
+    "services:down": "docker compose down"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.0",
     "better-sqlite3": "^12.8.0",
     "dotenv": "^17.4.1",
+    "duckdb": "^1.4.4",
     "pg": "^8.20.0",
     "uuid": "^9.0.0",
     "zod": "^3.22.0"

@@ -10,7 +10,8 @@ export { outputNodeDefinition } from './definitions/output-node.js';
 export { transformNodeDefinition } from './definitions/transform-node.js';
 export { queryNodeDefinition } from './definitions/query-node.js';
 export { createLLMNodeDefinition } from './definitions/llm-node.js';
-export { httpNodeDefinition } from './definitions/http-node.js';
+export { createHttpNodeDefinition } from './definitions/http-node.js';
+export { createWriteNodeDefinition } from './definitions/write-node.js';
 export { conditionalNodeDefinition } from './definitions/conditional-node.js';
 export { mergeNodeDefinition } from './definitions/merge-node.js';
 export { parallelNodeDefinition } from './definitions/parallel-node.js';
@@ -21,7 +22,8 @@ import { outputNodeDefinition } from './definitions/output-node.js';
 import { transformNodeDefinition } from './definitions/transform-node.js';
 import { queryNodeDefinition } from './definitions/query-node.js';
 import { createLLMNodeDefinition } from './definitions/llm-node.js';
-import { httpNodeDefinition } from './definitions/http-node.js';
+import { createHttpNodeDefinition } from './definitions/http-node.js';
+import { createWriteNodeDefinition } from './definitions/write-node.js';
 import { conditionalNodeDefinition } from './definitions/conditional-node.js';
 import { mergeNodeDefinition } from './definitions/merge-node.js';
 import { parallelNodeDefinition } from './definitions/parallel-node.js';
@@ -30,13 +32,14 @@ import { validationFail } from '../core/types/validation.js';
 
 export function registerAllNodes(
   registry: NodeRegistry,
-  deps?: { anthropicApiKey?: string },
+  deps?: { anthropicApiKey?: string; evaluator?: any; storageBackend?: any; schema?: any; calciteClient?: any },
 ): void {
   registry.register(inputNodeDefinition);
   registry.register(outputNodeDefinition);
   registry.register(transformNodeDefinition);
   registry.register(queryNodeDefinition);
-  registry.register(httpNodeDefinition);
+  registry.register(createHttpNodeDefinition(deps?.evaluator));
+  registry.register(createWriteNodeDefinition(deps?.storageBackend, deps?.schema, deps?.calciteClient));
   registry.register(conditionalNodeDefinition);
   registry.register(mergeNodeDefinition);
   registry.register(parallelNodeDefinition);

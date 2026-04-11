@@ -90,9 +90,14 @@ export class PostgresBackend implements StorageBackend {
       let params: Value[] = [];
 
       if (opts.predicate && this.isSimplePredicate(opts.predicate)) {
+        console.log(`[PostgresBackend] Processing predicate:`, JSON.stringify(opts.predicate, null, 2));
         const { clause, params: sqlParams } = this.predicateToSQL(opts.predicate, []);
+        console.log(`[PostgresBackend] Generated WHERE clause:`, clause);
+        console.log(`[PostgresBackend] WHERE params:`, sqlParams);
         whereClause = `WHERE ${clause}`;
         params = sqlParams;
+      } else {
+        console.log(`[PostgresBackend] No predicate or not simple predicate, predicate:`, opts.predicate ? 'exists but not simple' : 'none');
       }
 
       const query = `
@@ -100,6 +105,9 @@ export class PostgresBackend implements StorageBackend {
         SELECT ${columns} FROM ${opts.table} ${whereClause}
       `;
 
+      console.log(`[PostgresBackend] Executing SQL:`, query.trim());
+      console.log(`[PostgresBackend] SQL params:`, params);
+      
       await client.query(query, params);
 
       while (true) {
@@ -233,6 +241,16 @@ export class PostgresBackend implements StorageBackend {
         nullable: row.is_nullable === 'YES',
       }));
       return { columns };
+    } finally {
+      client.release();
+    }
+  }
+
+  async rawQuery(sql: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(sql, params ?? []);
+      return { rows: result.rows, rowCount: result.rowCount ?? 0 };
     } finally {
       client.release();
     }
@@ -376,6 +394,10 @@ export class PostgresBackend implements StorageBackend {
               return { clause: `(${left.clause} IS NOT NULL)`, params };
             }
           }
+          // Special case for NOT IN with SqlExpr (subquery)
+          if (pred.op === '!=' && pred.right.kind === 'SqlExpr') {
+            return { clause: `${left.clause} NOT IN ${(pred.right as any).sql}`, params };
+          }
           return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
         }
 
@@ -475,6 +497,58 @@ export class PostgresBackend implements StorageBackend {
 
       case 'SqlExpr': {
         return { clause: (pred as any).sql, params };
+      }
+
+      case 'BinaryOp': {
+        const left = this.predicateToSQL(pred.left, params);
+        const right = this.predicateToSQL(pred.right, params);
+
+        // Arithmetic operators
+        if (['+', '-', '*', '/', '%'].includes(pred.op)) {
+          return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
+        }
+
+        // Comparison operators
+        if (['=', '!=', '<', '>', '<=', '>='].includes(pred.op)) {
+          // Special case for NULL comparisons
+          if (pred.right.kind === 'Literal' && pred.right.value === null) {
+            if (pred.op === '=') {
+              return { clause: `(${left.clause} IS NULL)`, params };
+            }
+            if (pred.op === '!=') {
+              return { clause: `(${left.clause} IS NOT NULL)`, params };
+            }
+          }
+          // Special case for NOT IN with SqlExpr (subquery)
+          if (pred.op === '!=' && pred.right.kind === 'SqlExpr') {
+            const fieldRef = pred.left as any;
+            const sqlExpr = pred.right as any;
+            const field = fieldRef.table 
+              ? `"${fieldRef.table}"."${fieldRef.field}"` 
+              : `"${fieldRef.field}"`;
+            const op = sqlExpr.sqlOp ?? 'IN';
+            return { clause: `${field} ${op} ${sqlExpr.sql}`, params };
+          }
+          return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
+        }
+
+        // Logical operators
+        if (pred.op === 'AND') {
+          return { clause: `(${left.clause} AND ${right.clause})`, params };
+        }
+        if (pred.op === 'OR') {
+          return { clause: `(${left.clause} OR ${right.clause})`, params };
+        }
+
+        // String operators
+        if (pred.op === 'LIKE') {
+          return { clause: `(${left.clause} LIKE ${right.clause})`, params };
+        }
+        if (pred.op === 'CONCAT') {
+          return { clause: `(${left.clause} || ${right.clause})`, params };
+        }
+
+        throw new Error(`Unsupported binary operator: ${pred.op}`);
       }
 
       case 'Wildcard': {
