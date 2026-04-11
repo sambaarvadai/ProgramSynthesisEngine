@@ -3,9 +3,9 @@
 import { test, describe } from 'node:test';
 import * as assert from 'node:assert';
 import type { SchemaConfig } from '../../schema/schema-config.js';
-import type { QueryIntent } from '../query-intent.js';
-import { QueryASTBuilder } from '../query-ast-builder.js';
-import { QueryPlanner } from '../query-planner.js';
+import type { QueryIntent } from '../../query-ast/query-intent.js';
+import { QueryASTBuilder } from '../../query-ast/query-ast-builder.js';
+import { QueryPlanner } from '../../query-ast/query-planner.js';
 import { OperatorTreeBuilder } from '../operator-tree-builder.js';
 import { QueryExecutor } from '../../../executors/query-executor.js';
 import { ExprEvaluator } from '../../../executors/expr-evaluator.js';

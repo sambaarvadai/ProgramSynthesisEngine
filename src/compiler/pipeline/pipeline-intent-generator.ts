@@ -128,7 +128,11 @@ Available node kinds and when to use them:
 - query: fetch data from database tables
 - transform: filter, map, sort, rename fields on a RowSet
 - llm: use AI to analyze, classify, summarize, or generate text for rows
-- http: call an external API
+- http: call an external HTTP API with request body built from row data
+          use for: sending emails via API, calling webhooks, fetching external data
+          outputFields: fields extracted from the API response
+- write: write rows back to the database (INSERT/UPDATE/UPSERT)
+           use for: logging actions taken, updating records, persisting results
 - conditional: branch based on a condition (requires trueBranch, falseBranch, mergeStep)
 - loop: iterate over a dataset (requires loopBody, loopMode, loopOver)
 - merge: combine outputs from multiple branches (requires mergeFrom)
@@ -164,6 +168,10 @@ Example mappings:
   'revenue by region' → ONE query step with JOIN + GROUP BY + SUM
   'mark orders as high/low value' → ONE transform step with addField using conditional expr
   'for each customer generate AI summary' → query + loop + llm
+  'send email to customer' → http step calling email API (Resend/SendGrid)
+  'log that we sent the email' → write step inserting into audit table
+  'update order status' → write step updating orders table
+  'call webhook when order completes' → http step POSTing to webhook URL
 
 SIMPLICITY RULES - always prefer the simpler plan:
 
@@ -210,7 +218,15 @@ SIMPLICITY RULES - always prefer the simpler plan:
      false branch: filter to normal tickets
      (these should be a single addField with conditional expression or loop+conditional)
 
-4. Minimum steps principle: if the same result can be achieved in
+4. For workflows that send notifications and log them:
+   query (fetch data) -> loop -> http (send notification) -> write (log it)
+   This is the standard pattern. Don't overcomplicate it.
+
+5. For workflows that log or notify, always filter out already-processed rows.
+   For email_log: add a filter WHERE orders.id NOT IN (SELECT order_id FROM email_log)
+   This makes the workflow idempotent - safe to re-run.
+
+6. Minimum steps principle: if the same result can be achieved in
    N steps or N+1 steps, always choose N steps.
 
 Additional rules:

@@ -12,7 +12,7 @@ export interface QueryIntentColumn {
 export interface QueryIntentFilter {
   field: string;
   table?: string;
-  operator: '=' | '!=' | '<' | '>' | '<=' | '>=' | 'LIKE' | 'IN' | 'BETWEEN' | 'IS NULL' | 'IS NOT NULL';
+  operator: '=' | '!=' | '<' | '>' | '<=' | '>=' | 'LIKE' | 'IN' | 'NOT IN' | 'BETWEEN' | 'IS NULL' | 'IS NOT NULL';
   value?: Value | Value[];
   valueRef?: string; // reference to a pipeline variable instead of literal
   expr?: string; // raw SQL expression for complex filter values (e.g., "NOW() - INTERVAL 90 DAY")

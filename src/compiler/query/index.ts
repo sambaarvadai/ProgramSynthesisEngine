@@ -1,3 +1,4 @@
+// Re-export QueryAST types from query-ast folder
 export type {
   OrderByNode,
   ProjectionNode,
@@ -7,7 +8,7 @@ export type {
   QueryDAGNodeId,
   QueryDAGNode,
   QueryPlan
-} from './query-ast.js';
+} from '../query-ast/query-ast.js';
 
 export type {
   QueryIntentColumn,
@@ -15,19 +16,20 @@ export type {
   QueryIntentJoin,
   QueryIntentOrderBy,
   QueryIntent
-} from './query-intent.js';
+} from '../query-ast/query-intent.js';
 
-export {
-  QueryASTBuilder,
-  type ValidationResult,
-  type QueryASTBuildResult
-} from './query-ast-builder.js';
+// Re-export QueryAST components
+export { QueryASTBuilder } from '../query-ast/query-ast-builder.js'
+export { QueryPlanner } from '../query-ast/query-planner.js'
+export type { QueryASTBuildResult } from '../query-ast/query-ast-builder.js'
 
-export { QueryPlanner } from './query-planner.js';
+// Re-export Substrait components
+export { SubstraitTranslator } from '../substrait/substrait-translator.js';
 
-export { OperatorTreeBuilder } from './operator-tree-builder.js';
+// Remaining query components
+import { OperatorTreeBuilder } from './operator-tree-builder.js';
 
-export {
+import {
   TablePreSelector,
   type TablePreSelectorConfig,
   type PreSelectionResult
@@ -37,3 +39,7 @@ export {
   QueryIntentGenerator,
   type QueryIntentGeneratorConfig
 } from './query-intent-generator.js';
+
+export { OperatorTreeBuilder };
+export { TablePreSelector };
+export type { TablePreSelectorConfig, PreSelectionResult };

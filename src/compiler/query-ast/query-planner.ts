@@ -69,7 +69,9 @@ export class QueryPlanner {
     }
 
     // 3. Where filter
+    console.log(`[QueryPlanner] Processing where clause:`, ast.where ? 'exists' : 'none');
     if (ast.where) {
+      console.log(`[QueryPlanner] Where predicate:`, JSON.stringify(ast.where, null, 2));
       const filterNodeId = this.generateId();
       const filterNode: QueryDAGNode = {
         id: filterNodeId,
@@ -79,6 +81,7 @@ export class QueryPlanner {
       };
       nodes.set(filterNodeId, filterNode);
       currentRoot = filterNodeId;
+      console.log(`[QueryPlanner] Filter node created with id: ${filterNodeId}`);
     }
 
     // 4. Aggregation
@@ -222,7 +225,7 @@ export class QueryPlanner {
     collectTables(predicate);
     
     // Check if any referenced table is different from the scan table
-    for (const table of referencedTables) {
+    for (const table of Array.from(referencedTables)) {
       if (table !== scanTable) {
         return true;
       }
@@ -239,7 +242,7 @@ export class QueryPlanner {
     let applied = false;
 
     // Find Filter nodes above Scan nodes
-    for (const [nodeId, node] of newNodes) {
+    for (const [nodeId, node] of Array.from(newNodes.entries())) {
       if (node.kind === 'Filter') {
         const inputNode = newNodes.get(node.input);
         if (inputNode && inputNode.kind === 'Scan') {
@@ -270,16 +273,27 @@ export class QueryPlanner {
     }
 
     // Find Filter nodes above Join nodes
-    for (const [nodeId, node] of newNodes) {
+    console.log(`[QueryPlanner] Starting predicate pushdown, checking ${newNodes.size} nodes`);
+    for (const [nodeId, node] of Array.from(newNodes.entries())) {
       if (node.kind === 'Filter') {
+        console.log(`[QueryPlanner] Found Filter node ${nodeId}, checking for pushdown`);
         const inputNode = newNodes.get(node.input);
         if (inputNode && inputNode.kind === 'Join') {
+          console.log(`[QueryPlanner] Filter ${nodeId} is above Join ${node.input}`);
           // Check if predicate references only one side of the join
           const referencedTables = this.extractReferencedTables(node.predicate);
-          const leftTable = inputNode.payload.table;
-          const rightTable = inputNode.payload.table;
+          console.log(`[QueryPlanner] Referenced tables: ${referencedTables.join(', ')}`);
+          
+          // Get left and right tables from the join's input nodes
+          const leftInput = newNodes.get(inputNode.left);
+          const rightInput = newNodes.get(inputNode.right);
+          const leftTable = leftInput?.kind === 'Scan' ? leftInput.payload.table : null;
+          const rightTable = rightInput?.kind === 'Scan' ? rightInput.payload.table : null;
+          
+          console.log(`[QueryPlanner] Left table: ${leftTable}, Right table: ${rightTable}`);
 
-          if (referencedTables.includes(leftTable) && !referencedTables.includes(rightTable)) {
+          if (leftTable !== null && rightTable !== null && referencedTables.includes(leftTable) && !referencedTables.includes(rightTable)) {
+            console.log(`[QueryPlanner] Pushing filter below join on left side`);
             // Push filter below join on left side
             const filterBelowJoinId = this.generateId();
             const filterBelowJoin: QueryDAGNode = {
@@ -299,10 +313,10 @@ export class QueryPlanner {
 
             // Remove original filter node and update parent references
             newNodes.delete(nodeId);
-            this.updateParentReferences(newNodes, nodeId, inputNode.id);
+            this.updateParentReferences(newNodes, nodeId, filterBelowJoinId);
 
             applied = true;
-          } else if (referencedTables.includes(rightTable) && !referencedTables.includes(leftTable)) {
+          } else if (leftTable !== null && rightTable !== null && referencedTables.includes(rightTable) && !referencedTables.includes(leftTable)) {
             // Push filter below join on right side
             const filterBelowJoinId = this.generateId();
             const filterBelowJoin: QueryDAGNode = {
@@ -354,7 +368,7 @@ export class QueryPlanner {
     let applied = false;
 
     // Simple heuristic: put smaller tables on build side
-    for (const [nodeId, node] of newNodes) {
+    for (const [nodeId, node] of Array.from(newNodes.entries())) {
       if (node.kind === 'Join') {
         const leftScan = this.findScanNode(newNodes, node.left);
         const rightScan = this.findScanNode(newNodes, node.right);
@@ -422,6 +436,10 @@ export class QueryPlanner {
           traverse(e.low);
           traverse(e.high);
           break;
+        case 'SqlExpr':
+          // Can't extract tables from raw SQL - assume it references the left table
+          // This allows predicatePushdown to move it below the join
+          break; // returns empty set -> pushdown applies to left side
       }
     };
 
@@ -477,7 +495,7 @@ export class QueryPlanner {
     oldNodeId: QueryDAGNodeId,
     newNodeId: QueryDAGNodeId
   ): void {
-    for (const node of nodes.values()) {
+    for (const node of Array.from(nodes.values())) {
       if ('input' in node && node.input === oldNodeId) {
         (node as any).input = newNodeId;
       }

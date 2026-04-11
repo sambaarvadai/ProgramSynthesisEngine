@@ -3,6 +3,7 @@ export type PipelineStepKind =
   | 'transform'
   | 'llm'
   | 'http'
+  | 'write'
   | 'conditional'
   | 'loop'
   | 'merge'

@@ -1,12 +1,11 @@
 import type { SchemaConfig } from '../schema/schema-config.js';
 import { getTable, getRowSchema, findJoinPath, tableExists } from '../schema/schema-config.js';
 import type { QueryIntent, QueryIntentColumn, QueryIntentFilter, QueryIntentJoin, QueryIntentOrderBy } from './query-intent.js';
-import type { QueryAST, ScanNode, JoinNode, ProjectionNode, OrderByNode } from './query-ast.js';
-import type { ExprAST, BinaryOperator } from '../../core/ast/expr-ast.js';
-import type { AggFn } from '../../core/ast/expr-ast.js';
+import type { QueryAST, ScanNode, JoinNode, ProjectionNode, OrderByNode, ExprAST, AggFn } from './query-ast.js';
+import type { BinaryOperator } from '../../core/ast/expr-ast.js';
+import type { ExprEvaluator } from '../../executors/expr-evaluator.js';
 import type { Value } from '../../core/types/value.js';
 import type { EngineType } from '../../core/types/engine-type.js';
-import { ExprEvaluator } from '../../executors/expr-evaluator.js';
 
 export interface ValidationResult {
   isValid: boolean;
@@ -70,7 +69,7 @@ export class QueryASTBuilder {
       
       // First check additional fields from previous pipeline steps
       if (this.additionalFields) {
-        for (const [sourceName, fields] of this.additionalFields) {
+        for (const [sourceName, fields] of Array.from(this.additionalFields.entries())) {
           if (fields.some(f => f.name === column.field)) {
             columnExists = true;
             break;
@@ -110,7 +109,7 @@ export class QueryASTBuilder {
         
         // First check additional fields from previous pipeline steps
         if (this.additionalFields) {
-          for (const [sourceName, fields] of this.additionalFields) {
+          for (const [sourceName, fields] of Array.from(this.additionalFields.entries())) {
             if (fields.some(f => f.name === filter.field)) {
               columnExists = true;
               break;
@@ -164,7 +163,7 @@ export class QueryASTBuilder {
         let errorDetails = '';
 
         if (this.additionalFields) {
-          for (const [sourceName, fields] of this.additionalFields) {
+          for (const [sourceName, fields] of Array.from(this.additionalFields.entries())) {
             if (fields.some(f => f.name === field)) {
               fieldExists = true;
               break;
@@ -508,14 +507,81 @@ export class QueryASTBuilder {
         };
 
       case 'IN':
+        // Handle IN with subqueries
+        if (typeof filter.value === 'string' && filter.value.trim().toLowerCase().startsWith('select')) {
+          // Raw subquery - emit as SqlExpr
+          return {
+            kind: 'BinaryOp',
+            op: '=', // placeholder op (SqlExpr overrides it)
+            left: {
+              kind: 'FieldRef',
+              field: filter.field,
+              table: filter.table
+            },
+            right: {
+              kind: 'SqlExpr',
+              sql: `(${filter.value.trim()})`,
+              sqlOp: 'IN' // store the real operator
+            } as any
+          };
+        }
+        // Handle IN with arrays
         if (!Array.isArray(filter.value)) {
-          throw new Error('IN operator requires array value');
+          throw new Error('IN operator requires array value or subquery string');
         }
         return {
           kind: 'In',
           expr: fieldRef,
           values: filter.value.map(val => ({ kind: 'Literal' as const, value: val, type: { kind: 'any' as const } }))
         };
+
+      case 'NOT IN':
+        // Handle NOT IN with subqueries
+        if (typeof filter.value === 'string' && filter.value.trim().toLowerCase().startsWith('select')) {
+          // Raw subquery - emit as SqlExpr
+          return {
+            kind: 'BinaryOp',
+            op: '!=', // placeholder op (SqlExpr overrides it)
+            left: {
+              kind: 'FieldRef',
+              field: filter.field,
+              table: filter.table
+            },
+            right: {
+              kind: 'SqlExpr',
+              sql: `(${filter.value.trim()})`,
+              sqlOp: 'NOT IN' // store the real operator
+            } as any
+          };
+        }
+        // Handle NOT IN with arrays
+        if (!Array.isArray(filter.value)) {
+          throw new Error('NOT IN operator requires array value or subquery string');
+        }
+        return {
+          kind: 'UnaryOp',
+          op: 'NOT',
+          operand: {
+            kind: 'In',
+            expr: fieldRef,
+            values: filter.value.map(val => ({ kind: 'Literal' as const, value: val, type: { kind: 'any' as const } }))
+          }
+        };
+
+      case '!=':
+        // Handle != with arrays as NOT IN
+        if (Array.isArray(filter.value)) {
+          return {
+            kind: 'UnaryOp',
+            op: 'NOT',
+            operand: {
+              kind: 'In',
+              expr: fieldRef,
+              values: filter.value.map(val => ({ kind: 'Literal' as const, value: val, type: { kind: 'any' as const } }))
+            }
+          };
+        }
+        // Fall through to regular != handling for non-array values
 
       case 'BETWEEN':
         if (!Array.isArray(filter.value) || filter.value.length !== 2) {

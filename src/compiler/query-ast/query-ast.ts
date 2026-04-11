@@ -1,6 +1,9 @@
 import type { ExprAST, AggFn } from '../../core/ast/expr-ast.js';
 import type { RowSchema } from '../../core/types/schema.js';
 
+// Re-export types that are used by other modules
+export type { ExprAST, AggFn } from '../../core/ast/expr-ast.js';
+
 export interface OrderByNode {
   expr: ExprAST;
   direction: 'ASC' | 'DESC';

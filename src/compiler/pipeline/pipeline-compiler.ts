@@ -11,7 +11,7 @@ import type {
   PipelineIntentValidationError,
 } from './pipeline-intent.js';
 import type { SchemaConfig } from '../schema/schema-config.js';
-import type { QueryIntent } from '../query/query-intent.js';
+import type { QueryIntent } from '../query-ast/query-intent.js';
 import { MODELS } from '../../config/models.js';
 import type {
   QueryPayload,
@@ -23,6 +23,7 @@ import type {
   ParallelPayload,
   InputPayload,
   OutputPayload,
+  WritePayload,
 } from '../../nodes/payloads.js';
 import type { ExprAST } from '../../core/ast/expr-ast.js';
 import type { RowSchema } from '../../core/types/schema.js';
@@ -196,6 +197,32 @@ export class PipelineCompiler {
     // Check for cycles in dependsOn graph
     const cycleErrors = this.detectCycles(intent);
     errors.push(...cycleErrors);
+
+    // Validate write and http nodes have dependencies
+    for (const step of intent.steps) {
+      if (step.kind === 'write') {
+        // write nodes should have a dependsOn unless they have explicit filtering
+        const hasExplicitFilter = step.config?.filter || step.config?.where || step.config?.whereColumns
+        if ((!step.dependsOn || step.dependsOn.length === 0) && !hasExplicitFilter) {
+          errors.push({
+            stepId: step.id,
+            code: 'WRITE_MISSING_INPUT',
+            message: 'Write step should depend on a data step or have explicit filtering conditions'
+          })
+        }
+      }
+      if (step.kind === 'http') {
+        // http nodes should have a dependsOn unless they have explicit URL/data
+        const hasExplicitData = step.config?.url || step.config?.endpoint || step.config?.data
+        if ((!step.dependsOn || step.dependsOn.length === 0) && !hasExplicitData) {
+          errors.push({
+            stepId: step.id,
+            code: 'HTTP_MISSING_INPUT',
+            message: 'HTTP step should depend on a data step or have explicit URL/data configuration'
+          })
+        }
+      }
+    }
 
     return errors;
   }
@@ -378,6 +405,16 @@ export class PipelineCompiler {
         break;
       }
 
+      case 'write': {
+        payload = {
+          table: '',
+          mode: 'insert',
+          columns: [],
+          datasource: 'default',
+        } as WritePayload;
+        break;
+      }
+
       default: {
         payload = {};
         break;
@@ -501,16 +538,19 @@ export class PipelineCompiler {
       }
 
       // Add loop edges
-      if (step.kind === 'loop' && step.loopBody) {
-        for (const bodyStepId of step.loopBody) {
-          // First body step gets data from loop node
-          const edgeId = `e_${step.id}_${bodyStepId}`;
+      if (step.kind === 'loop' && step.loopBody && step.loopBody.length > 0) {
+        // Only create edge to FIRST body step
+        // Internal body step connections come from their dependsOn
+        const firstBodyStepId = step.loopBody[0]
+        const edgeId = `e_${step.id}_${firstBodyStepId}` 
+        if (!edges.has(edgeId)) {
           edges.set(edgeId, {
             id: edgeId,
             from: step.id,
-            to: bodyStepId,
+            to: firstBodyStepId,
             kind: 'data',
-          });
+            inputKey: 'input'
+          })
         }
       }
 

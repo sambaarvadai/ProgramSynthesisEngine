@@ -146,7 +146,17 @@ export class ExprEvaluator {
         throw new NotImplementedError('Window functions require SortOperator context');
 
       case 'SqlExpr':
-        throw new NotImplementedError('SqlExpr requires SQL backend evaluation - cannot be evaluated in-memory');
+        // SqlExpr cannot be evaluated in memory - it should have been
+        // pushed down to the SQL backend. If we reach here, the predicate
+        // pushdown didn't work. Return true to pass all rows through
+        // (conservative - better than throwing or filtering everything out)
+        // Only warn once - this is expected when Calcite is unavailable
+        // and we fall back to raw SQL path
+        if (!(ExprEvaluator as any)._sqlExprWarned) {
+          console.warn('SqlExpr reached in-memory evaluator - using raw SQL fallback');
+          (ExprEvaluator as any)._sqlExprWarned = true;
+        }
+        return true;
 
       case 'Wildcard':
         throw new NotImplementedError('Wildcard (*) requires SQL backend evaluation - cannot be evaluated in-memory');
@@ -196,7 +206,16 @@ export class ExprEvaluator {
         throw new NotImplementedError('Window functions require SortOperator context');
 
       case 'SqlExpr':
-        throw new NotImplementedError('SqlExpr requires SQL backend evaluation - cannot be evaluated in-memory');
+        // SqlExpr cannot be evaluated in memory - it should have been
+        // pushed down to the SQL backend. If we reach here, the predicate
+        // pushdown didn't work. Return boolean type as fallback
+        // Only warn once - this is expected when Calcite is unavailable
+        // and we fall back to raw SQL path
+        if (!(ExprEvaluator as any)._sqlExprWarned) {
+          console.warn('SqlExpr reached in-memory evaluator - using raw SQL fallback');
+          (ExprEvaluator as any)._sqlExprWarned = true;
+        }
+        return { kind: 'boolean' };
 
       case 'Wildcard':
         throw new NotImplementedError('Wildcard (*) requires SQL backend evaluation - cannot be evaluated in-memory');

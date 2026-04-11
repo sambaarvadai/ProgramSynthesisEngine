@@ -1,7 +1,7 @@
 import type { StorageBackend } from '../../core/storage/storage-backend.js';
 import type { TempStore } from '../../core/storage/temp-store.js';
 import type { ExprEvaluator } from '../../executors/expr-evaluator.js';
-import type { QueryPlan, QueryDAGNode, QueryDAGNodeId } from './query-ast.js';
+import type { QueryPlan, QueryDAGNode, QueryDAGNodeId } from '../query-ast/query-ast.js';
 import type { PhysicalOperator } from '../../executors/physical-operator.js';
 import { ScanOperator } from '../../executors/operators/scan-operator.js';
 import { FilterOperator } from '../../executors/operators/filter-operator.js';

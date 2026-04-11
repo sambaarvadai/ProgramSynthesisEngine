@@ -1,0 +1,23 @@
+{
+  "root": "scan_1",
+  "nodes": {
+    "scan_1": {
+      "id": "scan_1",
+      "kind": "Scan",
+      "payload": {
+        "table": "customers",
+        "alias": "c",
+        "schema": {
+          "columns": [
+            { "name": "id", "type": { "kind": "number" }, "nullable": false },
+            { "name": "name", "type": { "kind": "string" }, "nullable": false },
+            { "name": "email", "type": { "kind": "string" }, "nullable": false },
+            { "name": "segment", "type": { "kind": "string" }, "nullable": false },
+            { "name": "created_at", "type": { "kind": "string" }, "nullable": false }
+          ]
+        }
+      }
+    }
+  },
+  "optimizations": []
+}

@@ -1,11 +1,9 @@
 import type { SchemaConfig } from '../schema/schema-config.js';
-import type { QueryIntent } from './query-intent.js';
-import type { AggFn } from '../../core/ast/expr-ast.js';
-import type { Value } from '../../core/types/value.js';
-import type { ValidationResult } from './query-ast-builder.js';
+import type { QueryIntent } from '../query-ast/query-intent.js'
+import { QueryASTBuilder } from '../query-ast/query-ast-builder.js'
+import type { ValidationResult } from '../query-ast/query-ast-builder.js';
 import type { RowSchema } from '../../core/types/schema.js';
 import { TablePreSelector, type TablePreSelectorConfig, type PreSelectionResult } from './table-pre-selector.js';
-import { QueryASTBuilder } from './query-ast-builder.js';
 import { z } from 'zod';
 import { MODELS } from '../../config/models.js';
 import { callLLM, LLMMessage } from '../../core/llm/llm-client.js';
@@ -75,7 +73,7 @@ export class QueryIntentGenerator {
   "filters?": Array<{
     "field": string,
     "table?": string,
-    "operator": "=" | "!=" | "<" | ">" | "<=" | ">=" | "LIKE" | "IN" | "BETWEEN" | "IS NULL" | "IS NOT NULL",
+    "operator": "=" | "!=" | "<" | ">" | "<=" | ">=" | "LIKE" | "IN" | "NOT IN" | "BETWEEN" | "IS NULL" | "IS NOT NULL",
     "value?": (primitive value or array for IN/BETWEEN),
     "valueRef?": string (reference to pipeline variable)
   }>,
@@ -104,6 +102,7 @@ Rules:
 - Use groupBy + aggregations together, never one without the other
 - Never add columns not in the schema
 - For IN and BETWEEN operators, use array values
+- For NOT IN with subqueries, use the value field for the subquery string
 - For IS NULL and IS NOT NULL, omit the value field
 - ORDER BY rules:
   - Always include orderBy when the user asks for sorted or ranked results
@@ -230,7 +229,7 @@ Rules:
     const queryIntentFilterSchema = z.object({
       field: z.string(),
       table: z.string().optional(),
-      operator: z.enum(['=', '!=', '<', '>', '<=', '>=', 'LIKE', 'IN', 'BETWEEN', 'IS NULL', 'IS NOT NULL']),
+      operator: z.enum(['=', '!=', '<', '>', '<=', '>=', 'LIKE', 'IN', 'NOT IN', 'BETWEEN', 'IS NULL', 'IS NOT NULL']),
       value: z.union([z.string(), z.number(), z.boolean(), z.array(z.any())]).optional(),
       valueRef: z.string().optional(),
       expr: z.string().optional()

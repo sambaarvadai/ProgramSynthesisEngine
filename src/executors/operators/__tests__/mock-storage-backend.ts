@@ -100,6 +100,16 @@ export class MockStorageBackend implements StorageBackend {
     return this.inferSchema(rows[0]);
   }
 
+  async rawQuery(sql: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
+    // Mock implementation - for testing purposes only
+    // This is a simplified mock that doesn't actually parse SQL
+    console.log('MockStorageBackend.rawQuery called with:', { sql, params });
+    
+    // Return empty result by default
+    // In real tests, you might want to mock specific SQL queries
+    return { rows: [], rowCount: 0 };
+  }
+
   getTableData(table: string): Row[] {
     return this.data[table] || [];
   }
