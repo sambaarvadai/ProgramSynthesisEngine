@@ -4,12 +4,15 @@ import { crmSchema } from './config/index.js';
 import { PostgresBackend } from './storage/index.js';
 import { isTabular, isRecord, isScalar, isCollection, isVoid, toTabular } from './core/types/data-value.js';
 import type { DataValue } from './core/types/data-value.js';
+import { SessionManager } from './session/session-manager.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
 async function main() {
   const backend = new PostgresBackend(process.env.DATABASE_URL!);
   await backend.connect();
+
+  const sessionManager = new SessionManager(process.env.ANTHROPIC_API_KEY!);
 
   const engine = new PipelineEngine({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
@@ -30,12 +33,13 @@ async function main() {
   const ask = (q: string): Promise<string> =>
     new Promise(resolve => rl.question(q, resolve));
 
-  console.log('\n🔧 ProgramExecutionEngine CLI');
+  console.log('\n\uFE0F ProgramExecutionEngine CLI');
   console.log('Describe a workflow and the engine will plan and execute it.');
   console.log('Type "exit" to quit.\n');
 
-  console.log('🗄️  Connected to Postgres:', process.env.DATABASE_URL?.replace(/:\/\/.*@/, '://***@'));
-  console.log('📊 Schema:', [...crmSchema.tables.keys()].join(', '));
+  console.log('\ud83d\udd52 Connected to Postgres:', process.env.DATABASE_URL?.replace(/:\/\/.*@/, '://***@'));
+  console.log('\ud83d\udcca Schema:', [...crmSchema.tables.keys()].join(', '));
+  console.log(`\ud83d\udd11 Session ID: ${sessionManager.getSessionId()}`);
   console.log();
 
   process.on('SIGINT', async () => {
@@ -51,14 +55,20 @@ async function main() {
 
     try {
       // Plan phase
-      console.log('\n📋 Planning...');
-      const plan = await engine.plan(description);
+      console.log('\n\ud83d\udccb Planning...');
+      const sessionHistory = sessionManager.getHistory();
+      const plan = await engine.plan(description, undefined, sessionHistory);
 
-      // Show plan
-      console.log('\n' + engine.formatPlan(plan));
+      // Check if this is conversational (no execution steps)
+      const isConversational = plan.intent.steps.length === 0;
+
+      // Show plan only for non-conversational inputs
+      if (!isConversational) {
+        console.log('\n' + engine.formatPlan(plan));
+      }
 
       if (plan.compilationErrors.length > 0) {
-        console.log('\n⚠️  Compilation errors:');
+        console.log('\n\u26A0\ufe0f  Compilation errors:');
         for (const err of plan.compilationErrors) {
           console.log(`  - ${err.message}`);
         }
@@ -66,7 +76,17 @@ async function main() {
         continue;
       }
 
-      // Confirm
+      if (isConversational) {
+        // Just show the conversational response
+        console.log(`\n${plan.intent.description}`);
+        console.log();
+        
+        // Add turn to session history
+        sessionManager.addTurn(description, plan.intent, plan, true);
+        continue;
+      }
+
+      // Confirm for non-conversational inputs
       const confirm = await ask('\nExecute this plan? (y/n/refine) ');
 
       if (confirm.trim() === 'refine') {
@@ -199,9 +219,12 @@ async function main() {
         console.log(`  ${icon} ${nodeId} (${ms})`);
       }
 
+      // Add turn to session history for workflow execution
+      sessionManager.addTurn(description, plan.intent, plan, false);
+
       console.log();
     } catch (error) {
-      console.error('\n❌ Error:', (error as Error).message);
+      console.error('\n\u2728 Error:', (error as Error).message);
       if (process.env.DEBUG) console.error((error as Error).stack);
       console.log();
     }

@@ -161,11 +161,13 @@ export class PipelineEngine {
   async plan(
     description: string,
     params?: Record<string, string>,
+    sessionHistory?: string,
   ): Promise<PlanResult> {
     const { intent, raw: intentRaw } = await this.generator.generate(
       description,
       {
         availableParams: params,
+        sessionHistory,
       },
     );
 

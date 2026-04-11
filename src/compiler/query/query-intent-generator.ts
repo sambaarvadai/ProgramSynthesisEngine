@@ -3,10 +3,12 @@ import type { QueryIntent } from './query-intent.js';
 import type { AggFn } from '../../core/ast/expr-ast.js';
 import type { Value } from '../../core/types/value.js';
 import type { ValidationResult } from './query-ast-builder.js';
+import type { RowSchema } from '../../core/types/schema.js';
 import { TablePreSelector, type TablePreSelectorConfig, type PreSelectionResult } from './table-pre-selector.js';
 import { QueryASTBuilder } from './query-ast-builder.js';
 import { z } from 'zod';
 import { MODELS } from '../../config/models.js';
+import { callLLM, LLMMessage } from '../../core/llm/llm-client.js';
 
 function parseJsonResponse(raw: string): any {
   // Strip markdown fences — model sometimes wraps response despite instructions
@@ -119,7 +121,15 @@ Rules:
     userPrompt += `Query: ${naturalLanguageQuery}\n\nSchema:\n${schemaSection}`;
 
     // 5. Call Sonnet and parse JSON response
-    const response = await this.callAnthropicAPI(systemPrompt, userPrompt);
+    const messages: LLMMessage[] = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ];
+    const response = await callLLM('anthropic', {
+      apiKey: this.config.anthropicApiKey,
+      model: this.config.model,
+      maxTokens: 4096
+    }, messages);
     const intent = parseJsonResponse(response);
 
     // 6. Validate against QueryIntent shape with Zod
@@ -144,39 +154,7 @@ Rules:
     };
   }
 
-  private async callAnthropicAPI(systemPrompt: string, userPrompt: string): Promise<string> {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.anthropicApiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: this.config.model,
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages: [
-          {
-            role: 'user',
-            content: userPrompt
-          }
-        ]
-      })
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Anthropic API error: ${response.status} ${errorText}`);
-    }
-
-    const data = await response.json();
-    const output = data.content[0].text;
-    console.log('[Query Intent Generator LLM Output]', output);
-    return output;
-  }
-
+  
   private buildSchemaSection(schema: SchemaConfig): string {
     const lines: string[] = [];
 

@@ -1,6 +1,6 @@
 import type { SchemaConfig } from '../schema/schema-config.js';
-import { getRelatedTables, tableExists } from '../schema/schema-config.js';
 import { MODELS } from '../../config/models.js';
+import { callLLM, LLMMessage } from '../../core/llm/llm-client.js';
 
 function parseJsonResponse(raw: string): any {
   // Strip markdown fences — model sometimes wraps response despite instructions
@@ -46,7 +46,15 @@ Return ONLY raw JSON with no markdown formatting, no backticks, no explanation.`
     const userPrompt = `Respond with raw JSON only. No markdown. No backticks. No explanation.\n\nQuery: ${naturalLanguageQuery}\n\nSchema:\n${schemaSummary}`;
 
     // 3. Call Anthropic API
-    const response = await this.callAnthropicAPI(systemPrompt, userPrompt);
+    const messages: LLMMessage[] = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ];
+    const response = await callLLM('anthropic', {
+      apiKey: this.config.anthropicApiKey,
+      model: this.config.model,
+      maxTokens: 4096
+    }, messages);
 
     // 4. Parse response JSON
     let selectedTables: string[];
@@ -64,7 +72,7 @@ Return ONLY raw JSON with no markdown formatting, no backticks, no explanation.`
     }
 
     // 5. Validate selected tables are real table names
-    selectedTables = selectedTables.filter(tableName => tableExists(fullSchema, tableName));
+    selectedTables = selectedTables.filter(tableName => fullSchema.tables.has(tableName));
 
     if (selectedTables.length === 0) {
       // Fall back to full schema if no valid tables selected
@@ -75,8 +83,10 @@ Return ONLY raw JSON with no markdown formatting, no backticks, no explanation.`
     // 6. Expand selection to include directly related tables
     const expandedTables = new Set<string>(selectedTables);
     for (const table of selectedTables) {
-      const related = getRelatedTables(fullSchema, table);
-      related.forEach(t => expandedTables.add(t));
+      const related = this.getRelatedTables(fullSchema, table);
+      for (const t of related) {
+        expandedTables.add(t);
+      }
     }
 
     // Deduplicate and cap at maxTables * 2
@@ -93,39 +103,7 @@ Return ONLY raw JSON with no markdown formatting, no backticks, no explanation.`
     };
   }
 
-  private async callAnthropicAPI(systemPrompt: string, userPrompt: string): Promise<string> {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.anthropicApiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: this.config.model,
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: [
-          {
-            role: 'user',
-            content: userPrompt
-          }
-        ]
-      })
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Anthropic API error: ${response.status} ${errorText}`);
-    }
-
-    const data = await response.json();
-    const output = data.content[0].text;
-    console.log('[Table Pre-selector LLM Output]', output);
-    return output;
-  }
-
+  
   private buildSchemaSummary(schema: SchemaConfig): string {
     const lines: string[] = [];
 
@@ -179,6 +157,21 @@ Return ONLY raw JSON with no markdown formatting, no backticks, no explanation.`
     }
 
     return summary;
+  }
+
+  private getRelatedTables(schema: SchemaConfig, tableName: string): string[] {
+    const related = new Set<string>();
+    
+    // Find tables related through foreign keys
+    for (const fk of schema.foreignKeys) {
+      if (fk.fromTable === tableName) {
+        related.add(fk.toTable);
+      } else if (fk.toTable === tableName) {
+        related.add(fk.fromTable);
+      }
+    }
+    
+    return Array.from(related);
   }
 
   private buildReducedSchema(fullSchema: SchemaConfig, tables: string[]): SchemaConfig {

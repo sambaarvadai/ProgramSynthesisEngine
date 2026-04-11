@@ -327,12 +327,9 @@ export class PostgresBackend implements StorageBackend {
 
   private isSimplePredicate(pred: ExprAST): boolean {
     if (pred.kind === 'BinaryOp') {
-      if (pred.op === '=' && pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal') {
-        return true;
-      }
-      // Check for IN operator by examining the expression structure
-      if (pred.kind === 'BinaryOp' && (pred as any).op === 'IN' && pred.left.kind === 'FieldRef' &&
-          pred.right.kind === 'Literal' && Array.isArray((pred.right as any).value)) {
+      // Handle all comparison operators with FieldRef and Literal
+      if (['=', '!=', '<', '>', '<=', '>=', 'LIKE'].includes(pred.op) &&
+          pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal') {
         return true;
       }
       // Handle SqlExpr - if right side is SqlExpr, it's safe to use directly
@@ -340,27 +337,69 @@ export class PostgresBackend implements StorageBackend {
         return true;
       }
     }
+    // Handle IS NULL and IS NOT NULL
+    if (pred.kind === 'IsNull' && pred.expr.kind === 'FieldRef') {
+      return true;
+    }
+    if (pred.kind === 'UnaryOp' && pred.op === 'NOT' && 
+        pred.operand.kind === 'IsNull' && pred.operand.expr.kind === 'FieldRef') {
+      return true;
+    }
+    // Handle IN operator
+    if (pred.kind === 'In' && pred.expr.kind === 'FieldRef') {
+      return true;
+    }
     return false;
   }
 
   private predicateToSQL(pred: ExprAST): { clause: string; params: Value[] } {
-    if (pred.kind === 'BinaryOp' && pred.op === '=' &&
+    // Handle all binary comparison operators with FieldRef and Literal
+    if (pred.kind === 'BinaryOp' && 
+        ['=', '!=', '<', '>', '<=', '>='].includes(pred.op) &&
         pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal') {
       return {
-        clause: `${pred.left.field} = $1`,
+        clause: `${pred.left.field} ${pred.op} $1`,
         params: [pred.right.value],
       };
     }
 
-    // Handle IN operator by checking the expression structure
-    if (pred.kind === 'BinaryOp' && (pred as any).op === 'IN' &&
-        pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal' &&
-        Array.isArray((pred.right as any).value)) {
-      const values = (pred.right as any).value;
+    // Handle LIKE operator
+    if (pred.kind === 'BinaryOp' && pred.op === 'LIKE' &&
+        pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal') {
+      return {
+        clause: `${pred.left.field} LIKE $1`,
+        params: [pred.right.value],
+      };
+    }
+
+    // Handle IN operator using the In expression kind
+    if (pred.kind === 'In' && pred.expr.kind === 'FieldRef') {
+      const values = pred.values.map(v => {
+        if (v.kind === 'Literal') {
+          return v.value;
+        }
+        throw new Error('IN operator only supports literal values');
+      });
       const placeholders = values.map((_: any, i: number) => `$${i + 1}`).join(', ');
       return {
-        clause: `${pred.left.field} IN (${placeholders})`,
+        clause: `${pred.expr.field} IN (${placeholders})`,
         params: values,
+      };
+    }
+
+    // Handle IS NULL and IS NOT NULL
+    if (pred.kind === 'IsNull' && pred.expr.kind === 'FieldRef') {
+      return {
+        clause: `${pred.expr.field} IS NULL`,
+        params: [],
+      };
+    }
+
+    if (pred.kind === 'UnaryOp' && pred.op === 'NOT' && 
+        pred.operand.kind === 'IsNull' && pred.operand.expr.kind === 'FieldRef') {
+      return {
+        clause: `${pred.operand.expr.field} IS NOT NULL`,
+        params: [],
       };
     }
 
