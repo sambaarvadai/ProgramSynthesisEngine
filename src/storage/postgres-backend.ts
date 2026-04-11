@@ -90,9 +90,9 @@ export class PostgresBackend implements StorageBackend {
       let params: Value[] = [];
 
       if (opts.predicate && this.isSimplePredicate(opts.predicate)) {
-        const sql = this.predicateToSQL(opts.predicate);
-        whereClause = `WHERE ${sql.clause}`;
-        params = sql.params;
+        const { clause, params: sqlParams } = this.predicateToSQL(opts.predicate, []);
+        whereClause = `WHERE ${clause}`;
+        params = sqlParams;
       }
 
       const query = `
@@ -266,20 +266,7 @@ export class PostgresBackend implements StorageBackend {
     return value;
   }
 
-  private engineTypeToPostgres(type: EngineType): string {
-    switch (type.kind) {
-      case 'string': return 'TEXT';
-      case 'number': return 'NUMERIC';
-      case 'boolean': return 'BOOLEAN';
-      case 'datetime': return 'TIMESTAMPTZ';
-      case 'json': return 'JSONB';
-      case 'array': return 'JSONB';
-      case 'record': return 'JSONB';
-      case 'any': return 'JSONB';
-      default: return 'JSONB';
-    }
-  }
-
+  
   private postgresTypeToEngine(dataTypeID: number, typeName: string): EngineType {
     // OID-based mapping for precision
     switch (dataTypeID) {
@@ -326,91 +313,188 @@ export class PostgresBackend implements StorageBackend {
   }
 
   private isSimplePredicate(pred: ExprAST): boolean {
-    if (pred.kind === 'BinaryOp') {
-      // Handle all comparison operators with FieldRef and Literal
-      if (['=', '!=', '<', '>', '<=', '>=', 'LIKE'].includes(pred.op) &&
-          pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal') {
-        return true;
-      }
-      // Handle SqlExpr - if right side is SqlExpr, it's safe to use directly
-      if (pred.left.kind === 'FieldRef' && pred.right.kind === 'SqlExpr') {
-        return true;
-      }
-    }
-    // Handle IS NULL and IS NOT NULL
-    if (pred.kind === 'IsNull' && pred.expr.kind === 'FieldRef') {
+    try {
+      this.predicateToSQL(pred, []);
       return true;
+    } catch {
+      return false; // Only throws for VarRef, WindowExpr, unknown functions
     }
-    if (pred.kind === 'UnaryOp' && pred.op === 'NOT' && 
-        pred.operand.kind === 'IsNull' && pred.operand.expr.kind === 'FieldRef') {
-      return true;
-    }
-    // Handle IN operator
-    if (pred.kind === 'In' && pred.expr.kind === 'FieldRef') {
-      return true;
-    }
-    return false;
   }
 
-  private predicateToSQL(pred: ExprAST): { clause: string; params: Value[] } {
-    // Handle all binary comparison operators with FieldRef and Literal
-    if (pred.kind === 'BinaryOp' && 
-        ['=', '!=', '<', '>', '<=', '>='].includes(pred.op) &&
-        pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal') {
-      return {
-        clause: `${pred.left.field} ${pred.op} $1`,
-        params: [pred.right.value],
-      };
-    }
+  private predicateToSQL(
+    pred: ExprAST,
+    params: Value[] = []
+  ): { clause: string; params: Value[] } {
+    const addParam = (value: Value): string => {
+      params.push(value);
+      return `$${params.length}`;
+    };
 
-    // Handle LIKE operator
-    if (pred.kind === 'BinaryOp' && pred.op === 'LIKE' &&
-        pred.left.kind === 'FieldRef' && pred.right.kind === 'Literal') {
-      return {
-        clause: `${pred.left.field} LIKE $1`,
-        params: [pred.right.value],
-      };
-    }
-
-    // Handle IN operator using the In expression kind
-    if (pred.kind === 'In' && pred.expr.kind === 'FieldRef') {
-      const values = pred.values.map(v => {
-        if (v.kind === 'Literal') {
-          return v.value;
+    switch (pred.kind) {
+      case 'Literal': {
+        if (pred.value === null) {
+          return { clause: 'NULL', params };
         }
-        throw new Error('IN operator only supports literal values');
-      });
-      const placeholders = values.map((_: any, i: number) => `$${i + 1}`).join(', ');
-      return {
-        clause: `${pred.expr.field} IN (${placeholders})`,
-        params: values,
-      };
-    }
+        if (typeof pred.value === 'string') {
+          return { clause: addParam(pred.value), params };
+        }
+        if (typeof pred.value === 'number') {
+          return { clause: `${addParam(pred.value)}::numeric`, params };
+        }
+        if (typeof pred.value === 'boolean') {
+          return { clause: `${addParam(pred.value)}::boolean`, params };
+        }
+        return { clause: addParam(pred.value), params };
+      }
 
-    // Handle IS NULL and IS NOT NULL
-    if (pred.kind === 'IsNull' && pred.expr.kind === 'FieldRef') {
-      return {
-        clause: `${pred.expr.field} IS NULL`,
-        params: [],
-      };
-    }
+      case 'FieldRef': {
+        const field = pred.table ? `"${pred.table}"."${pred.field}"` : `"${pred.field}"`;
+        return { clause: field, params };
+      }
 
-    if (pred.kind === 'UnaryOp' && pred.op === 'NOT' && 
-        pred.operand.kind === 'IsNull' && pred.operand.expr.kind === 'FieldRef') {
-      return {
-        clause: `${pred.operand.expr.field} IS NOT NULL`,
-        params: [],
-      };
-    }
+      case 'VarRef': {
+        throw new Error('VarRef expressions cannot be translated to SQL (pipeline variables)');
+      }
 
-    // Handle SqlExpr - output raw SQL directly
-    if (pred.kind === 'BinaryOp' && pred.left.kind === 'FieldRef' && pred.right.kind === 'SqlExpr') {
-      return {
-        clause: `${pred.left.field} ${pred.op} ${(pred.right as any).sql}`,
-        params: [],
-      };
-    }
+      case 'BinaryOp': {
+        const left = this.predicateToSQL(pred.left, params);
+        const right = this.predicateToSQL(pred.right, params);
 
-    throw new Error('Predicate is not simple enough for SQL translation');
+        // Arithmetic operators
+        if (['+', '-', '*', '/', '%'].includes(pred.op)) {
+          return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
+        }
+
+        // Comparison operators
+        if (['=', '!=', '<', '>', '<=', '>='].includes(pred.op)) {
+          // Special case for NULL comparisons
+          if (pred.right.kind === 'Literal' && pred.right.value === null) {
+            if (pred.op === '=') {
+              return { clause: `(${left.clause} IS NULL)`, params };
+            }
+            if (pred.op === '!=') {
+              return { clause: `(${left.clause} IS NOT NULL)`, params };
+            }
+          }
+          return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
+        }
+
+        // Logical operators
+        if (pred.op === 'AND') {
+          return { clause: `(${left.clause} AND ${right.clause})`, params };
+        }
+        if (pred.op === 'OR') {
+          return { clause: `(${left.clause} OR ${right.clause})`, params };
+        }
+
+        // String operators
+        if (pred.op === 'LIKE') {
+          return { clause: `(${left.clause} LIKE ${right.clause})`, params };
+        }
+        if (pred.op === 'CONCAT') {
+          return { clause: `(${left.clause} || ${right.clause})`, params };
+        }
+
+        throw new Error(`Unsupported binary operator: ${pred.op}`);
+      }
+
+      case 'UnaryOp': {
+        const operand = this.predicateToSQL(pred.operand, params);
+        if (pred.op === 'NOT') {
+          return { clause: `NOT (${operand.clause})`, params };
+        }
+        if (pred.op === 'NEG') {
+          return { clause: `-${operand.clause}`, params };
+        }
+        throw new Error(`Unsupported unary operator: ${pred.op}`);
+      }
+
+      case 'FunctionCall': {
+        const args = pred.args.map(arg => this.predicateToSQL(arg, params).clause);
+        
+        // Map common function names to SQL equivalents
+        const sqlFunction = pred.name.toUpperCase();
+        const supportedFunctions = [
+          'ABS', 'FLOOR', 'CEIL', 'ROUND', 'UPPER', 'LOWER', 'TRIM', 
+          'LENGTH', 'COALESCE', 'NOW', 'DATE_TRUNC'
+        ];
+        
+        if (!supportedFunctions.includes(sqlFunction)) {
+          throw new Error(`Unsupported function: ${pred.name}`);
+        }
+        
+        return { clause: `${sqlFunction}(${args.join(', ')})`, params };
+      }
+
+      case 'Conditional': {
+        const condition = this.predicateToSQL(pred.condition, params);
+        const thenClause = this.predicateToSQL(pred.then, params);
+        const elseClause = this.predicateToSQL(pred.else, params);
+        return {
+          clause: `(CASE WHEN ${condition.clause} THEN ${thenClause.clause} ELSE ${elseClause.clause} END)`,
+          params
+        };
+      }
+
+      case 'IsNull': {
+        const operand = this.predicateToSQL(pred.expr, params);
+        return { clause: `(${operand.clause} IS NULL)`, params };
+      }
+
+      case 'In': {
+        const expr = this.predicateToSQL(pred.expr, params);
+        const values = pred.values.map(v => {
+          if (v.kind === 'Literal') {
+            const value = v.value;
+            if (typeof value === 'number') {
+              return `${addParam(value)}::numeric`;
+            }
+            return addParam(value);
+          }
+          throw new Error('IN operator only supports literal values');
+        });
+        return { clause: `(${expr.clause} IN (${values.join(', ')}))`, params };
+      }
+
+      case 'Between': {
+        const expr = this.predicateToSQL(pred.expr, params);
+        const low = this.predicateToSQL(pred.low, params);
+        const high = this.predicateToSQL(pred.high, params);
+        return { clause: `(${expr.clause} BETWEEN ${low.clause} AND ${high.clause})`, params };
+      }
+
+      case 'Cast': {
+        const expr = this.predicateToSQL(pred.expr, params);
+        const pgType = this.engineTypeToPostgres(pred.to);
+        return { clause: `(${expr.clause}::${pgType})`, params };
+      }
+
+      case 'WindowExpr': {
+        throw new Error('Window functions cannot be pushed down to SQL (need ORDER context)');
+      }
+
+      case 'SqlExpr': {
+        return { clause: (pred as any).sql, params };
+      }
+
+      case 'Wildcard': {
+        throw new Error('Wildcard expressions are not valid in predicates');
+      }
+
+      default: {
+        throw new Error(`Unsupported expression kind: ${(pred as any).kind}`);
+      }
+    }
+  }
+
+  private engineTypeToPostgres(engineType: any): string {
+    switch (engineType.kind) {
+      case 'string': return 'TEXT';
+      case 'number': return 'NUMERIC';
+      case 'boolean': return 'BOOLEAN';
+      case 'datetime': return 'TIMESTAMPTZ';
+      case 'json': return 'JSONB';
+      default: return 'TEXT';
+    }
   }
 }
