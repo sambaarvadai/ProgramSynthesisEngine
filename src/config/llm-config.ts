@@ -14,13 +14,13 @@ export const DEFAULT_LLM_CONFIGS = {
     provider: 'anthropic' as const,
     model: 'claude-3-sonnet-20240229',
     maxTokens: 4096,
-    temperature: 0.1
+    temperature: 0
   },
   openai: {
     provider: 'openai' as const,
     model: 'gpt-4',
     maxTokens: 4096,
-    temperature: 0.1
+    temperature: 0
   }
 };
 

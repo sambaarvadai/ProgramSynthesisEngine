@@ -5,6 +5,8 @@ import { PostgresBackend } from './storage/index.js';
 import { isTabular, isRecord, isScalar, isCollection, isVoid, toTabular } from './core/types/data-value.js';
 import type { DataValue } from './core/types/data-value.js';
 import { SessionManager } from './session/session-manager.js';
+// Import error analyzer for detailed LLM-based error analysis
+import { ErrorAnalyzer } from './core/llm/error-analyzer.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
@@ -13,6 +15,11 @@ async function main() {
   await backend.connect();
 
   const sessionManager = new SessionManager(process.env.ANTHROPIC_API_KEY!);
+
+  // Initialize error analyzer for detailed LLM-based error analysis
+  const errorAnalyzer = new ErrorAnalyzer({
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY!
+  });
 
   const engine = new PipelineEngine({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
@@ -225,8 +232,24 @@ async function main() {
 
       console.log();
     } catch (error) {
-      console.error('\n\u2728 Error:', (error as Error).message);
-      if (process.env.DEBUG) console.error((error as Error).stack);
+      console.log();
+      console.log('\nError:', (error as Error).message);
+      
+      // Get detailed error analysis from LLM
+      console.log('\nAnalyzing error with AI...');
+      try {
+        const analysis = await errorAnalyzer.analyzeError(error as Error, {
+          operation: 'pipeline_execution',
+          additionalInfo: 'Error occurred during pipeline execution in Program Synthesis Engine'
+        });
+        
+        console.log(errorAnalyzer.formatForDisplay(analysis));
+      } catch (analysisError) {
+        console.log('\nFailed to get AI analysis:', analysisError instanceof Error ? analysisError.message : String(analysisError));
+        console.log('\nBasic error information:');
+        if (process.env.DEBUG) console.error((error as Error).stack);
+      }
+      
       console.log();
     }
   }

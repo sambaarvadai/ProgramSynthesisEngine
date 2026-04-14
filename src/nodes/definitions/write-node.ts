@@ -343,7 +343,9 @@ export function createWriteNodeDefinition(
 
 // ─── Row helpers ─────────────────────────────────────────────────────────────
 
-function extractRows(input: DataValue): Row[] {
+function extractRows(input: DataValue | undefined | null): Row[] {
+  if (input == null) return []          // null/undefined guard
+  if (input.kind === 'void') return []
   if (input.kind === 'tabular')  return input.data.rows as Row[]
   if (input.kind === 'record')   return [input.data as Row]
   if (input.kind === 'collection') {

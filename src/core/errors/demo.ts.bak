@@ -1,0 +1,201 @@
+// Error Handling System Demonstration
+
+import { 
+  BaseError, 
+  ValidationError, 
+  QueryExecutionError, 
+  BudgetExceededError,
+  ErrorCapture,
+  ErrorFramer,
+  ErrorMonitoring,
+  ErrorUtils,
+  ErrorCategory,
+  ErrorSeverity,
+  ErrorLevel,
+  Audience
+} from './index.js';
+
+/**
+ * Demonstration of the comprehensive error handling system
+ */
+export function demonstrateErrorHandling() {
+  console.log('=== Error Handling System Demonstration ===\n');
+
+  // 1. Create different types of errors
+  console.log('1. Creating Different Error Types:');
+  
+  const validationError = new ValidationError(
+    'Input data validation failed',
+    'VAL001',
+    { nodeId: 'user-input-validator', operation: 'validate_user_data' },
+    ['email is required', 'age must be positive']
+  );
+  
+  const queryError = new QueryExecutionError(
+    'SELECT * FROM users WHERE active = true',
+    new Error('Connection timeout'),
+    { nodeId: 'user-query-executor', executionId: 'exec-123' }
+  );
+  
+  const budgetError = new BudgetExceededError(
+    'timeout',
+    120000,
+    60000,
+    { executionId: 'exec-456', pipelineId: 'pipeline-789' }
+  );
+
+  console.log(`  - Validation Error: ${validationError.userMessage}`);
+  console.log(`  - Query Error: ${queryError.userMessage}`);
+  console.log(`  - Budget Error: ${budgetError.userMessage}\n`);
+
+  // 2. Error Capture and Aggregation
+  console.log('2. Error Capture and Aggregation:');
+  
+  const errorCapture = new ErrorCapture(100);
+  errorCapture.captureError(validationError);
+  errorCapture.captureError(queryError);
+  errorCapture.captureError(budgetError);
+  
+  const summary = errorCapture.generateSummary();
+  console.log(`  - Total Errors: ${summary.totalErrors}`);
+  console.log(`  - Categories: ${Object.keys(summary.categories).filter(cat => (summary.categories[cat as ErrorCategory]?.count ?? 0) > 0).join(', ')}`);
+  console.log(`  - Recommendations: ${summary.recommendations.length}\n`);
+
+  // 3. Error Response Framing
+  console.log('3. Error Response Framing:');
+  
+  const userResponse = ErrorFramer.formatErrorResponse(validationError, Audience.USER);
+  const developerResponse = ErrorFramer.formatErrorResponse(validationError, Audience.DEVELOPER);
+  
+  console.log('  User Response:');
+  console.log(`    Message: ${userResponse.error.message}`);
+  console.log(`    Recovery Suggestions: ${userResponse.error.recoverySuggestions.length}`);
+  
+  console.log('  Developer Response:');
+  console.log(`    Message: ${developerResponse.error.message}`);
+  console.log(`    Technical Details: ${developerResponse.error.technicalDetails}\n`);
+
+  // 4. Error Monitoring and Analytics
+  console.log('4. Error Monitoring and Analytics:');
+  
+  const errorMonitoring = new ErrorMonitoring({
+    alertThresholds: {
+      critical_error_rate: { value: 0.1, severity: ErrorSeverity.CRITICAL },
+      total_error_rate: { value: 1.0, severity: ErrorSeverity.ERROR }
+    }
+  });
+  
+  // Capture errors in monitoring system
+  errorMonitoring.captureError(validationError);
+  errorMonitoring.captureError(queryError);
+  errorMonitoring.captureError(budgetError);
+  
+  const report = errorMonitoring.generateReport();
+  console.log(`  - Report Period: ${Math.round(report.period.duration / 60000)} minutes`);
+  console.log(`  - Error Rate: ${report.metrics.errorRate.toFixed(2)}/min`);
+  console.log(`  - Active Alerts: ${report.alerts.length}`);
+  console.log(`  - Patterns Detected: ${report.patterns.length}\n`);
+
+  // 5. Formatted Reports
+  console.log('5. Formatted Error Reports:');
+  
+  const userReport = errorMonitoring.formatReportForUser(report);
+  const developerReport = errorMonitoring.formatReportForDeveloper(report);
+  
+  console.log('  User Report (first 200 chars):');
+  console.log(`    ${userReport.substring(0, 200)}...`);
+  
+  console.log('  Developer Report (first 200 chars):');
+  console.log(`    ${developerReport.substring(0, 200)}...\n`);
+
+  // 6. Error Utilities
+  console.log('6. Error Utilities:');
+  
+  const wrappedError = ErrorUtils.wrapError(new Error('Regular error'), { nodeId: 'test-node' });
+  console.log(`  - Wrapped Error: ${wrappedError.metadata.errorCode}`);
+  console.log(`  - Is Recoverable: ${ErrorUtils.isRecoverable(validationError)}`);
+  console.log(`  - Should Escalate: ${ErrorUtils.shouldEscalate(budgetError)}`);
+  
+  const correlationContext = ErrorUtils.createCorrelationContext('exec-123', 'pipe-456', 'node-789');
+  console.log(`  - Correlation Context: ${correlationContext.executionId}\n`);
+
+  // 7. Pattern Detection
+  console.log('7. Pattern Detection:');
+  
+  // Create multiple errors for the same node to trigger pattern detection
+  for (let i = 0; i < 5; i++) {
+    const nodeError = new ValidationError(`Repeated error ${i}`, 'VAL002', { nodeId: 'failing-node' });
+    errorCapture.captureError(nodeError);
+  }
+  
+  const patterns = errorCapture.detectPatterns();
+  console.log(`  - Patterns Found: ${patterns.length}`);
+  patterns.forEach(pattern => {
+    console.log(`    - ${pattern.pattern}: ${pattern.description}`);
+  });
+  
+  console.log('\n=== Demonstration Complete ===');
+  return {
+    summary,
+    report,
+    patterns,
+    alerts: errorMonitoring.getActiveAlerts()
+  };
+}
+
+/**
+ * Demonstrate error handling integration with pipeline execution
+ */
+export function demonstratePipelineErrorIntegration() {
+  console.log('\n=== Pipeline Error Integration Demo ===\n');
+  
+  // Simulate a pipeline execution with errors
+  const errorMonitoring = new ErrorMonitoring();
+  
+  // 1. Node-level error
+  const nodeError = new ValidationError(
+    'Invalid node configuration',
+    'VAL001',
+    { 
+      nodeId: 'data-transformer',
+      pipelineId: 'customer-pipeline',
+      executionId: 'exec-123',
+      component: 'NodeExecutor',
+      operation: 'validate_node_config'
+    }
+  );
+  
+  // 2. Pipeline-level error
+  const pipelineError = ErrorUtils.wrapError(nodeError, {
+    component: 'PipelineExecutor',
+    operation: 'execute_pipeline',
+    stage: 'node_execution'
+  });
+  
+  // 3. System-level error
+  const systemError = ErrorUtils.wrapError(pipelineError, {
+    component: 'System',
+    operation: 'pipeline_management',
+    resource: 'memory'
+  });
+  
+  // Capture all errors
+  errorMonitoring.captureError(nodeError);
+  errorMonitoring.captureError(pipelineError);
+  errorMonitoring.captureError(systemError);
+  
+  const report = errorMonitoring.generateReport();
+  
+  console.log('Pipeline Error Summary:');
+  console.log(`  - Total Errors: ${report.metrics.totalErrors}`);
+  console.log(`  - By Level: Node(${report.metrics.errorsByLevel[ErrorLevel.NODE] || 0}), Pipeline(${report.metrics.errorsByLevel[ErrorLevel.PIPELINE] || 0}), System(${report.metrics.errorsByLevel[ErrorLevel.SYSTEM] || 0})`);
+  console.log(`  - Error Propagation: ${nodeError.metadata.correlationId === pipelineError.metadata.correlationId ? 'Tracked' : 'Not tracked'}`);
+  
+  return report;
+}
+
+// Run demonstrations if this file is executed directly
+if (import.meta.url === `file://${process.argv[1]}`) {
+  demonstrateErrorHandling();
+  demonstratePipelineErrorIntegration();
+}

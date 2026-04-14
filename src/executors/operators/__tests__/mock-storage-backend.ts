@@ -102,11 +102,32 @@ export class MockStorageBackend implements StorageBackend {
 
   async rawQuery(sql: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
     // Mock implementation - for testing purposes only
-    // This is a simplified mock that doesn't actually parse SQL
     console.log('MockStorageBackend.rawQuery called with:', { sql, params });
     
+    // Handle specific test queries
+    if (sql.includes('COUNT') && sql.includes('GROUP BY') && sql.includes('customer_id')) {
+      // Handle "customers with most orders" query
+      const orders = this.data['orders'] || [];
+      const customerGroups = new Map<number, number>();
+      
+      // Count orders per customer
+      orders.forEach(order => {
+        const customerId = order.customer_id as number;
+        if (customerId != null) {
+          customerGroups.set(customerId, (customerGroups.get(customerId) || 0) + 1);
+        }
+      });
+      
+      // Convert to array and sort by count descending
+      const results = Array.from(customerGroups.entries())
+        .map(([customer_id, order_count]) => ({ customer_id, order_count }))
+        .sort((a, b) => b.order_count - a.order_count)
+        .slice(0, 5); // Limit 5
+      
+      return { rows: results, rowCount: results.length };
+    }
+    
     // Return empty result by default
-    // In real tests, you might want to mock specific SQL queries
     return { rows: [], rowCount: 0 };
   }
 

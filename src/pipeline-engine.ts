@@ -19,6 +19,8 @@ import { PipelineIntentGenerator } from './compiler/pipeline/index.js';
 import { PipelineCompiler } from './compiler/pipeline/index.js';
 import { QueryIntentGenerator as QueryIntentGeneratorClass, TablePreSelector } from './compiler/query/index.js';
 import { registerBuiltinFunctions } from './functions/index.js';
+// import { ErrorMonitoring, ErrorUtils } from './core/errors/index.js';
+import { SchemaValidator } from './core/validation/schema-validator.js';
 import Anthropic from '@anthropic-ai/sdk';
 import type {
   PipelineIntent,
@@ -82,6 +84,8 @@ export class PipelineEngine {
   private storageBackend: StorageBackend;
   private tempStore: TempStore;
   public calciteClient: CalciteClient;
+  private schemaValidator: SchemaValidator;
+  // public errorMonitoring: ErrorMonitoring;
 
   constructor(private config: PipelineEngineConfig) {
     // Initialize Anthropic client for transform enrichment
@@ -157,6 +161,24 @@ export class PipelineEngine {
       evaluator: this.evaluator,
       batchSize: config.defaultBatchSize || 100,
       calciteClient: this.calciteClient,
+    });
+
+    // Initialize error monitoring system
+    // this.errorMonitoring = new ErrorMonitoring({
+    //   alertThresholds: {
+    //     critical_error_rate: { value: 0.1, severity: 'critical' as any },
+    //     total_error_rate: { value: 1.0, severity: 'error' as any },
+    //     error_burst: { value: 5, severity: 'warning' as any }
+    //   },
+    //   maxHistorySize: 1000,
+    //   enableAutoRecovery: true
+    // });
+
+    // Initialize schema validator for pre-flight checks
+    this.schemaValidator = new SchemaValidator(config.schema || { 
+      tables: new Map(), 
+      foreignKeys: [], 
+      version: '1.0' 
     });
 
     // Initialize scheduler
@@ -235,8 +257,29 @@ export class PipelineEngine {
     params?: Record<string, Value>,
   ): Promise<RunResult> {
     if (plan.compilationErrors.length > 0) {
-      throw new PipelineCompilationError(plan.compilationErrors);
+      const compilationError = new PipelineCompilationError(plan.compilationErrors);
+      // this.errorMonitoring.captureError(compilationError, {
+      //   pipelineId: plan.graph.id,
+      //   operation: 'pipeline_execution',
+      //   stage: 'validation'
+      // });
+      throw compilationError;
     }
+
+    // Pre-flight schema validation
+    console.log('Performing pre-flight schema validation...');
+    const schemaValidation = await this.schemaValidator.validatePipeline(plan.graph);
+    
+    if (!schemaValidation.isValid) {
+      console.log('\nSchema validation failed:');
+      console.log(this.schemaValidator.formatForDisplay(schemaValidation));
+      
+      const validationError = new Error(`Schema validation failed: ${schemaValidation.summary}`);
+      (validationError as any).schemaValidation = schemaValidation;
+      throw validationError;
+    }
+    
+    console.log('Schema validation passed successfully');
 
     // Merge budget with correct precedence: defaults < plan.intent.budget < config.budget (user always wins)
     const budget: Partial<ExecutionBudget> = {
@@ -251,7 +294,7 @@ export class PipelineEngine {
       ...plan.intent.budget,
       // User config always wins
       ...(this.config.budget ?? {}),
-      // These must never be overridden — always reset at execution start
+      // These must never be overridden â always reset at execution start
       llmCallsUsed: 0,
       iterationsUsed: 0,
       startedAt: Date.now(),
@@ -266,14 +309,34 @@ export class PipelineEngine {
     });
 
     const startTime = Date.now();
-    const execution = await this.scheduler.execute(plan.graph, ctx);
-    const durationMs = Date.now() - startTime;
+    
+    try {
+      const execution = await this.scheduler.execute(plan.graph, ctx);
+      const durationMs = Date.now() - startTime;
 
-    return {
-      plan,
-      execution,
-      durationMs,
-    };
+      // Integrate execution trace with error monitoring
+      // this.errorMonitoring.integrateWithTrace(ctx.trace);
+
+      return {
+        plan,
+        execution,
+        durationMs,
+      };
+    } catch (error) {
+      // Capture execution errors
+      // const executionError = ErrorUtils.wrapError(error as Error, {
+      //   pipelineId: plan.graph.id,
+      //   executionId: ctx.executionId,
+      //   operation: 'pipeline_execution',
+      //   stage: 'scheduler_execution',
+      //   duration: Date.now() - startTime
+      // });
+      
+      // this.errorMonitoring.captureError(executionError);
+      // this.errorMonitoring.integrateWithTrace(ctx.trace);
+      
+      throw error;
+    }
   }
 
   formatPlan(plan: PlanResult): string {
@@ -354,6 +417,30 @@ export class PipelineEngine {
 
     return lines.join('\n');
   }
+
+  /**
+   * Get comprehensive error report for monitoring and analytics
+   */
+  // getErrorReport(timeRange?: { start: number; end: number }) {
+  //   return this.errorMonitoring.generateReport(timeRange);
+  // }
+
+  /**
+   * Get formatted error report for user display
+   */
+  // getFormattedErrorReport(audience: 'user' | 'developer' = 'user', timeRange?: { start: number; end: number }) {
+  //   const report = this.getErrorReport(timeRange);
+  //   return audience === 'user' 
+  //     ? this.errorMonitoring.formatReportForUser(report)
+  //     : this.errorMonitoring.formatReportForDeveloper(report);
+  // }
+
+  /**
+   * Get active error alerts
+   */
+  // getActiveAlerts() {
+  //   return this.errorMonitoring.getActiveAlerts();
+  // }
 
   private async enrichNodes(
     graph: PipelineGraph,
@@ -767,8 +854,13 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
   ): Promise<WritePayload> {
     const availableFields = this.getAvailableFields(step.id, { description: '', steps: [step], budget: {} }, fieldMap);
     
+    // Extract existing fields from the original step configuration
+    const originalFields = step.config?.fields as Record<string, any> || {};
+    
     const prompt = `Extract database write configuration from this step description:
 "${step.description}"
+
+Existing fields to preserve: ${JSON.stringify(originalFields)}
 
 Identify:
 1. 'columns': field names that come FROM input data rows (dynamic SET values)
@@ -777,24 +869,16 @@ Identify:
 4. 'staticWhere': literal WHERE values mentioned in the description
                   (e.g., 'ID=2', 'where id is 5', 'ticket 3')
 
+IMPORTANT: You MUST preserve all existing fields from the original configuration!
+- Template fields like "{{step.field}}" should go in 'columns'
+- Literal values should go in 'staticValues'
+- Do NOT lose any fields from the original configuration
+
 Examples:
-'update ticket ID=2 status to in_progress'
--> columns: []
--> staticValues: { 'status': 'in_progress' }
--> whereColumns: []
--> staticWhere: { 'id': 2 }
-
-'for each order set status to completed where order_id matches'
--> columns: []
--> staticValues: { 'status': 'completed' }
--> whereColumns: ['order_id']
--> staticWhere: {}
-
-'update the email for customer_id from the row, where id is from the row'
--> columns: ['email']
--> staticValues: {}
--> whereColumns: ['id']
--> staticWhere: {}
+Original: {"customer_id": "{{step.id}}", "subject": "Test"}
+Description: "update the email"
+-> columns: ['customer_id']
+-> staticValues: { 'subject': 'Test' }
 
 Available tables: ${Array.from(this.config.schema?.tables.keys() ?? []).join(', ')}
 Available input fields: ${availableFields.join(', ')}
@@ -814,6 +898,16 @@ IMPORTANT:
 - Only put field names in "columns" if they exist in availableFields
 - Put hardcoded/literal values in "staticValues"
 - For NOW() timestamps, use the string "NOW()"
+- PRESERVE all original fields - merge with existing configuration
+- NEVER include 'id' in columns if the table has a SERIAL or auto-increment primary key
+- Postgres assigns auto-increment IDs automatically - omit them from INSERT
+- Only include 'id' if the user explicitly provides a specific ID value
+- For email_log, use order_id (from orders table), not a computed max+1
+- FIELD MAPPING: When inserting into email_log from an orders query:
+  * Map 'id' from orders query to 'order_id' column
+  * Map 'customer_id' from orders query to 'customer_id' column
+  * Map 'email' from customers query to 'email' column
+- If availableFields contains 'id' and table is 'email_log', include 'order_id' in columns
 Return ONLY raw JSON.`;
 
     const response = await this.client.messages.create({
@@ -829,8 +923,67 @@ Return ONLY raw JSON.`;
     try {
       const config = JSON.parse(clean);
       
-      // Detect log tables and default to insert_ignore for safety
-      const tableName = config.table ?? step.config?.table as string ?? 'output';
+      // Preserve original table name from step.config
+      const tableName = step.config?.table as string ?? config.table ?? 'output';
+      
+      // Merge original fields with LLM-generated configuration
+      const mergedColumns: string[] = [];
+      const mergedStaticValues: Record<string, any> = { ...config.staticValues };
+      
+      // Process original fields
+      for (const [fieldName, fieldValue] of Object.entries(originalFields)) {
+        const fieldValueStr = String(fieldValue);
+        
+        // Check if it's a template field (contains {{}})
+        if (fieldValueStr.includes('{{') && fieldValueStr.includes('}}')) {
+          // Extract the field name from template (e.g., "{{step.id}}" -> "id")
+          const templateMatch = fieldValueStr.match(/\{\{([^}]+)\.([^}]+)\}\}/);
+          if (templateMatch) {
+            const sourceStep = templateMatch[1]; // e.g., "get_globex_latest_order"
+            const templateField = templateMatch[2]; // e.g., "id"
+            
+            // Field mapping logic: map common field names to target column names
+            let mappedField = templateField;
+            
+            // Map id -> order_id when the target table is email_log and field comes from orders-like query
+            if (tableName === 'email_log' && templateField === 'id') {
+              mappedField = 'order_id';
+            }
+            
+            // Map id -> customer_id when the target table needs customer_id and field comes from customers-like query  
+            if (fieldName === 'customer_id' && templateField === 'id') {
+              mappedField = 'customer_id';
+            }
+            
+            if (!mergedColumns.includes(mappedField)) {
+              mergedColumns.push(mappedField);
+            }
+          } else {
+            // If it's a complex template, add the whole field as a column
+            if (!mergedColumns.includes(fieldName)) {
+              mergedColumns.push(fieldName);
+            }
+          }
+        } else {
+          // It's a literal value
+          mergedStaticValues[fieldName] = fieldValue;
+        }
+      }
+      
+      // Add any additional columns from LLM config
+      for (const column of config.columns || []) {
+        if (!mergedColumns.includes(column)) {
+          mergedColumns.push(column);
+        }
+      }
+      
+      // Special handling: if we're inserting into email_log and have 'id' in availableFields,
+      // ensure 'order_id' is included in columns
+      if (tableName === 'email_log' && availableFields.includes('id')) {
+        if (!mergedColumns.includes('order_id')) {
+          mergedColumns.push('order_id');
+        }
+      }
       const isLogTable = tableName.includes('_log') || 
                          tableName.includes('_audit') ||
                          tableName.includes('notification');
@@ -843,8 +996,8 @@ Return ONLY raw JSON.`;
       return {
         table: tableName,
         mode,
-        columns: config.columns ?? [],
-        staticValues: config.staticValues ?? {},
+        columns: mergedColumns,
+        staticValues: mergedStaticValues,
         staticWhere: config.staticWhere ?? {},
         conflictColumns: config.conflictColumns as string[],
         updateColumns: config.updateColumns as string[],
@@ -852,11 +1005,25 @@ Return ONLY raw JSON.`;
         datasource: 'default'
       };
     } catch {
-      // Fallback to basic configuration
+      // Fallback to basic configuration with original fields
+      const fallbackColumns: string[] = [];
+      const fallbackStaticValues: Record<string, any> = {};
+      
+      // Process original fields for fallback
+      for (const [fieldName, fieldValue] of Object.entries(originalFields)) {
+        const fieldValueStr = String(fieldValue);
+        if (fieldValueStr.includes('{{')) {
+          fallbackColumns.push(fieldName);
+        } else {
+          fallbackStaticValues[fieldName] = fieldValue;
+        }
+      }
+      
       return {
         table: step.config?.table as string ?? 'output',
         mode: (step.config?.mode as string ?? 'insert') as 'insert' | 'update' | 'upsert' | 'insert_ignore' | 'delete',
-        columns: availableFields,
+        columns: fallbackColumns.length > 0 ? fallbackColumns : availableFields,
+        staticValues: fallbackStaticValues,
         datasource: 'default'
       };
     }

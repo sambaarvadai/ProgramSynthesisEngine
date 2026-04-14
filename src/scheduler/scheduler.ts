@@ -14,6 +14,8 @@ import { validationOk, validationFail, ValidationError } from '../core/types/val
 import { isBudgetExceeded, budgetRemaining } from '../core/context/execution-budget.js';
 import { contextPushScope } from '../core/context/execution-context.js';
 import { scopeSet } from '../core/scope/scope.js';
+import { traceError } from '../core/context/execution-trace.js';
+import { ValidationError as EnhancedValidationError, SystemError, BudgetExceededError as EnhancedBudgetExceededError, ErrorUtils } from '../core/errors/index.js';
 
 export class SchedulerValidationError extends Error {
   errors: ValidationError[];
@@ -174,13 +176,55 @@ function checkBudget(ctx: ExecutionContext, nodeKind: string): void {
   if (isBudgetExceeded(ctx.budget)) {
     const remaining = budgetRemaining(ctx.budget);
     if (remaining.timeMs <= 0) {
-      throw new BudgetExceededError('Pipeline timeout exceeded');
+      const timeoutError = new EnhancedBudgetExceededError(
+        'timeout',
+        ctx.budget.timeoutMs - remaining.timeMs,
+        ctx.budget.timeoutMs,
+        {
+          executionId: ctx.executionId,
+          pipelineId: ctx.pipelineId,
+          component: 'Scheduler',
+          operation: 'budget_check',
+          nodeKind,
+          elapsed: Date.now() - ctx.budget.startedAt,
+          remaining: remaining.timeMs
+        }
+      );
+      throw timeoutError;
     }
     if (remaining.llmCalls <= 0) {
-      throw new BudgetExceededError('LLM call budget exhausted');
+      const llmError = new EnhancedBudgetExceededError(
+        'llm_calls',
+        ctx.budget.maxLLMCalls,
+        ctx.budget.maxLLMCalls,
+        {
+          executionId: ctx.executionId,
+          pipelineId: ctx.pipelineId,
+          component: 'Scheduler',
+          operation: 'budget_check',
+          nodeKind,
+          used: ctx.budget.llmCallsUsed,
+          remaining: remaining.llmCalls
+        }
+      );
+      throw llmError;
     }
     if (remaining.iterations <= 0) {
-      throw new BudgetExceededError('Iteration budget exhausted');
+      const iterationError = new EnhancedBudgetExceededError(
+        'iterations',
+        ctx.budget.maxIterations,
+        ctx.budget.maxIterations,
+        {
+          executionId: ctx.executionId,
+          pipelineId: ctx.pipelineId,
+          component: 'Scheduler',
+          operation: 'budget_check',
+          nodeKind,
+          used: ctx.budget.iterationsUsed,
+          remaining: remaining.iterations
+        }
+      );
+      throw iterationError;
     }
   }
 
@@ -517,13 +561,38 @@ export class Scheduler {
       const timeoutMs = Math.min(remaining.timeMs, 30000); // Cap at 30s per node
 
       // Determine actual input to pass to node
-      // If node has single input port named 'input', pass that value directly
-      // Otherwise, pass the Record
       let actualInput: any;
-      if (def.inputPorts.length === 1 && def.inputPorts[0].key === 'input') {
-        actualInput = inputs['input'];
+      const inputKeys = Object.keys(inputs);
+      
+      if (inputKeys.length === 0) {
+        // No inputs - pass undefined (node handles it)
+        actualInput = undefined;
+        
+      } else if (inputKeys.length === 1) {
+        // Single input - pass the value directly regardless of key name
+        actualInput = inputs[inputKeys[0]];
+        
       } else {
-        actualInput = inputs;
+        // Multiple inputs - merge all into a single flat row (fan-in)
+        const mergedRow: Record<string, unknown> = {};
+        for (const value of Object.values(inputs)) {
+          if (!value) continue;
+          if (value.kind === 'tabular' && value.data.rows.length > 0) {
+            Object.assign(mergedRow, value.data.rows[0]);
+          } else if (value.kind === 'record') {
+            Object.assign(mergedRow, value.data);
+          } else if (value.kind === 'scalar') {
+            // scalar - skip, can't merge into row
+          }
+        }
+        const schema = {
+          columns: Object.keys(mergedRow).map(name => ({
+            name, 
+            type: { kind: 'any' } as any, 
+            nullable: true
+          }))
+        };
+        actualInput = tabular({ rows: [mergedRow as Row], schema }, schema);
       }
 
       // Debug: For write nodes, log payload details
@@ -558,9 +627,29 @@ export class Scheduler {
       });
 
     } catch (error) {
-      console.error(`[Scheduler] Node ${nodeId} failed with error:`, (error as Error).message);
-      console.error(`[Scheduler] Node ${nodeId} error stack:`, (error as Error).stack);
-      await this.handleNodeError(node, error as Error, graph, state);
+      const originalError = error as Error;
+      console.error(`[Scheduler] Node ${nodeId} failed with error:`, originalError.message);
+      console.error(`[Scheduler] Node ${nodeId} error stack:`, originalError.stack);
+      
+      // Capture detailed error information
+      const enhancedError = ErrorUtils.wrapError(originalError, {
+        nodeId,
+        pipelineId: state.ctx.pipelineId,
+        executionId: state.ctx.executionId,
+        component: 'Scheduler',
+        operation: 'executeNode',
+        nodeKind: node.kind,
+        nodePayload: node.payload
+      });
+      
+      // Add to execution trace
+      traceError(state.ctx.trace, nodeId, enhancedError, {
+        stage: 'node_execution',
+        nodeKind: node.kind,
+        retryAttempt: state.nodeStates.get(nodeId)?.retryCount || 0
+      });
+      
+      await this.handleNodeError(node, originalError, graph, state);
     }
   }
 

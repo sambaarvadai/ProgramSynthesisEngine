@@ -10,6 +10,5 @@ CREATE TABLE IF NOT EXISTS email_log (
   provider_id TEXT
 );
 
-CREATE UNIQUE INDEX idx_email_log_order_id ON email_log(order_id);
 CREATE INDEX idx_email_log_customer_id ON email_log(customer_id);
 CREATE INDEX idx_email_log_sent_at ON email_log(sent_at);

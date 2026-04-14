@@ -6,6 +6,9 @@ export interface ColumnConfig {
   name: string;
   type: EngineType;
   nullable: boolean;
+  hasDefault?: boolean; // true for SERIAL, DEFAULT values, etc.
+  defaultValue?: unknown; // the actual default value if known
+  primaryKey?: boolean; // true if this is a primary key column
   description?: string; // semantic metadata, used in LLM prompts
   examples?: Value[]; // sample values, used for llmTransform nodes
 }

@@ -239,6 +239,13 @@ Additional rules:
 - Return ONLY valid JSON, no markdown, no explanation
 - Do not set budget values in the response. Omit the budget field entirely.
 
+For INSERT operations:
+- NEVER compute MAX(id)+1 to get next ID - use SERIAL columns
+- The id column is auto-assigned by the database for tables with SERIAL PRIMARY KEY
+- Focus on the actual data columns: order_id, customer_id, email, subject, status, etc.
+- Do not create separate steps just to compute next ID values
+- Use proper field names that match the target table columns
+
 PipelineIntent schema:
 {
   "description": "string - overall pipeline description",

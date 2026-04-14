@@ -13,7 +13,8 @@ import { QueryASTBuilder, type ValidationResult } from '../compiler/query-ast/qu
 import { QueryPlanner } from '../compiler/query-ast/query-planner.js';
 import { OperatorTreeBuilder } from '../compiler/query/operator-tree-builder.js';
 import { collectAll } from './physical-operator.js';
-import { traceEvent } from '../core/context/execution-trace.js';
+import { traceEvent, traceError } from '../core/context/execution-trace.js';
+import { QueryExecutionError, ValidationError, DatabaseConnectionError, ErrorUtils } from '../core/errors/index.js';
 
 export interface QueryExecutorConfig {
   schema: SchemaConfig;
@@ -95,16 +96,36 @@ export class QueryExecutor {
     // Build FROM and JOINs
     sql += ` FROM "${intent.table}"`;
     
+    // Create a map of table aliases
+    const tableAliases = new Map<string, string>();
+    tableAliases.set(intent.table, intent.table);
+    
     if (intent.joins) {
       for (const join of intent.joins) {
         const joinKind = join.kind || 'INNER';
+        const alias = join.alias || join.table;
+        tableAliases.set(join.table, alias);
+        
         const onLeft = join.on?.left?.includes('.') ? 
-          `"${join.on.left.split('.')[0]}"."${join.on.left.split('.')[1]}"` : 
+          (() => {
+            const [table, field] = join.on.left.split('.');
+            const tableRef = tableAliases.get(table) || table;
+            return `"${tableRef}"."${field}"`;
+          })() : 
           `"${join.on?.left}"`;
         const onRight = join.on?.right?.includes('.') ? 
-          `"${join.on.right.split('.')[0]}"."${join.on.right.split('.')[1]}"` : 
+          (() => {
+            const [table, field] = join.on.right.split('.');
+            const tableRef = tableAliases.get(table) || table;
+            return `"${tableRef}"."${field}"`;
+          })() : 
           `"${join.on?.right}"`;
-        sql += ` ${joinKind} JOIN "${join.table}" ON ${onLeft} = ${onRight}`;
+        
+        if (join.alias) {
+          sql += ` ${joinKind} JOIN "${join.table}" "${join.alias}" ON ${onLeft} = ${onRight}`;
+        } else {
+          sql += ` ${joinKind} JOIN "${join.table}" ON ${onLeft} = ${onRight}`;
+        }
       }
     }
     
@@ -112,7 +133,9 @@ export class QueryExecutor {
     if (intent.filters && intent.filters.length > 0) {
       sql += ' WHERE ';
       const conditions = intent.filters.map(f => {
-        const field = f.table ? `"${f.table}"."${f.field}"` : `"${f.field}"`;
+        // Use table alias if available, otherwise use table name
+        const tableRef = f.table ? tableAliases.get(f.table) || f.table : null;
+        const field = tableRef ? `"${tableRef}"."${f.field}"` : `"${f.field}"`;
         
         if (f.operator === 'NOT IN' && typeof f.value === 'string' && f.value.trim().toLowerCase().startsWith('select')) {
           return `${field} NOT IN (${f.value.trim()})`;
@@ -144,8 +167,9 @@ export class QueryExecutor {
           // Order by alias directly (no quotes needed for aliases in ORDER BY)
           return `${ob.field} ${ob.direction || 'ASC'}`;
         } else {
-          // Order by regular field
-          const field = ob.table ? `"${ob.table}"."${ob.field}"` : `"${ob.field}"`;
+          // Order by regular field using table alias if available
+          const tableRef = ob.table ? tableAliases.get(ob.table) || ob.table : null;
+          const field = tableRef ? `"${tableRef}"."${ob.field}"` : `"${ob.field}"`;
           return `${field} ${ob.direction || 'ASC'}`;
         }
       }).join(', ');
@@ -196,22 +220,42 @@ export class QueryExecutor {
             optimizationsApplied: compiled.optimizations
           };
         } catch (err) {
-          console.warn('[QueryExecutor] Calcite failed, using raw SQL fallback:', (err as Error).message);
+          const error = err as Error;
+          console.warn('[QueryExecutor] Calcite failed, using raw SQL fallback:', error.message);
+          
+          // Capture detailed error information
+          const queryError = new QueryExecutionError(
+            `Calcite compilation for table: ${intent.table}`,
+            error,
+            {
+              executionId: ctx.executionId,
+              pipelineId: ctx.pipelineId,
+              component: 'QueryExecutor',
+              operation: 'calcite_compile',
+              nodeId: intent.table || 'unknown',
+              query: intent,
+              calciteAvailable: true
+            }
+          );
+          
+          traceError(ctx.trace, ctx.executionId, queryError, {
+            stage: 'calcite_compilation',
+            fallback: 'raw_sql'
+          });
         }
       }
       
-      // Fallback: buildRawSQL -> Postgres directly (NOT physical operators)
+      // Fallback: buildRawSQL -> backend.rawQuery
       // Physical operators can't handle joins correctly
       const { sql, params } = this.buildRawSQL(intent);
       console.log('[QueryExecutor] Raw SQL fallback:', sql);
-      const pool = (this.config.backend as any).pool;
-      const result = await pool.query(sql, params);
+      const result = await this.config.backend.rawQuery(sql, params);
       const schema = {
-        columns: result.fields.map((f: any) => ({
-          name: f.name,
+        columns: result.rows.length > 0 ? Object.keys(result.rows[0]).map(name => ({
+          name,
           type: { kind: 'any' } as any,
           nullable: true
-        }))
+        })) : []
       };
       return {
         rows: result.rows,

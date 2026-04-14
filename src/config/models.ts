@@ -25,7 +25,7 @@ export const MODELS = {
   // LLM node execution and transform enrichment (Haiku for per-row processing)
   LLM_NODE:
     process.env.ANTHROPIC_LLM_NODE_MODEL ||
-    'claude-haiku-4-5-20251001',
+    'claude-sonnet-4-6',
 } as const;
 
 export type ModelName = keyof typeof MODELS;

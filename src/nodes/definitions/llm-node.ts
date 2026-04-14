@@ -80,6 +80,7 @@ export function createLLMNodeDefinition(
         const response = await client.messages.create({
           model: payload.model ?? MODELS.LLM_NODE,
           max_tokens: payload.maxTokens ?? 500,
+          temperature: 0.7, // Higher temperature for creative LLM node processing
           system: systemContent,
           messages: [{ role: 'user', content: fullUserContent }],
         });

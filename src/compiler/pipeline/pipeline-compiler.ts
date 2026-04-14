@@ -492,6 +492,7 @@ export class PipelineCompiler {
             from: dep,
             to: step.id,
             kind: 'data',
+            inputKey: dep  // Use source node id as the key to avoid overwrites
           });
         }
       }
