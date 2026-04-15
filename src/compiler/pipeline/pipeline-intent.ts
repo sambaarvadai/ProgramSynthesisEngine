@@ -57,4 +57,5 @@ export interface PipelineIntentValidationError {
   stepId?: string;
   code: string;
   message: string;
+  missingColumns?: Array<{ column: string; nullable: boolean; description: string }>;
 }

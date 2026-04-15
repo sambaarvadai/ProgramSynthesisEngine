@@ -7,6 +7,7 @@ export interface ColumnConfig {
   type: EngineType;
   nullable: boolean;
   hasDefault?: boolean; // true for SERIAL, DEFAULT values, etc.
+  isGenerated?: boolean; // true for SERIAL / GENERATED ALWAYS
   defaultValue?: unknown; // the actual default value if known
   primaryKey?: boolean; // true if this is a primary key column
   description?: string; // semantic metadata, used in LLM prompts

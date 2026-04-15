@@ -7,6 +7,7 @@ import type { DataValue } from './core/types/data-value.js';
 import { SessionManager } from './session/session-manager.js';
 // Import error analyzer for detailed LLM-based error analysis
 import { ErrorAnalyzer } from './core/llm/error-analyzer.js';
+import { grantStore } from './auth/grant-store.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
@@ -40,7 +41,160 @@ async function main() {
   const ask = (q: string): Promise<string> =>
     new Promise(resolve => rl.question(q, resolve));
 
-  console.log('\n\uFE0F ProgramExecutionEngine CLI');
+  // User authentication
+  let currentUser: { id: string; username: string; role: string } | null = null;
+
+  async function login() {
+    console.log('\n\uFE0F ProgramExecutionEngine CLI');
+    console.log('Please log in to continue.\n');
+    
+    while (true) {
+      const username = await ask('Username: ');
+      if (!username.trim()) continue;
+      
+      const password = await ask('Password: ');
+      if (!password.trim()) continue;
+      
+      const user = grantStore.getUserByUsername(username.trim());
+      if (!user) {
+        console.log('\n\u274c Invalid username or password. Please try again.\n');
+        continue;
+      }
+      
+      // In a real implementation, you'd verify the password hash
+      // For now, we'll just accept any password for demo purposes
+      currentUser = { id: user.id, username: user.username, role: user.role };
+      grantStore.updateLastLogin(user.id);
+      
+      console.log(`\n\u2709 Logged in as ${user.username} (${user.role})\n`);
+      return;
+    }
+  }
+
+  await login();
+
+  // Access management command parsing
+  async function handleAccessCommand(input: string): Promise<boolean> {
+    const trimmed = input.trim().toLowerCase();
+    
+    // User commands
+    if (trimmed.startsWith('request access to ')) {
+      const target = input.slice('request access to '.length).trim();
+      if (!target) {
+        console.log('\u274c Usage: "request access to [table]" or "request access to [table].[column]"');
+        return true;
+      }
+      
+      const [table, column] = target.split('.');
+      if (!table) {
+        console.log('\u274c Invalid table name');
+        return true;
+      }
+      
+      const requestId = grantStore.requestAccess(currentUser!.id, table, column);
+      const targetDesc = column ? `${table}.${column}` : table;
+      console.log(`\u2709 Access request submitted for ${targetDesc}. An admin will review it.`);
+      console.log(`Request ID: ${requestId}`);
+      return true;
+    }
+    
+    if (trimmed === 'my access' || trimmed === 'what can i access') {
+      console.log('\n\ud83d\udccb Your Current Access:');
+      console.log('Table          | Read | Write');
+      console.log('-------------- | ---- | -----');
+      
+      // Get all tables in the schema
+      const schema = crmSchema;
+      let hasAnyAccess = false;
+      
+      for (const [tableName] of schema.tables) {
+        const canRead = grantStore.checkTableAccess(currentUser!.id, tableName, 'read');
+        const canWrite = grantStore.checkTableAccess(currentUser!.id, tableName, 'write');
+        
+        if (canRead || canWrite) {
+          hasAnyAccess = true;
+          const readSymbol = canRead ? '\u2713' : '\u2717';
+          const writeSymbol = canWrite ? '\u2713' : '\u2717';
+          console.log(`${tableName.padEnd(14)} | ${readSymbol}   | ${writeSymbol}`);
+        }
+      }
+      
+      if (!hasAnyAccess) {
+        console.log('No table access granted. Use "request access to [table]" to request access.');
+      }
+      console.log();
+      return true;
+    }
+    
+    // Admin commands
+    if (currentUser!.role !== 'admin') {
+      if (trimmed.startsWith('pending requests') || 
+          trimmed.startsWith('approve request') || 
+          trimmed.startsWith('deny request')) {
+        console.log('\u274c Only admins can manage access requests.');
+        return true;
+      }
+    }
+    
+    if (currentUser!.role === 'admin') {
+      if (trimmed === 'pending requests') {
+        const pending = grantStore.listPendingRequests();
+        if (pending.length === 0) {
+          console.log('\n\ud83d\udccb No pending access requests.');
+        } else {
+          console.log('\n\ud83d\udccb Pending Access Requests:');
+          console.log('ID              | User    | Table/Column     | Requested At');
+          console.log('---------------- | ------- | ---------------- | ------------');
+          
+          for (const request of pending) {
+            const user = grantStore.getUserById(request.userId);
+            const username = user?.username || 'Unknown';
+            const target = request.columnName ? `${request.tableName}.${request.columnName}` : request.tableName;
+            const requestedAt = new Date(request.requestedAt).toLocaleString();
+            
+            console.log(`${request.id.slice(0, 14).padEnd(14)} | ${username.padEnd(7)} | ${target.padEnd(14)} | ${requestedAt}`);
+          }
+        }
+        console.log();
+        return true;
+      }
+      
+      if (trimmed.startsWith('approve request ')) {
+        const requestId = input.slice('approve request '.length).trim();
+        if (!requestId) {
+          console.log('\u274c Usage: "approve request [requestId]"');
+          return true;
+        }
+        
+        try {
+          grantStore.approveAccess(requestId, currentUser!.id);
+          console.log(`\u2709 Request ${requestId} approved and access granted.`);
+        } catch (error) {
+          console.log(`\u274c Error approving request: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+        return true;
+      }
+      
+      if (trimmed.startsWith('deny request ')) {
+        const requestId = input.slice('deny request '.length).trim();
+        if (!requestId) {
+          console.log('\u274c Usage: "deny request [requestId]"');
+          return true;
+        }
+        
+        try {
+          grantStore.denyAccess(requestId, currentUser!.id);
+          console.log(`\u2709 Request ${requestId} denied.`);
+        } catch (error) {
+          console.log(`\u274c Error denying request: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+        return true;
+      }
+    }
+    
+    return false; // Not an access command
+  }
+
   console.log('Describe a workflow and the engine will plan and execute it.');
   console.log('Type "exit" to quit.\n');
 
@@ -57,15 +211,21 @@ async function main() {
   });
 
   while (true) {
-    const description = await ask('PEE> ');
+    const description = await ask(`${currentUser!.username}> `);
     if (description.trim() === 'exit') break;
     if (!description.trim()) continue;
 
     try {
+      // Check for access management commands first
+      const isAccessCommand = await handleAccessCommand(description);
+      if (isAccessCommand) {
+        continue; // Skip NL pipeline for access commands
+      }
+
       // Plan phase
       console.log('\n\ud83d\udccb Planning...');
       const sessionHistory = sessionManager.getHistory();
-      const plan = await engine.plan(description, undefined, sessionHistory);
+      const plan = await engine.plan(description, { sessionHistory, userId: currentUser!.id });
 
       // Check if this is conversational (no execution steps)
       const isConversational = plan.intent.steps.length === 0;
@@ -76,12 +236,75 @@ async function main() {
       }
 
       if (plan.compilationErrors.length > 0) {
-        console.log('\n\u26A0\ufe0f  Compilation errors:');
-        for (const err of plan.compilationErrors) {
-          console.log(`  - ${err.message}`);
+        // Check if this is a write completeness error that we can handle interactively
+        const writeIncompleteError = plan.compilationErrors.find(err => err.code === 'WRITE_INCOMPLETE');
+        if (writeIncompleteError && writeIncompleteError.missingColumns) {
+          console.log('\n\u26A0\ufe0f  Write completeness check:');
+          console.log(writeIncompleteError.message);
+          
+          console.log('\nThe write operation needs a few more values:');
+          
+          const collectedValues: Record<string, string> = {};
+          let cancelled = false;
+          
+          for (const col of writeIncompleteError.missingColumns) {
+            if (cancelled) break;
+            const label = col.nullable ? '(optional)' : '(required)';
+            
+            while (true) {
+              const value = await ask(`  ${col.column} ${label} - ${col.description}: `);
+              
+              if (value.trim().toLowerCase() === 'cancel') {
+                console.log('\nWrite cancelled.');
+                cancelled = true;
+                break;
+              }
+              if (!value.trim() && !col.nullable) {
+                console.log('  This field is required, please enter a value.');
+                continue;
+              }
+              if (value.trim()) collectedValues[col.column] = value.trim();
+              break;
+            }
+          }
+          
+          if (cancelled) continue;
+          
+          // Patch the existing plan in place - no re-planning
+          const enrichedPlan = engine.planWithMissingValues(
+            plan,                                    // pass full plan
+            writeIncompleteError.stepId!,
+            collectedValues
+          );
+          
+          plan.intent = enrichedPlan.intent;
+          plan.graph = enrichedPlan.graph;
+          plan.compilationErrors = enrichedPlan.compilationErrors;
+          
+          if (plan.compilationErrors.length > 0) {
+            // Still missing something - show remaining gaps
+            console.log('\n\u26A0\ufe0f  Still missing required values:');
+            for (const err of plan.compilationErrors) {
+              console.log(`  - ${err.message}`);
+            }
+            continue;
+          }
+          
+          // Plan is now complete - show it and ask for confirmation
+          console.log('\n' + engine.formatPlan(plan));
+          console.log('\n\u2705 All required values provided!');
+          const confirmAfterFill = await ask('\nExecute this plan? (y/n) ');
+          if (confirmAfterFill.trim() !== 'y') continue;
+          // fall through to execution
+        } else {
+          // Handle other compilation errors normally
+          console.log('\n\u26A0\ufe0f  Compilation errors:');
+          for (const err of plan.compilationErrors) {
+            console.log(`  - ${err.message}`);
+          }
+          console.log('Please refine your description.\n');
+          continue;
         }
-        console.log('Please refine your description.\n');
-        continue;
       }
 
       if (isConversational) {
@@ -247,7 +470,6 @@ async function main() {
       } catch (analysisError) {
         console.log('\nFailed to get AI analysis:', analysisError instanceof Error ? analysisError.message : String(analysisError));
         console.log('\nBasic error information:');
-        if (process.env.DEBUG) console.error((error as Error).stack);
       }
       
       console.log();

@@ -201,9 +201,10 @@ export class PipelineCompiler {
     // Validate write and http nodes have dependencies
     for (const step of intent.steps) {
       if (step.kind === 'write') {
-        // write nodes should have a dependsOn unless they have explicit filtering
+        // write nodes should have a dependsOn unless they have explicit filtering or are INSERT operations
         const hasExplicitFilter = step.config?.filter || step.config?.where || step.config?.whereColumns
-        if ((!step.dependsOn || step.dependsOn.length === 0) && !hasExplicitFilter) {
+        const isInsertOperation = step.config?.operation === 'INSERT' || step.config?.mode === 'insert'
+        if ((!step.dependsOn || step.dependsOn.length === 0) && !hasExplicitFilter && !isInsertOperation) {
           errors.push({
             stepId: step.id,
             code: 'WRITE_MISSING_INPUT',

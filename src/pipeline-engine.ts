@@ -21,6 +21,7 @@ import { QueryIntentGenerator as QueryIntentGeneratorClass, TablePreSelector } f
 import { registerBuiltinFunctions } from './functions/index.js';
 // import { ErrorMonitoring, ErrorUtils } from './core/errors/index.js';
 import { SchemaValidator } from './core/validation/schema-validator.js';
+import { PermissionChecker, type GrantedSchemaResult, type JoinCompletenessResult, type PostIntentValidationResult, type MissingColumnResult } from './auth/permission-checker.js';
 import Anthropic from '@anthropic-ai/sdk';
 import type {
   PipelineIntent,
@@ -85,6 +86,7 @@ export class PipelineEngine {
   private tempStore: TempStore;
   public calciteClient: CalciteClient;
   private schemaValidator: SchemaValidator;
+  private permissionChecker: PermissionChecker;
   // public errorMonitoring: ErrorMonitoring;
 
   constructor(private config: PipelineEngineConfig) {
@@ -181,6 +183,9 @@ export class PipelineEngine {
       version: '1.0' 
     });
 
+    // Initialize permission checker
+    this.permissionChecker = new PermissionChecker();
+
     // Initialize scheduler
     this.scheduler = new Scheduler({
       nodeRegistry: this.nodeRegistry,
@@ -203,9 +208,127 @@ export class PipelineEngine {
 
   async plan(
     description: string,
-    params?: Record<string, string>,
-    sessionHistory?: string,
+    options?: {
+      params?: Record<string, string>;
+      sessionHistory?: string;
+      userId?: string;
+    },
   ): Promise<PlanResult> {
+    const { params, sessionHistory, userId } = options || {};
+    const fullSchema = this.config.schema ?? { tables: new Map(), foreignKeys: [], version: '1' };
+
+    // If userId is provided, run permission checks
+    let grantedSchemaResult: GrantedSchemaResult | undefined;
+    
+    if (userId) {
+      // 1. Check explicit mentions for permission violations
+      const explicitCheck = this.permissionChecker.checkExplicitMentions(description, userId, fullSchema);
+      if (!explicitCheck.allowed) {
+        return {
+          intent: { steps: [], description: '' },
+          graph: {
+            id: 'error-graph',
+            version: 1,
+            nodes: new Map(),
+            edges: new Map(),
+            entryNode: '',
+            exitNodes: [],
+            metadata: {
+              createdAt: Date.now(),
+              description: 'Permission denied',
+              tags: [],
+              budget: {}
+            }
+          },
+          compilationErrors: [{
+            code: 'PERMISSION_DENIED',
+            message: explicitCheck.message || 'Permission denied',
+            stepId: ''
+          }],
+          intentRaw: description,
+        };
+      }
+
+      // 2. Get granted schema or return error
+      grantedSchemaResult = this.permissionChecker.getGrantedSchemaOrError(userId, fullSchema);
+      if (!grantedSchemaResult.ok) {
+        return {
+          intent: { steps: [], description: '' },
+          graph: {
+            id: 'error-graph',
+            version: 1,
+            nodes: new Map(),
+            edges: new Map(),
+            entryNode: '',
+            exitNodes: [],
+            metadata: {
+              createdAt: Date.now(),
+              description: 'No accessible tables',
+              tags: [],
+              budget: {}
+            }
+          },
+          compilationErrors: [{
+            code: 'NO_ACCESSIBLE_TABLES',
+            message: grantedSchemaResult.message || 'No accessible tables',
+            stepId: ''
+          }],
+          intentRaw: description,
+        };
+      }
+    }
+
+    // Use granted schema if userId provided, otherwise use full schema
+    const schemaToUse = userId && grantedSchemaResult?.ok && grantedSchemaResult.schema 
+      ? grantedSchemaResult.schema 
+      : fullSchema;
+
+    // Run TablePreSelector first to get selected tables
+    const preSelector = new TablePreSelector({
+      anthropicApiKey: this.config.anthropicApiKey,
+      maxTables: 5,
+    });
+    
+    const preSelectionResult = await preSelector.select(description, schemaToUse);
+    
+    // If userId is provided, check join completeness
+    if (userId) {
+      const joinCompletenessResult = this.permissionChecker.checkJoinCompleteness(
+        preSelectionResult.selectedTables,
+        schemaToUse,
+        fullSchema
+      );
+      
+      if (!joinCompletenessResult.ok) {
+        return {
+          intent: { steps: [], description: '' },
+          graph: {
+            id: 'error-graph',
+            version: 1,
+            nodes: new Map(),
+            edges: new Map(),
+            entryNode: '',
+            exitNodes: [],
+            metadata: {
+              createdAt: Date.now(),
+              description: 'Join completeness check failed',
+              tags: [],
+              budget: {}
+            }
+          },
+          compilationErrors: [{
+            code: 'JOIN_INCOMPLETE',
+            message: joinCompletenessResult.message || 'Join completeness check failed',
+            stepId: ''
+          }],
+          intentRaw: description,
+        };
+      }
+    }
+
+    // Use the reduced schema from TablePreSelector for intent generation
+    const schemaForIntentGeneration = preSelectionResult.reducedSchema;
+
     const { intent, raw: intentRaw } = await this.generator.generate(
       description,
       {
@@ -220,8 +343,98 @@ export class PipelineEngine {
       await this.enrichNodes(
         graph,
         intent,
-        this.config.schema ?? { tables: new Map(), foreignKeys: [], version: '1' },
+        schemaForIntentGeneration,
       );
+    }
+
+    // Post-intent permission validation (safety net against LLM hallucinations)
+    if (userId && compilationErrors.length === 0) {
+      const postIntentValidation = this.permissionChecker.validateEnrichedPipeline(
+        intent,
+        userId,
+        schemaToUse,
+        graph
+      );
+      
+      if (!postIntentValidation.ok) {
+        return {
+          intent: { steps: [], description: '' },
+          graph: {
+            id: 'error-graph',
+            version: 1,
+            nodes: new Map(),
+            edges: new Map(),
+            entryNode: '',
+            exitNodes: [],
+            metadata: {
+              createdAt: Date.now(),
+              description: 'Post-intent permission validation failed',
+              tags: [],
+              budget: {}
+            }
+          },
+          compilationErrors: [{
+            code: 'POST_INTENT_PERMISSION_DENIED',
+            message: postIntentValidation.message || 'Post-intent permission validation failed',
+            stepId: ''
+          }],
+          intentRaw: description,
+        };
+      }
+    }
+
+    // Write completeness check for all WriteNode steps
+    if (compilationErrors.length === 0) {
+      for (const step of intent.steps) {
+        const node = graph.nodes.get(step.id);
+        if (node?.kind === 'write') {
+          const writePayload = node.payload as WritePayload;
+          
+          // Resolve upstream columns by looking at input edges and finding QueryNode output
+          const upstreamColumns: string[] = [];
+          const inputEdges = Array.from(graph.edges.values()).filter(edge => edge.to === step.id);
+          
+          for (const edge of inputEdges) {
+            const upstreamNode = graph.nodes.get(edge.from);
+            if (upstreamNode?.kind === 'query') {
+              const queryPayload = upstreamNode.payload as QueryPayload;
+              // Get column names from query output
+              upstreamColumns.push(...queryPayload.intent.columns.map(col => col.alias || col.field));
+            }
+          }
+          
+          // Check for missing columns
+          const missingColumnsResult = this.permissionChecker.getMissingColumns(
+            writePayload.table,
+            fullSchema,
+            writePayload,
+            upstreamColumns
+          );
+          
+          if (!missingColumnsResult.complete) {
+            const missing = missingColumnsResult.missing!;
+            const missingList = missing.map(m => 
+              `${m.column}${m.nullable ? ' (optional)' : ' (required)'} - ${m.description}`
+            ).join('\n  ');
+            
+            return {
+              intent,          // Return the real intent, not empty
+              graph,           // Return the real graph
+              compilationErrors: [{
+                code: 'WRITE_INCOMPLETE',
+                message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
+                stepId: step.id,
+                missingColumns: missing.map(m => ({
+                  column: m.column,
+                  nullable: m.nullable,
+                  description: m.description
+                }))
+              }],
+              intentRaw: description,
+            };
+          }
+        }
+      }
     }
 
     return {
@@ -250,6 +463,87 @@ export class PipelineEngine {
     params?: Record<string, string>,
   ): Promise<PlanResult> {
     return await this.plan(description, params);
+  }
+
+  /**
+   * Patch an existing plan with additional static values for a specific write step.
+   * This patches the plan in place without re-planning or LLM calls.
+   */
+  planWithMissingValues(
+    existingPlan: PlanResult,
+    stepId: string,
+    additionalValues: Record<string, string>
+  ): PlanResult {
+    // Find the write step and node in the existing plan
+    const writeStep = existingPlan.intent.steps.find(step => step.id === stepId);
+    const writeNode = existingPlan.graph.nodes.get(stepId);
+    
+    if (!writeStep || !writeNode || writeNode.kind !== 'write') {
+      return existingPlan;
+    }
+    
+    // Update the WriteNode payload with additional static values
+    const writePayload = writeNode.payload as WritePayload;
+    writePayload.staticValues = {
+      ...writePayload.staticValues,
+      ...additionalValues
+    };
+    
+    // Update the step config as well
+    writeStep.config = {
+      ...writeStep.config,
+      fields: {
+        ...(writeStep.config?.fields as Record<string, any> || {}),
+        ...additionalValues
+      }
+    };
+    
+    // Re-run getMissingColumns() on the patched payload to verify completeness
+    const upstreamColumns: string[] = [];
+    const inputEdges = Array.from(existingPlan.graph.edges.values()).filter(edge => edge.to === stepId);
+    
+    for (const edge of inputEdges) {
+      const upstreamNode = existingPlan.graph.nodes.get(edge.from);
+      if (upstreamNode?.kind === 'query') {
+        const queryPayload = upstreamNode.payload as QueryPayload;
+        upstreamColumns.push(...queryPayload.intent.columns.map(col => col.alias || col.field));
+      }
+    }
+    
+    const missingColumnsResult = this.permissionChecker.getMissingColumns(
+      writePayload.table,
+      this.config.schema ?? { tables: new Map(), foreignKeys: [], version: '1' },
+      writePayload,
+      upstreamColumns
+    );
+    
+    // If still incomplete, return plan with remaining WRITE_INCOMPLETE error
+    if (!missingColumnsResult.complete) {
+      const missing = missingColumnsResult.missing!;
+      const missingList = missing.map(m => 
+        `${m.column}${m.nullable ? ' (optional)' : ' (required)'} - ${m.description}`
+      ).join('\n  ');
+      
+      return {
+        ...existingPlan,
+        compilationErrors: [{
+          code: 'WRITE_INCOMPLETE',
+          message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
+          stepId: stepId,
+          missingColumns: missing.map(m => ({
+            column: m.column,
+            nullable: m.nullable,
+            description: m.description
+          }))
+        }]
+      };
+    }
+    
+    // If complete, return plan with empty compilationErrors (ready to execute)
+    return {
+      ...existingPlan,
+      compilationErrors: []
+    };
   }
 
   async execute(
