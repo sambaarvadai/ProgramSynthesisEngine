@@ -8,6 +8,7 @@
     "start": "node dist/index.js",
     "cli": "tsx src/cli.ts",
     "auth:seed": "npx tsx src/auth/seed-dev-grants.ts",
+    "api:seed": "npx tsx src/config/seed-api-registry.ts",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
     "db:reset": "docker compose down -v && docker compose up -d",
@@ -18,7 +19,9 @@
     "calcite:start": "java -jar calcite-service/target/calcite-service-1.0.0.jar",
     "calcite:dev": "npm run calcite:build && npm run calcite:start",
     "services:up": "docker compose up -d",
-    "services:down": "docker compose down"
+    "services:down": "docker compose down",
+    "mock:api": "npx tsx src/mock-api/customer-enrichment-server.ts",
+    "test:http": "npx tsx src/mock-api/http-node-integration-test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.0",

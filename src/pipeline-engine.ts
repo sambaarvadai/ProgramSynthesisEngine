@@ -18,6 +18,8 @@ import { stripHallucinatedFieldRefs } from './compiler/pipeline/expr-sanitizer.j
 import { PipelineIntentGenerator } from './compiler/pipeline/index.js';
 import { PipelineCompiler } from './compiler/pipeline/index.js';
 import { QueryIntentGenerator as QueryIntentGeneratorClass, TablePreSelector } from './compiler/query/index.js';
+import { apiRegistryStore } from './config/api-registry-store.js';
+import { ApiPreSelector } from './compiler/http/api-pre-selector.js';
 import { registerBuiltinFunctions } from './functions/index.js';
 // import { ErrorMonitoring, ErrorUtils } from './core/errors/index.js';
 import { SchemaValidator } from './core/validation/schema-validator.js';
@@ -872,36 +874,46 @@ export class PipelineEngine {
         }
 
         case 'http': {
-          const url = step.config?.url as string
-                   ?? step.config?.endpoint as string
-                   ?? ''
-          const method = (step.config?.method as string ?? 'POST').toUpperCase()
-          const authHeader = step.config?.authHeader as string ?? 'Authorization'
-          const authToken = step.config?.authToken as string
-                         ?? step.config?.apiKey as string
-                         ?? ''
+          const availableFields = this.getAvailableFields(step.id, intent, fieldMap);
           
-          // Resolve auth token from env if it looks like an env var name
-          const resolvedToken = authToken.startsWith('process.env.')
-            ? process.env[authToken.replace('process.env.', '')] ?? ''
-            : authToken.startsWith('$')
-            ? process.env[authToken.slice(1)] ?? ''
-            : authToken
+          // Try registry lookup first (fast, deterministic)
+          const urlFromStep = step.config?.url as string ?? 
+                              step.description.match(/https?:\/\/[^\s"']+/)?.[0] ?? ''
           
-          node.payload = {
-            url: { parts: [{ kind: 'literal', text: url }] },
-            method: method as 'GET' | 'POST' | 'PUT' | 'DELETE',
-            headers: resolvedToken ? {
-              [authHeader]: { parts: [{ kind: 'literal', text: resolvedToken }] }
-            } : {},
-            body: {
-              kind: 'VarRef',
-              name: 'input'
-            },
-            outputSchema: { kind: 'any' },
-            retryPolicy: { maxRetries: 2, backoffMs: 1000 }
-          } as HttpPayload
-          break
+          let matchedEndpoint = urlFromStep 
+            ? apiRegistryStore.findByUrl(urlFromStep) 
+            : null
+          
+          // If no URL match, use ApiPreSelector to find relevant endpoint from description
+          if (!matchedEndpoint) {
+            const allEndpoints = apiRegistryStore.listAll()
+            if (allEndpoints.length > 0) {
+              const apiSelector = new ApiPreSelector({ 
+                anthropicApiKey: this.config.anthropicApiKey 
+              })
+              const { selectedEndpoints } = await apiSelector.select(
+                step.description, 
+                allEndpoints
+              )
+              matchedEndpoint = selectedEndpoints[0] ?? null
+            }
+          }
+          
+          node.payload = await this.enrichHttpNode(step, availableFields, matchedEndpoint);
+          
+          const responseFieldNames = matchedEndpoint
+            ? matchedEndpoint.responseFields.map((f: any) => f.name)
+            : (node.payload as HttpPayload).outputFields ?? ['http_response']
+          
+          // Array-mode HTTP nodes expand rows - fieldMap gets response fields only
+          // (not combined with input fields, since each output row is a new entity)
+          if (matchedEndpoint?.responseMode === 'array') {
+            fieldMap.set(step.id, [...responseFieldNames, 'http_status'])
+          } else {
+            // Object mode - input fields flow through with response fields appended
+            fieldMap.set(step.id, [...availableFields, ...responseFieldNames, 'http_status'])
+          }
+          break;
         }
 
         case 'write': {
@@ -1075,6 +1087,7 @@ Return ONLY a JSON array of operations, no markdown, no explanation.`;
     const response = await this.client.messages.create({
       model: MODELS.LLM_NODE,
       max_tokens: 500,
+      temperature: 0,
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -1145,15 +1158,16 @@ Examples:
 
 Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
 
-    const response = await this.client.messages.create({
-      model: MODELS.LLM_NODE,
-      max_tokens: 300,
-      messages: [{ role: 'user', content: prompt }],
-    });
+  const response = await this.client.messages.create({
+    model: MODELS.LLM_NODE,
+    max_tokens: 300,
+    temperature: 0,
+    messages: [{ role: 'user', content: prompt }],
+  });
 
-    const raw = response.content[0].type === 'text' ? response.content[0].text : '';
-    console.log('[Conditional Enrichment LLM Output]', raw);
-    const clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+  const raw = response.content[0].type === 'text' ? response.content[0].text : '';
+  console.log('[Conditional Enrichment LLM Output]', raw);
+  const clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
 
     function stripTablePrefixes(expr: any): any {
       if (!expr || typeof expr !== 'object') return expr;
@@ -1282,6 +1296,7 @@ Return ONLY raw JSON.`;
     const response = await this.client.messages.create({
       model: MODELS.LLM_NODE,
       max_tokens: 300,
+      temperature: 0,
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -1396,5 +1411,279 @@ Return ONLY raw JSON.`;
         datasource: 'default'
       };
     }
+  }
+
+  private async enrichHttpNode(
+    step: PipelineStepIntent,
+    availableFields: string[],
+    matchedEndpoint: any // ApiEndpointRow | null
+  ): Promise<HttpPayload> {
+    // Extract URL using registry endpoint as authoritative source
+    const urlFromDescription = matchedEndpoint?.baseUrl
+      ?? step.description.match(/https?:\/\/[^\s"']+/)?.[0]
+      ?? step.config?.url as string
+      ?? ''
+
+    // Extract method using registry endpoint as authoritative source
+    const methodFromDescription = matchedEndpoint?.method
+      ?? (step.description.match(/\b(GET|POST|PUT|PATCH|DELETE)\b/i)?.[1]
+      ?? step.config?.method as string
+      ?? 'POST').toUpperCase()
+
+    // Extract batchMode from registry endpoint
+    const batchModeFromRegistry = matchedEndpoint?.batchMode ?? null
+
+    // Get schema context for LLM prompt (endpoint is now passed as parameter)
+    const schemaContext = matchedEndpoint 
+      ? apiRegistryStore.getSchemaContext(matchedEndpoint)
+      : ''
+
+    const userPrompt = `
+Extract HTTP request config from this step description:
+"${step.description}"
+
+Available fields for body construction: ${availableFields.join(', ')}
+
+IMPORTANT: The URL has already been extracted and is: ${urlFromDescription}
+The method has already been determined as: ${methodFromDescription}
+Do NOT change or reinterpret these values.
+Your job is ONLY to determine: bodyFields, batchMode, outputFields, and auth.
+
+${schemaContext ? `API Schema Context:\n${schemaContext}\n` : ''}
+Return JSON with these fields:
+{
+  "headers": {"Content-Type": "application/json"},
+  "auth": {"kind": "bearer|apiKey", "envVar": "ENV_VAR_NAME"},
+  "bodyFields": ["field1", "field2"] | [],
+  "bodyTemplate": "JSON template with {field} placeholders" | null,
+  "outputFields": ["responseField1", "responseField2"],
+  "batchMode": true/false
+}
+
+Rules:
+- batchMode: true if description mentions 'batch', 'all at once', 'send all', 'array of', or the URL path suggests bulk operation (e.g. /enrich/customers plural endpoint)
+- If bodyFields is empty array [], send entire row as JSON object
+- If bodyTemplate is provided, use that instead of bodyFields
+- If method is GET, omit bodyFields and bodyTemplate
+- Always include Content-Type: application/json in headers
+- For auth, use $ENV_VAR_NAME format for environment variables
+- outputFields defaults to ["http_response"] if not specified
+`
+
+    // Fast path: if matchedEndpoint is found, skip LLM entirely
+    if (matchedEndpoint) {
+      // Registry is authoritative - only need to map availableFields to requestFields
+      const requestFieldNames = matchedEndpoint.requestFields.map((f: any) => f.name)
+      const responseFieldNames = matchedEndpoint.responseFields.map((f: any) => f.name)
+      
+      // Map: which availableFields exist in the API's requestSchema
+      const bodyFields = availableFields.filter(f => requestFieldNames.includes(f))
+      
+      // Resolve auth from registry
+      let auth
+      if (matchedEndpoint.auth.kind === 'bearer' && matchedEndpoint.auth.envVar) {
+        const token = process.env[matchedEndpoint.auth.envVar] ?? ''
+        auth = {
+          kind: 'bearer' as const,
+          token: { kind: 'Literal' as const, value: token, type: { kind: 'string' as const } }
+        }
+      } else if (matchedEndpoint.auth.kind === 'apiKey' && matchedEndpoint.auth.envVar) {
+        const key = process.env[matchedEndpoint.auth.envVar] ?? ''
+        auth = {
+          kind: 'apiKey' as const,
+          header: matchedEndpoint.auth.header ?? 'X-API-Key',
+          value: { kind: 'Literal' as const, value: key, type: { kind: 'string' as const } }
+        }
+      }
+
+      return {
+        url: this.buildUrlTemplate(urlFromDescription, availableFields),
+        method: methodFromDescription as 'GET'|'POST'|'PUT'|'PATCH'|'DELETE',
+        headers: { 'Content-Type': { parts: [{ kind: 'literal', text: 'application/json' }] } },
+        body: { kind: 'VarRef' as const, name: 'input' },
+        bodyFields,                          // intersection of availableFields and requestFields
+        outputFields: responseFieldNames,    // authoritative from registry
+        outputSchema: { kind: 'any' as const },
+        auth,
+        retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+        batchMode: matchedEndpoint.batchMode,
+        endpointId: matchedEndpoint.id,
+        responseMode: matchedEndpoint.responseMode,
+        responseRoot: matchedEndpoint.responseRoot,
+        concurrency: matchedEndpoint.defaultConcurrency,
+        rateLimitPerSecond: matchedEndpoint.defaultRateLimit,
+        chunkSize: matchedEndpoint.defaultChunkSize
+      }
+    }
+    // Fall through to LLM-based extraction for unknown APIs
+
+    try {
+      const response = await this.client.messages.create({
+        model: MODELS.LLM_NODE,
+        max_tokens: 400,
+        temperature: 0,
+        system: "You extract HTTP request configuration from natural language step descriptions. Return only raw JSON, no markdown.",
+        messages: [{ role: 'user', content: userPrompt }]
+      })
+
+      const content = response.content[0]
+      if (content.type !== 'text') {
+        throw new Error('Unexpected response type from LLM')
+      }
+
+      // Clean markdown wrapping if present
+      const cleanText = content.text.trim()
+        .replace(/```json\n?/g, '')
+        .replace(/```\n?/g, '')
+
+      const config = JSON.parse(cleanText)
+
+      // Build URL template from extracted URL with field validation
+      const urlParts = this.buildUrlTemplate(urlFromDescription, availableFields)
+
+      // Parse auth
+      let auth
+      if (config.auth && config.auth.kind) {
+        const tokenValue = process.env[config.auth.envVar] ?? ''
+        if (config.auth.kind === 'bearer') {
+          auth = {
+            kind: 'bearer' as const,
+            token: { kind: 'Literal' as const, value: tokenValue, type: { kind: 'string' as const } }
+          }
+        } else if (config.auth.kind === 'apiKey') {
+          auth = {
+            kind: 'apiKey' as const,
+            header: 'X-API-Key',
+            value: { kind: 'Literal' as const, value: tokenValue, type: { kind: 'string' as const } }
+          }
+        }
+      }
+
+      // Parse body - validate against matched endpoint schema
+      let body
+      let validatedBodyFields: string[] = []
+      if (config.method !== 'GET' && config.bodyFields !== null) {
+        if (config.bodyTemplate) {
+          // For body templates, use VarRef to reference the input row
+          // The template processing will be handled by the HTTP node during execution
+          body = { kind: 'VarRef' as const, name: 'input' }
+        } else if (config.bodyFields && config.bodyFields.length > 0) {
+          // When no matched endpoint, don't filter against empty validRequestFields
+          // - accept all bodyFields the LLM returned that exist in availableFields
+          const validatedBodyFields = matchedEndpoint
+            ? config.bodyFields.filter((f: string) => 
+                matchedEndpoint.requestFields.map((rf: any) => rf.name).includes(f)
+              )
+            : config.bodyFields.filter((f: string) => availableFields.includes(f))
+          
+          // bodyFields case - set fallback body expression
+          body = { kind: 'VarRef' as const, name: 'input' }
+        } else {
+          // Empty array = send entire row
+          body = { kind: 'VarRef' as const, name: 'input' }
+        }
+      }
+
+      // Parse output schema - validate against matched endpoint schema
+      let validatedOutputFields: string[] = []
+      if (config.outputFields) {
+        const validResponseFields = matchedEndpoint?.responseFields.map((f: any) => f.name) || []
+        validatedOutputFields = config.outputFields.filter((field: string) => 
+          validResponseFields.includes(field)
+        )
+      }
+      
+      const outputFields = validatedOutputFields.length > 0 ? validatedOutputFields : ['http_response']
+      const outputSchema = {
+        columns: outputFields.map((f: string) => ({
+          name: f,
+          type: { kind: 'any' as const },
+          nullable: true
+        }))
+      }
+
+      // Convert headers to TemplateString format
+      const headers: Record<string, any> = {}
+      if (config.headers) {
+        for (const [key, value] of Object.entries(config.headers)) {
+          headers[key] = { parts: [{ kind: 'literal', text: String(value) }] }
+        }
+      }
+
+      return {
+        url: urlParts,
+        method: methodFromDescription as 'GET'|'POST'|'PUT'|'PATCH'|'DELETE',
+        headers,
+        body,
+        bodyFields: validatedBodyFields,
+        outputFields: outputFields,
+        outputSchema: { kind: 'any' },
+        auth,
+        retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+        batchMode: config.batchMode ?? false,
+        endpointId: matchedEndpoint?.id
+      }
+    } catch (error) {
+      console.warn('Failed to parse LLM response for HTTP node:', error)
+      
+      // Fallback: minimal valid payload
+      const fallbackUrl = String(step.config?.url ?? '')
+      return {
+        url: { parts: [{ kind: 'literal', text: fallbackUrl }] },
+        method: 'POST',
+        headers: {},
+        body: { kind: 'VarRef' as const, name: 'input' },
+        bodyFields: [],
+        outputFields: ['http_response'],
+        outputSchema: { kind: 'any' },
+        retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+        batchMode: false,
+        endpointId: matchedEndpoint?.id
+      }
+    }
+  }
+
+  private buildUrlTemplate(url: string, availableFields: string[]): { parts: any[] } {
+    const fieldSet = new Set(availableFields)
+    const parts: any[] = []
+    const regex = /\{(\w+)\}/g
+    let lastIndex = 0
+    let match: RegExpExecArray | null
+
+    while ((match = regex.exec(url)) !== null) {
+      // Add literal part before the template variable
+      if (match.index > lastIndex) {
+        parts.push({ kind: 'literal', text: url.slice(lastIndex, match.index) })
+      }
+      
+      const fieldName = match[1]
+      
+      if (fieldSet.has(fieldName)) {
+        // Valid field - create FieldRef
+        parts.push({ kind: 'expr', expr: { kind: 'FieldRef', field: fieldName } })
+      } else {
+        // Field not in available fields - try common name mappings or keep as literal
+        const mapped = fieldName === 'customerId' ? 'id'
+                     : fieldName === 'customer_id' ? 'id'  
+                     : fieldName === 'orderId' ? 'id'
+                     : null
+        if (mapped && fieldSet.has(mapped)) {
+          parts.push({ kind: 'expr', expr: { kind: 'FieldRef', field: mapped } })
+        } else {
+          // Unknown field - keep as literal text to avoid runtime crash
+          parts.push({ kind: 'literal', text: match[0] })
+          console.warn(`[enrichHttpNode] URL template field {${fieldName}} not found in availableFields: ${availableFields.join(', ')} - keeping as literal`)
+        }
+      }
+      
+      lastIndex = regex.lastIndex
+    }
+
+    // Add remaining literal text
+    if (lastIndex < url.length) {
+      parts.push({ kind: 'literal', text: url.slice(lastIndex) })
+    }
+
+    return { parts: parts.length > 0 ? parts : [{ kind: 'literal', text: url }] }
   }
 }

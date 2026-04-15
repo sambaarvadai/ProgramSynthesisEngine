@@ -131,6 +131,41 @@ Available node kinds and when to use them:
 - http: call an external HTTP API with request body built from row data
           use for: sending emails via API, calling webhooks, fetching external data
           outputFields: fields extracted from the API response
+
+For 'http' steps, always populate config with:
+- url: the full API endpoint URL
+- method: HTTP method
+- authToken or apiKey: use $ENV_VAR_NAME format (e.g. $RESEND_API_KEY)
+- bodyFields: list of input fields to include in the request body
+- batchMode: true if the endpoint accepts an array and should send all rows at once
+
+Example http step:
+{
+  "id": "send_email",
+  "kind": "http",
+  "description": "Send delivery notification email via Resend API for each order",
+  "config": {
+    "url": "https://api.resend.com/emails",
+    "method": "POST",
+    "authToken": "$RESEND_API_KEY",
+    "bodyFields": ["email", "order_id", "status"],
+    "batchMode": false
+  }
+}
+
+Example batch http step:
+{
+  "id": "enrich_customers",
+  "kind": "http", 
+  "description": "Send all customers as a batch to the enrichment API",
+  "config": {
+    "url": "https://api.example.com/enrich/customers",
+    "method": "POST",
+    "authToken": "$API_KEY",
+    "bodyFields": ["id", "name", "email"],
+    "batchMode": true
+  }
+}
 - write: write rows back to the database (INSERT/UPDATE/UPSERT)
            use for: logging actions taken, updating records, persisting results
 - conditional: branch based on a condition (requires trueBranch, falseBranch, mergeStep)

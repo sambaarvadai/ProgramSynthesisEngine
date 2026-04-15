@@ -9,6 +9,7 @@ import { SessionManager } from './session/session-manager.js';
 import { ErrorAnalyzer } from './core/llm/error-analyzer.js';
 import { grantStore } from './auth/grant-store.js';
 import { auditStore, AuditAction } from './auth/audit-store.js';
+import { apiRegistryStore } from './config/api-registry-store.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
@@ -94,6 +95,93 @@ async function main() {
       timeoutMs: 60000,
     },
   });
+
+  // API registry command parsing
+  async function handleApiCommand(input: string): Promise<boolean> {
+    const trimmed = input.trim().toLowerCase();
+    
+    // List all APIs
+    if (trimmed === 'list apis') {
+      const endpoints = apiRegistryStore.listAll();
+      
+      console.log('\n\ud83d\udccb Registered API Endpoints:');
+      console.log('ID                     | Method | URL                           | Description');
+      console.log('---------------------- | ------ | ----------------------------- | -----------');
+      
+      for (const endpoint of endpoints) {
+        const id = endpoint.id.padEnd(22);
+        const method = endpoint.method.padEnd(6);
+        const url = endpoint.baseUrl.padEnd(29);
+        const description = endpoint.description.length > 30 
+          ? endpoint.description.substring(0, 27) + '...'
+          : endpoint.description;
+        
+        console.log(`${id} | ${method} | ${url} | ${description}`);
+        console.log(`  Accepts: ${endpoint.requestFields.length} fields, Returns: ${endpoint.responseFields.length} fields`);
+      }
+      
+      if (endpoints.length === 0) {
+        console.log('No API endpoints registered. Use "api:seed" to register default endpoints.');
+      }
+      console.log();
+      return true;
+    }
+    
+    // Show specific API details
+    if (trimmed.startsWith('show api ')) {
+      const apiId = input.slice('show api '.length).trim();
+      if (!apiId) {
+        console.log('\u274c Usage: "show api [id]"');
+        return true;
+      }
+      
+      const endpoint = apiRegistryStore.getById(apiId);
+      if (!endpoint) {
+        console.log(`\u274c API '${apiId}' not found.`);
+        return true;
+      }
+      
+      console.log('\n\ud83d\udccb API Endpoint Details:');
+      console.log(apiRegistryStore.getSchemaContext(endpoint));
+      console.log();
+      return true;
+    }
+    
+    // Find APIs that accept a specific field
+    if (trimmed.startsWith('apis for field ')) {
+      const fieldName = input.slice('apis for field '.length).trim();
+      if (!fieldName) {
+        console.log('\u274c Usage: "apis for field [fieldName]"');
+        return true;
+      }
+      
+      const endpoints = apiRegistryStore.findByInputField(fieldName);
+      
+      console.log(`\n\ud83d\udd0d APIs that accept field '${fieldName}':`);
+      
+      if (endpoints.length === 0) {
+        console.log(`No APIs accept field '${fieldName}'.`);
+      } else {
+        console.log('ID                     | Method | URL                           | Description');
+        console.log('---------------------- | ------ | ----------------------------- | -----------');
+        
+        for (const endpoint of endpoints) {
+          const id = endpoint.id.padEnd(22);
+          const method = endpoint.method.padEnd(6);
+          const url = endpoint.baseUrl.padEnd(29);
+          const description = endpoint.description.length > 30 
+            ? endpoint.description.substring(0, 27) + '...'
+            : endpoint.description;
+          
+          console.log(`${id} | ${method} | ${url} | ${description}`);
+        }
+      }
+      console.log();
+      return true;
+    }
+    
+    return false;
+  }
 
   // Access management command parsing
   async function handleAccessCommand(input: string): Promise<boolean> {
@@ -298,7 +386,13 @@ async function main() {
     if (!description.trim()) continue;
 
     try {
-      // Check for access management commands first
+      // Check for API registry commands first
+      const isApiCommand = await handleApiCommand(description);
+      if (isApiCommand) {
+        continue; // Skip NL pipeline for API commands
+      }
+
+      // Check for access management commands next
       const isAccessCommand = await handleAccessCommand(description);
       if (isAccessCommand) {
         continue; // Skip NL pipeline for access commands

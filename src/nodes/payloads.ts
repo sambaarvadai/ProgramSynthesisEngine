@@ -66,14 +66,24 @@ export type LLMPayload = {
 
 export type HttpPayload = {
   url: TemplateString;
-  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   headers?: Record<string, TemplateString>;
   body?: ExprAST;
+  bodyFields?: string[];     // subset of input fields to include in body
+  outputFields?: string[];   // expected response fields to surface downstream
   outputSchema: EngineType;
   auth?:
     | { kind: 'bearer'; token: ExprAST }
     | { kind: 'apiKey'; header: string; value: ExprAST };
   retryPolicy?: { maxRetries: number; backoffMs: number };
+  batchMode?: boolean;    // if true, collect all input rows and send as a single array
+  endpointId?: string;     // reference to database endpoint for runtime metadata access
+  responseMode?: 'object' | 'array';  // response handling mode
+  responseRoot?: string;   // for array mode: key holding the array (e.g. 'results', 'data.items')
+  concurrency?: number;        // max parallel requests in per-row mode (default: 1)
+  rateLimitPerSecond?: number; // max requests per second (default: unlimited)
+  chunkSize?: number;    // for batch mode: split input rows into chunks of this size
+                        // default: undefined = send all rows in one call
 };
 
 export type InputPayload = {
