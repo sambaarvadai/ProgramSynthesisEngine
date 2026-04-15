@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
 import type { SchemaConfig, TableConfig, ColumnConfig } from '../compiler/schema/schema-config.js';
+import { auditStore, AuditAction } from './audit-store.js';
 
 export interface AccessRequest {
   id: string;
@@ -218,6 +219,21 @@ export class GrantStore {
       VALUES (?, ?, ?, ?, 'pending', ?)
     `).run(requestId, userId, tableName, columnName || null, now);
 
+    // Add audit logging
+    const user = this.getUserById(userId);
+    if (user) {
+      auditStore.log({
+        userId,
+        username: user.username,
+        role: user.role,
+        action: AuditAction.ACCESS_REQUESTED,
+        resourceId: requestId,
+        resourceName: columnName ? `${tableName}.${columnName}` : tableName,
+        status: 'success',
+        details: { tableName, columnName }
+      });
+    }
+
     return requestId;
   }
 
@@ -256,6 +272,22 @@ export class GrantStore {
         VALUES (?, ?, ?, 1, 1)
       `).run(uuidv4(), request.user_id, request.table_name);
     }
+
+    // Add audit logging
+    const adminUser = this.getUserById(adminUserId);
+    if (adminUser) {
+      const target = request.column_name ? `${request.table_name}.${request.column_name}` : request.table_name;
+      auditStore.log({
+        userId: adminUserId,
+        username: adminUser.username,
+        role: adminUser.role,
+        action: AuditAction.ACCESS_APPROVED,
+        resourceId: requestId,
+        resourceName: target,
+        status: 'success',
+        details: { grantedTo: request.user_id, tableName: request.table_name, columnName: request.column_name }
+      });
+    }
   }
 
   denyAccess(requestId: string, adminUserId: string): void {
@@ -278,6 +310,22 @@ export class GrantStore {
       SET status = 'denied', reviewed_at = ?, reviewed_by = ?
       WHERE id = ?
     `).run(now, adminUserId, requestId);
+
+    // Add audit logging
+    const adminUser = this.getUserById(adminUserId);
+    if (adminUser) {
+      const target = request.column_name ? `${request.table_name}.${request.column_name}` : request.table_name;
+      auditStore.log({
+        userId: adminUserId,
+        username: adminUser.username,
+        role: adminUser.role,
+        action: AuditAction.ACCESS_DENIED,
+        resourceId: requestId,
+        resourceName: target,
+        status: 'success',
+        details: { deniedTo: request.user_id, tableName: request.table_name, columnName: request.column_name }
+      });
+    }
   }
 
   listPendingRequests(): AccessRequest[] {

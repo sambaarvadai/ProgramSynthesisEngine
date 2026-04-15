@@ -8,30 +8,13 @@ import { SessionManager } from './session/session-manager.js';
 // Import error analyzer for detailed LLM-based error analysis
 import { ErrorAnalyzer } from './core/llm/error-analyzer.js';
 import { grantStore } from './auth/grant-store.js';
+import { auditStore, AuditAction } from './auth/audit-store.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
 async function main() {
   const backend = new PostgresBackend(process.env.DATABASE_URL!);
   await backend.connect();
-
-  const sessionManager = new SessionManager(process.env.ANTHROPIC_API_KEY!);
-
-  // Initialize error analyzer for detailed LLM-based error analysis
-  const errorAnalyzer = new ErrorAnalyzer({
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY!
-  });
-
-  const engine = new PipelineEngine({
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
-    schema: crmSchema,
-    storageBackend: backend,
-    budget: {
-      maxLLMCalls: 20,
-      maxIterations: 100,
-      timeoutMs: 60000,
-    },
-  });
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -57,6 +40,16 @@ async function main() {
       
       const user = grantStore.getUserByUsername(username.trim());
       if (!user) {
+        // Add audit logging for failed login
+        auditStore.log({
+          userId: 'unknown',
+          username: username.trim(),
+          role: 'unknown',
+          action: AuditAction.LOGIN,
+          status: 'failed',
+          error: 'Invalid credentials',
+        });
+        
         console.log('\n\u274c Invalid username or password. Please try again.\n');
         continue;
       }
@@ -66,12 +59,41 @@ async function main() {
       currentUser = { id: user.id, username: user.username, role: user.role };
       grantStore.updateLastLogin(user.id);
       
+      // Add audit logging for successful login
+      auditStore.log({
+        userId: currentUser.id,
+        username: currentUser.username,
+        role: currentUser.role,
+        action: AuditAction.LOGIN,
+        status: 'success',
+        details: { loginAt: new Date().toISOString() }
+      });
+      
       console.log(`\n\u2709 Logged in as ${user.username} (${user.role})\n`);
       return;
     }
   }
 
   await login();
+
+  // Now create session manager with authenticated user
+  const sessionManager = new SessionManager(process.env.ANTHROPIC_API_KEY!, currentUser!.id);
+
+  // Initialize error analyzer for detailed LLM-based error analysis
+  const errorAnalyzer = new ErrorAnalyzer({
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY!
+  });
+
+  const engine = new PipelineEngine({
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
+    schema: crmSchema,
+    storageBackend: backend,
+    budget: {
+      maxLLMCalls: 20,
+      maxIterations: 100,
+      timeoutMs: 60000,
+    },
+  });
 
   // Access management command parsing
   async function handleAccessCommand(input: string): Promise<boolean> {
@@ -124,6 +146,55 @@ async function main() {
       }
       console.log();
       return true;
+    }
+    
+    // Audit log commands
+    if (trimmed === 'audit log' || trimmed === 'my audit log') {
+      const entries = auditStore.getForUser(currentUser!.id, 50);
+      if (entries.length === 0) {
+        console.log('\nNo audit history yet.');
+      } else {
+        console.log('\n\ud83d\udcdc Your Audit History:');
+        console.log(auditStore.formatTable(entries));
+      }
+      console.log();
+      return true;
+    }
+    
+    if (trimmed.startsWith('audit log ')) {
+      const target = input.slice('audit log '.length).trim();
+      
+      if (target === 'all') {
+        // Admin only command
+        if (currentUser!.role !== 'admin') {
+          console.log('\u274c Only admins can view all audit logs.');
+          return true;
+        }
+        
+        const entries = auditStore.getAll(100);
+        console.log('\n\ud83d\udcdc All Audit Logs:');
+        console.log(auditStore.formatTable(entries));
+        console.log();
+        return true;
+      } else {
+        // Audit log for specific username (admin only)
+        if (currentUser!.role !== 'admin') {
+          console.log('\u274c Only admins can view other users\' audit logs.');
+          return true;
+        }
+        
+        const targetUser = grantStore.getUserByUsername(target);
+        if (!targetUser) {
+          console.log(`\u274c User '${target}' not found.`);
+          return true;
+        }
+        
+        const entries = auditStore.getForUser(targetUser.id, 100);
+        console.log(`\n\ud83d\udcdc Audit History for ${target}:`);
+        console.log(auditStore.formatTable(entries));
+        console.log();
+        return true;
+      }
     }
     
     // Admin commands
@@ -205,6 +276,17 @@ async function main() {
   console.log();
 
   process.on('SIGINT', async () => {
+    // Add logout audit logging on SIGINT
+    if (currentUser) {
+      auditStore.log({
+        userId: currentUser.id,
+        username: currentUser.username,
+        role: currentUser.role,
+        action: AuditAction.LOGOUT,
+        status: 'success',
+      });
+    }
+    
     await backend.disconnect();
     rl.close();
     process.exit(0);
@@ -476,6 +558,18 @@ async function main() {
     }
   }
 
+  // Add logout audit logging before closing
+  if (currentUser) {
+    const user = currentUser as { id: string; username: string; role: string };
+    auditStore.log({
+      userId: user.id,
+      username: user.username,
+      role: user.role,
+      action: AuditAction.LOGOUT,
+      status: 'success',
+    });
+  }
+  
   rl.close();
   await backend.disconnect();
   console.log('Bye!');

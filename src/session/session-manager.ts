@@ -15,6 +15,7 @@ export interface SessionTurn {
 
 export interface Session {
   id: string;
+  userId: string;
   startTime: Date;
   turns: SessionTurn[];
 }
@@ -23,9 +24,10 @@ export class SessionManager {
   private session: Session;
   private anthropicClient: Anthropic;
 
-  constructor(anthropicApiKey: string) {
+  constructor(anthropicApiKey: string, userId: string) {
     this.session = {
       id: randomUUID(),
+      userId,
       startTime: new Date(),
       turns: [],
     };
@@ -34,6 +36,10 @@ export class SessionManager {
 
   getSessionId(): string {
     return this.session.id;
+  }
+
+  getUserId(): string {
+    return this.session.userId;
   }
 
   addTurn(
@@ -151,9 +157,10 @@ Focus on the key topics discussed and any important context that would be useful
     }
   }
 
-  getSessionInfo(): { id: string; startTime: Date; turnCount: number } {
+  getSessionInfo(): { id: string; userId: string; startTime: Date; turnCount: number } {
     return {
       id: this.session.id,
+      userId: this.session.userId,
       startTime: this.session.startTime,
       turnCount: this.session.turns.length,
     };

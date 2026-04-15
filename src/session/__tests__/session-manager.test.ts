@@ -5,7 +5,7 @@ import type { PipelineGraph, PipelineMetadata } from '../../core/graph/pipeline-
 
 describe('SessionManager', () => {
   test('creates session with unique ID', () => {
-    const sessionManager = new SessionManager('test-key');
+    const sessionManager = new SessionManager('test-key', 'test-user');
     const sessionId = sessionManager.getSessionId();
     
     assert.ok(sessionId);
@@ -14,14 +14,14 @@ describe('SessionManager', () => {
   });
 
   test('starts with empty history', () => {
-    const sessionManager = new SessionManager('test-key');
+    const sessionManager = new SessionManager('test-key', 'test-user');
     const history = sessionManager.getHistory();
     
     assert.strictEqual(history, '');
   });
 
   test('adds conversational turn to history', () => {
-    const sessionManager = new SessionManager('test-key');
+    const sessionManager = new SessionManager('test-key', 'test-user');
     
     const mockIntent = {
       description: 'Test response',
@@ -57,7 +57,7 @@ describe('SessionManager', () => {
   });
 
   test('adds workflow turn to history with steps', () => {
-    const sessionManager = new SessionManager('test-key');
+    const sessionManager = new SessionManager('test-key', 'test-user');
     
     const mockIntent = {
       description: 'Fetch all customers',
@@ -102,10 +102,12 @@ describe('SessionManager', () => {
   });
 
   test('provides session info', () => {
-    const sessionManager = new SessionManager('test-key');
+    const sessionManager = new SessionManager('test-key', 'test-user');
     const info = sessionManager.getSessionInfo();
     
     assert.ok(info.id);
+    assert.ok(info.userId);
+    assert.strictEqual(info.userId, 'test-user');
     assert.ok(info.startTime);
     assert.strictEqual(info.turnCount, 0);
     

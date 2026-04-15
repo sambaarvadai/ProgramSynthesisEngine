@@ -22,6 +22,8 @@ import { registerBuiltinFunctions } from './functions/index.js';
 // import { ErrorMonitoring, ErrorUtils } from './core/errors/index.js';
 import { SchemaValidator } from './core/validation/schema-validator.js';
 import { PermissionChecker, type GrantedSchemaResult, type JoinCompletenessResult, type PostIntentValidationResult, type MissingColumnResult } from './auth/permission-checker.js';
+import { auditStore, AuditAction } from './auth/audit-store.js';
+import { grantStore } from './auth/grant-store.js';
 import Anthropic from '@anthropic-ai/sdk';
 import type {
   PipelineIntent,
@@ -51,6 +53,7 @@ export type PlanResult = {
   graph: PipelineGraph;
   compilationErrors: PipelineIntentValidationError[];
   intentRaw: string;
+  userId?: string;
 };
 
 export type RunResult = {
@@ -437,11 +440,35 @@ export class PipelineEngine {
       }
     }
 
+    // Add audit logging
+    if (userId) {
+      const user = grantStore.getUserById(userId);
+      if (user) {
+        auditStore.log({
+          userId,
+          username: user.username,
+          role: user.role,
+          action: AuditAction.PIPELINE_PLANNED,
+          resourceName: intent.description.slice(0, 80),
+          status: compilationErrors.length === 0 ? 'planned' : 'failed',
+          error: compilationErrors.length > 0
+            ? compilationErrors.map(e => e.message).join('; ')
+            : undefined,
+          details: {
+            stepCount: intent.steps.length,
+            steps: intent.steps.map(s => ({ id: s.id, kind: s.kind })),
+            compilationErrors: compilationErrors.map(e => e.code),
+          }
+        });
+      }
+    }
+
     return {
       intent,
       graph,
       compilationErrors,
       intentRaw,
+      userId,
     };
   }
 
@@ -603,10 +630,38 @@ export class PipelineEngine {
     });
 
     const startTime = Date.now();
+    const auditStart = Date.now();
     
     try {
       const execution = await this.scheduler.execute(plan.graph, ctx);
       const durationMs = Date.now() - startTime;
+
+      // Add audit logging for successful execution
+      if (plan.userId) {
+        const user = grantStore.getUserById(plan.userId);
+        if (user) {
+          auditStore.log({
+            userId: plan.userId,
+            username: user.username,
+            role: user.role,
+            action: AuditAction.PIPELINE_EXECUTED,
+            resourceName: plan.intent.description.slice(0, 80),
+            status: execution.status === 'success' ? 'success' : 'failed',
+            durationMs: Date.now() - auditStart,
+            error: execution.status !== 'success' ? `Execution ${execution.status}` : undefined,
+            details: {
+              nodeCount: plan.graph.nodes.size,
+              nodeStatuses: Object.fromEntries(
+                [...execution.nodeStates.entries()].map(([k, v]) => [k, v.status])
+              ),
+              // For write nodes: capture row counts from outputs
+              writes: [...execution.outputs.entries()]
+                .filter(([, dv]) => dv.kind === 'tabular' || dv.kind === 'void')
+                .map(([key]) => key),
+            }
+          });
+        }
+      }
 
       // Integrate execution trace with error monitoring
       // this.errorMonitoring.integrateWithTrace(ctx.trace);
@@ -617,6 +672,26 @@ export class PipelineEngine {
         durationMs,
       };
     } catch (error) {
+      // Add audit logging for execution failure
+      if (plan.userId) {
+        const user = grantStore.getUserById(plan.userId);
+        if (user) {
+          auditStore.log({
+            userId: plan.userId,
+            username: user.username,
+            role: user.role,
+            action: AuditAction.PIPELINE_EXECUTED,
+            resourceName: plan.intent.description.slice(0, 80),
+            status: 'failed',
+            durationMs: Date.now() - auditStart,
+            error: error instanceof Error ? error.message : String(error),
+            details: {
+              nodeCount: plan.graph.nodes.size,
+            }
+          });
+        }
+      }
+
       // Capture execution errors
       // const executionError = ErrorUtils.wrapError(error as Error, {
       //   pipelineId: plan.graph.id,
