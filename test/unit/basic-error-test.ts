@@ -9,13 +9,13 @@ import {
   ErrorSeverity,
   ErrorLevel,
   ERROR_CODES
-} from './core/errors/error-taxonomy.js';
+} from '../../src/core/errors/error-taxonomy.js';
 
 import { 
   ValidationError, 
   QueryExecutionError, 
   BudgetExceededError
-} from './core/errors/specific-errors.js';
+} from '../../src/core/errors/specific-errors.js';
 
 console.log('=== Basic Error Handling System Test ===\n');
 

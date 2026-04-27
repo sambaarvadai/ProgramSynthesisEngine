@@ -12,6 +12,7 @@ import {
   ExecutionResult,
   Value,
 } from './index.js';
+import type { SessionCursorStore } from './session/SessionCursor.js';
 import { CalciteClient } from './compiler/calcite/index.js';
 import { PostgresBackend, SQLiteTempStore } from './storage/index.js';
 import { stripHallucinatedFieldRefs } from './compiler/pipeline/expr-sanitizer.js';
@@ -37,8 +38,19 @@ import type {
   PipelineNode,
 } from './core/graph/index.js';
 import type { SchemaConfig } from './compiler/schema/index.js';
+import { resolveWriteColumnSource } from './compiler/schema/schema-config.js';
 import type { QueryPayload, TransformPayload, ConditionalPayload, LLMPayload, HttpPayload, WritePayload } from './nodes/payloads.js';
 import { MODELS } from './config/models.js';
+import { getAppConfig } from './config/app-config.js';
+import { 
+  classifyAllColumns,
+  getAutoResolvedValues,
+  getUserSuppliedRequired,
+  getBlockedOnUpdate,
+  buildIntentExclusionList,
+  type SessionContext
+} from './schema/ColumnClassifier.js';
+import { crmSchema } from './schema/crm-schema.js';
 
 export type PipelineEngineConfig = {
   anthropicApiKey: string;
@@ -48,6 +60,7 @@ export type PipelineEngineConfig = {
   budget?: Partial<ExecutionBudget>;
   maxParallelBranches?: number;
   defaultBatchSize?: number;
+  sessionCursorStore?: SessionCursorStore;
 };
 
 export type PlanResult = {
@@ -77,6 +90,24 @@ export class PipelineCompilationError extends Error {
   }
 }
 
+function suggestFix(
+  column: string,
+  targetTable: string,
+  upstreamFields: string[],
+  foreignKeys: any[]
+): string {
+  const fk = foreignKeys.find(fk =>
+    fk.fromTable === targetTable && fk.fromColumn === column
+  )
+  if (fk) {
+    return (
+      `Add '${fk.toColumn}' from table '${fk.toTable}' to the upstream query ` +
+      `(it will be mapped to '${column}' via the foreign key relationship)` 
+    )
+  }
+  return `Add '${column}' to the upstream query output or staticValues` 
+}
+
 export class PipelineEngine {
   public generator: PipelineIntentGenerator;
   public compiler: PipelineCompiler;
@@ -102,6 +133,7 @@ export class PipelineEngine {
     this.generator = new PipelineIntentGenerator({
       anthropicApiKey: config.anthropicApiKey,
       schema: config.schema,
+      sessionCursorStore: config.sessionCursorStore,
     });
 
     // Initialize compiler
@@ -138,14 +170,12 @@ export class PipelineEngine {
     this.tempStore = new SQLiteTempStore(':memory:');
 
     // Initialize CalciteClient
-    this.calciteClient = new CalciteClient(
-      process.env.CALCITE_URL ?? 'http://localhost:8765'
-    );
+    this.calciteClient = new CalciteClient();
     
     // Non-blocking availability check
     this.calciteClient.isAvailable().then(available => {
       if (available) {
-        console.log('Calcite compiler: connected at', process.env.CALCITE_URL ?? 'http://localhost:8765')
+        console.log('Calcite compiler: connected at', this.calciteClient['baseUrl'])
       } else {
         console.log('Calcite compiler: not available - using fallback SQL builder')
       }
@@ -158,6 +188,7 @@ export class PipelineEngine {
       storageBackend: this.storageBackend,
       schema: config.schema,
       calciteClient: this.calciteClient,
+      sessionCursorStore: config.sessionCursorStore,
     });
 
     // Initialize query executor
@@ -198,6 +229,7 @@ export class PipelineEngine {
       evaluator: this.evaluator,
       maxParallelBranches: config.maxParallelBranches || 4,
       defaultBatchSize: config.defaultBatchSize || 100,
+      sessionCursorStore: config.sessionCursorStore,
     });
   }
 
@@ -220,15 +252,26 @@ export class PipelineEngine {
     },
   ): Promise<PlanResult> {
     const { params, sessionHistory, userId } = options || {};
-    const fullSchema = this.config.schema ?? { tables: new Map(), foreignKeys: [], version: '1' };
+    const fullSchema = this.config.schema ?? { 
+      tables: new Map(), 
+      foreignKeys: [],
+      version: '1' 
+    };
+
+    // Ensure foreignKeys is never undefined even if schema was constructed 
+    // without it (e.g. older code paths)
+    if (!fullSchema.foreignKeys) {
+      (fullSchema as any).foreignKeys = []
+    }
 
     // If userId is provided, run permission checks
     let grantedSchemaResult: GrantedSchemaResult | undefined;
     
     if (userId) {
-      // 1. Check explicit mentions for permission violations
-      const explicitCheck = this.permissionChecker.checkExplicitMentions(description, userId, fullSchema);
-      if (!explicitCheck.allowed) {
+      try {
+        // 1. Check explicit mentions for permission violations
+        const explicitCheck = this.permissionChecker.checkExplicitMentions(description, userId, fullSchema);
+        if (!explicitCheck.allowed) {
         return {
           intent: { steps: [], description: '' },
           graph: {
@@ -281,6 +324,33 @@ export class PipelineEngine {
           intentRaw: description,
         };
       }
+      } catch (e) {
+        console.error('[PipelineEngine] Permission check error:', e);
+        console.error('[PipelineEngine] Stack:', (e as Error).stack);
+        return {
+          intent: { steps: [], description: '' },
+          graph: {
+            id: 'error-graph',
+            version: 1,
+            nodes: new Map(),
+            edges: new Map(),
+            entryNode: '',
+            exitNodes: [],
+            metadata: {
+              createdAt: Date.now(),
+              description: 'Permission check failed',
+              tags: [],
+              budget: {}
+            }
+          },
+          compilationErrors: [{
+            code: 'PERMISSION_CHECK_ERROR',
+            message: `Permission check failed: ${(e as Error).message}`,
+            stepId: ''
+          }],
+          intentRaw: description,
+        };
+      }
     }
 
     // Use granted schema if userId provided, otherwise use full schema
@@ -294,7 +364,41 @@ export class PipelineEngine {
       maxTables: 5,
     });
     
-    const preSelectionResult = await preSelector.select(description, schemaToUse);
+    let preSelectionResult;
+    try {
+      preSelectionResult = await preSelector.select(description, schemaToUse);
+    } catch (e) {
+      console.error('[PipelineEngine] TablePreSelector error:', e);
+      console.error('[PipelineEngine] Stack:', (e as Error).stack);
+      console.error('[PipelineEngine] schemaToUse structure:', {
+        hasTables: !!schemaToUse.tables,
+        tablesType: typeof schemaToUse.tables,
+        isMap: schemaToUse.tables instanceof Map
+      });
+      return {
+        intent: { steps: [], description: '' },
+        graph: {
+          id: 'error-graph',
+          version: 1,
+          nodes: new Map(),
+          edges: new Map(),
+          entryNode: '',
+          exitNodes: [],
+          metadata: {
+            createdAt: Date.now(),
+            description: 'Table selection failed',
+            tags: [],
+            budget: {}
+          }
+        },
+        compilationErrors: [{
+          code: 'TABLE_SELECTION_ERROR',
+          message: `Table selection failed: ${(e as Error).message}`,
+          stepId: ''
+        }],
+        intentRaw: description,
+      };
+    }
     
     // If userId is provided, check join completeness
     if (userId) {
@@ -344,11 +448,13 @@ export class PipelineEngine {
 
     const { graph, errors: compilationErrors } = this.compiler.compile(intent);
 
+    let fieldMap: Map<string, string[]> = new Map();
     if (compilationErrors.length === 0) {
-      await this.enrichNodes(
+      fieldMap = await this.enrichNodes(
         graph,
         intent,
         schemaForIntentGeneration,
+        userId
       );
     }
 
@@ -388,6 +494,16 @@ export class PipelineEngine {
       }
     }
 
+    // Validate write field resolution using FK-aware column mapping
+    if (compilationErrors.length === 0) {
+      const fieldResolutionErrors = this.validateWriteFieldResolution(
+        graph, intent, fieldMap, fullSchema
+      )
+      if (fieldResolutionErrors.length > 0) {
+        compilationErrors.push(...fieldResolutionErrors)
+      }
+    }
+
     // Write completeness check for all WriteNode steps
     if (compilationErrors.length === 0) {
       for (const step of intent.steps) {
@@ -395,48 +511,111 @@ export class PipelineEngine {
         if (node?.kind === 'write') {
           const writePayload = node.payload as WritePayload;
           
-          // Resolve upstream columns by looking at input edges and finding QueryNode output
-          const upstreamColumns: string[] = [];
-          const inputEdges = Array.from(graph.edges.values()).filter(edge => edge.to === step.id);
-          
-          for (const edge of inputEdges) {
-            const upstreamNode = graph.nodes.get(edge.from);
-            if (upstreamNode?.kind === 'query') {
-              const queryPayload = upstreamNode.payload as QueryPayload;
-              // Get column names from query output
-              upstreamColumns.push(...queryPayload.intent.columns.map(col => col.alias || col.field));
-            }
-          }
-          
-          // Check for missing columns
-          const missingColumnsResult = this.permissionChecker.getMissingColumns(
-            writePayload.table,
-            fullSchema,
-            writePayload,
-            upstreamColumns
-          );
-          
-          if (!missingColumnsResult.complete) {
-            const missing = missingColumnsResult.missing!;
-            const missingList = missing.map(m => 
-              `${m.column}${m.nullable ? ' (optional)' : ' (required)'} - ${m.description}`
-            ).join('\n  ');
+          // ColumnClassifier integration: skip auto-resolved columns in completeness check
+          if (writePayload.table && (crmSchema as any).parsed.tables.has(writePayload.table)) {
+            const mode = writePayload.mode === 'update' ? 'update' : 'insert';
             
-            return {
-              intent,          // Return the real intent, not empty
-              graph,           // Return the real graph
-              compilationErrors: [{
-                code: 'WRITE_INCOMPLETE',
-                message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
-                stepId: step.id,
-                missingColumns: missing.map(m => ({
-                  column: m.column,
-                  nullable: m.nullable,
-                  description: m.description
-                }))
-              }],
-              intentRaw: description,
+            // Build session context
+            const sessionCtx: SessionContext = {
+              userId: userId ? parseInt(userId, 10) : 1,
+              anchorIds: { workspaces: Number(1) }
             };
+            
+            const classifications = classifyAllColumns(
+        writePayload.table, 
+        crmSchema as any, 
+        sessionCtx, 
+        mode
+      );
+            const currentStaticValues = writePayload.staticValues || {};
+            const missingRequired = getUserSuppliedRequired(classifications, currentStaticValues);
+            
+            // Additionally filter: skip columns that have a schema default
+            const tableColumns = (crmSchema as any).parsed.tables.get(writePayload.table)?.columns;
+            const mustPrompt = missingRequired.filter(c => {
+              const colDef = tableColumns?.get(c.column);
+              if (!colDef) return false;
+              
+              // Skip nullable columns — they're truly optional
+              if (colDef.nullable) return false;
+              
+              // Skip columns with any default value (literal or SQL expr)
+              // They'll use their DB default if not provided
+              if (colDef.defaultRaw !== null) return false;
+              
+              // Skip columns with schema-defined enum defaults
+              // (e.g. status defaults to 'open', priority to 'medium')
+              const traits = (crmSchema as any).traits.get(writePayload.table)?.get(c.column);
+              if (traits?.default !== undefined) return false;
+              
+              return true;
+            });
+            
+            // Log what will and won't be prompted
+            const skipped = missingRequired
+              .filter(c => !mustPrompt.find(m => m.column === c.column))
+              .map(c => c.column);
+            
+            if (skipped.length > 0) {
+              console.log(
+                `[WriteCompleteness] Skipping optional/defaulted columns: ${skipped.join(', ')}` 
+              );
+            }
+            
+            if (mustPrompt.length > 0) {
+              const missingList = mustPrompt.map(c => {
+                const colDef = tableColumns?.get(c.column);
+                const colType = colDef?.type ?? 'TEXT';
+                return `${c.column} (${colType}, required)`;
+              }).join('\n  ');
+              
+              return {
+                intent,
+                graph,
+                compilationErrors: [{
+                  code: 'WRITE_INCOMPLETE',
+                  message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
+                  stepId: step.id,
+                  missingColumns: mustPrompt.map(c => ({
+                    column: c.column,
+                    nullable: false,
+                    description: 'Required field'
+                  }))
+                }],
+                intentRaw: description,
+              };
+            }
+          } else {
+            // Fallback to permission checker for non-CRM tables
+            const missingColumnsResult = this.permissionChecker.getMissingColumns(
+              writePayload.table,
+              fullSchema,
+              writePayload,
+              []
+            );
+            
+            if (!missingColumnsResult.complete) {
+              const missing = missingColumnsResult.missing!;
+              const missingList = missing.map(m => 
+                `${m.column}${m.nullable ? ' (optional)' : ' (required)'} - ${m.description}`
+              ).join('\n  ');
+              
+              return {
+                intent,
+                graph,
+                compilationErrors: [{
+                  code: 'WRITE_INCOMPLETE',
+                  message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
+                  stepId: step.id,
+                  missingColumns: missing.map(m => ({
+                    column: m.column,
+                    nullable: m.nullable,
+                    description: m.description
+                  }))
+                }],
+                intentRaw: description,
+              };
+            }
           }
         }
       }
@@ -501,7 +680,7 @@ export class PipelineEngine {
   planWithMissingValues(
     existingPlan: PlanResult,
     stepId: string,
-    additionalValues: Record<string, string>
+    additionalValues: Record<string, any>
   ): PlanResult {
     // Find the write step and node in the existing plan
     const writeStep = existingPlan.intent.steps.find(step => step.id === stepId);
@@ -527,30 +706,44 @@ export class PipelineEngine {
       }
     };
     
-    // Re-run getMissingColumns() on the patched payload to verify completeness
-    const upstreamColumns: string[] = [];
-    const inputEdges = Array.from(existingPlan.graph.edges.values()).filter(edge => edge.to === stepId);
+    // Re-run completeness check on the patched payload using crmSchema for accurate default info
+    // (not permissionChecker which uses engine SchemaConfig with TEXT fallback)
+    const tableColumns = (crmSchema as any).parsed.tables.get(writePayload.table)?.columns;
+    const currentStaticValues = writePayload.staticValues || {};
     
-    for (const edge of inputEdges) {
-      const upstreamNode = existingPlan.graph.nodes.get(edge.from);
-      if (upstreamNode?.kind === 'query') {
-        const queryPayload = upstreamNode.payload as QueryPayload;
-        upstreamColumns.push(...queryPayload.intent.columns.map(col => col.alias || col.field));
-      }
-    }
+    // Build session context for ColumnClassifier
+    const sessionCtx: SessionContext = {
+      userId: 1,  // Default for planWithMissingValues
+      anchorIds: { workspaces: Number(1) }
+    };
     
-    const missingColumnsResult = this.permissionChecker.getMissingColumns(
+    const classifications = classifyAllColumns(
       writePayload.table,
-      this.config.schema ?? { tables: new Map(), foreignKeys: [], version: '1' },
-      writePayload,
-      upstreamColumns
+      crmSchema as any,
+      sessionCtx,
+      writePayload.mode === 'update' ? 'update' : 'insert'
     );
     
+    const missingRequired = getUserSuppliedRequired(classifications, currentStaticValues);
+    
+    // Filter: skip columns that have a schema default from DDLParser
+    const mustPrompt = missingRequired.filter(c => {
+      const colDef = tableColumns?.get(c.column);
+      if (!colDef) return false;
+      
+      // Skip nullable columns
+      if (colDef.nullable) return false;
+      
+      // Skip columns with defaults from DDLParser
+      if (colDef.defaultRaw !== null) return false;
+      
+      return true;
+    });
+    
     // If still incomplete, return plan with remaining WRITE_INCOMPLETE error
-    if (!missingColumnsResult.complete) {
-      const missing = missingColumnsResult.missing!;
-      const missingList = missing.map(m => 
-        `${m.column}${m.nullable ? ' (optional)' : ' (required)'} - ${m.description}`
+    if (mustPrompt.length > 0) {
+      const missingList = mustPrompt.map(c => 
+        `${c.column} (${c.column}, required) - ${c.column} column`
       ).join('\n  ');
       
       return {
@@ -559,10 +752,10 @@ export class PipelineEngine {
           code: 'WRITE_INCOMPLETE',
           message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
           stepId: stepId,
-          missingColumns: missing.map(m => ({
-            column: m.column,
-            nullable: m.nullable,
-            description: m.description
+          missingColumns: mustPrompt.map(c => ({
+            column: c.column,
+            nullable: false,
+            description: 'Required field'
           }))
         }]
       };
@@ -605,14 +798,16 @@ export class PipelineEngine {
     console.log('Schema validation passed successfully');
 
     // Merge budget with correct precedence: defaults < plan.intent.budget < config.budget (user always wins)
+    // Get centralized configuration for defaults
+    const appConfig = getAppConfig();
     const budget: Partial<ExecutionBudget> = {
-      // Sensible defaults
-      maxLLMCalls: 20,
-      maxIterations: 1000,
-      timeoutMs: 300000,
-      maxRowsPerNode: 10000,
-      maxMemoryMB: 512,
-      maxBatchSize: 100,
+      // Use centralized defaults
+      maxLLMCalls: appConfig.execution.maxLLMCalls,
+      maxIterations: appConfig.execution.maxIterations,
+      timeoutMs: appConfig.execution.timeoutMs,
+      maxRowsPerNode: appConfig.execution.maxRowsPerNode,
+      maxMemoryMB: appConfig.execution.maxMemoryMB,
+      maxBatchSize: appConfig.execution.maxBatchSize,
       // LLM-generated hints (lower priority than user config)
       ...plan.intent.budget,
       // User config always wins
@@ -817,7 +1012,8 @@ export class PipelineEngine {
     graph: PipelineGraph,
     intent: PipelineIntent,
     schema: SchemaConfig,
-  ): Promise<void> {
+    userId?: string
+  ): Promise<Map<string, string[]>> {
     // Track available fields for each step to prevent hallucination
     const fieldMap = new Map<string, string[]>(); // stepId -> field names
 
@@ -917,8 +1113,14 @@ export class PipelineEngine {
         }
 
         case 'write': {
-          const writeConfig = await this.enrichWriteNode(step, fieldMap)
+          const writeConfig = await this.enrichWriteNode(step, fieldMap, intent, graph, userId, 1) // Default workspaceId to 1 for demo
           node.payload = writeConfig
+          
+          // WriteNodes pass through the fields they received from upstream.
+          // This allows downstream nodes (e.g. another WriteNode) to see 
+          // the same fields that were available to this WriteNode.
+          const passedThroughFields = this.getAvailableFields(step.id, intent, fieldMap)
+          fieldMap.set(step.id, passedThroughFields)
           break
         }
 
@@ -928,6 +1130,195 @@ export class PipelineEngine {
           break;
       }
     }
+
+    return fieldMap;
+  }
+
+  private getUpstreamFields(
+    stepId: string,
+    intent: PipelineIntent,
+    fieldMap: Map<string, string[]>
+  ): string[] {
+    const step = intent.steps.find(s => s.id === stepId)
+    if (!step?.dependsOn?.length) return []
+
+    const allFields: string[] = []
+    
+    // BFS through dependsOn chain to collect all reachable fields
+    const visited = new Set<string>()
+    const queue = [...step.dependsOn]
+    
+    while (queue.length > 0) {
+      const depId = queue.shift()!
+      if (visited.has(depId)) continue
+      visited.add(depId)
+      
+      const fields = fieldMap.get(depId)
+      if (fields && fields.length > 0) {
+        // Found fields at this level - add them and stop going deeper for this branch
+        allFields.push(...fields)
+      } else {
+        // No fields at this level - go deeper (this dep may be a write node 
+        // that didn't populate fieldMap yet, or a structural node)
+        const depStep = intent.steps.find(s => s.id === depId)
+        if (depStep?.dependsOn?.length) {
+          queue.push(...depStep.dependsOn)
+        }
+      }
+    }
+    
+    return [...new Set(allFields)]
+  }
+
+  private getUpstreamTablesTransitive(
+    stepId: string,
+    intent: PipelineIntent,
+    graph: PipelineGraph
+  ): string[] {
+    const tables: string[] = []
+    const visited = new Set<string>()
+    const queue = [stepId]
+    
+    while (queue.length > 0) {
+      const id = queue.shift()!
+      if (visited.has(id)) continue
+      visited.add(id)
+      
+      const node = graph.nodes.get(id)
+      if (node?.kind === 'query') {
+        const qp = node.payload as any
+        console.log(`[upstreamTables] QueryNode '${id}': table=${qp.intent?.table}, ` +
+          `joins=${JSON.stringify(qp.intent?.joins?.map((j:any) => j.table))}`)
+        if (qp.intent?.table) tables.push(qp.intent.table)
+        qp.intent?.joins?.forEach((j: any) => {
+          if (j.table) tables.push(j.table)
+        })
+      }
+      
+      const step = intent.steps.find(s => s.id === id)
+      if (step?.dependsOn?.length) {
+        queue.push(...step.dependsOn)
+      }
+    }
+    
+    return [...new Set(tables)]
+  }
+
+  public validateWriteFieldResolution(
+    graph: PipelineGraph,
+    intent: PipelineIntent,
+    fieldMap: Map<string, string[]>,
+    schema: SchemaConfig
+  ): PipelineIntentValidationError[] {
+    const errors: PipelineIntentValidationError[] = []
+
+    for (const [nodeId, node] of graph.nodes) {
+      if (node.kind !== 'write') continue
+
+      const payload = node.payload as WritePayload
+      const step = intent.steps.find(s => s.id === nodeId)
+      const upstreamFields = this.getUpstreamFields(nodeId, intent, fieldMap)
+      const staticKeys = new Set(Object.keys(payload.staticValues ?? {}))
+      // Extract upstream tables from dependency nodes if not already set
+      let upstreamTables = payload.upstreamTables ?? []
+      if (upstreamTables.length === 0 && step?.dependsOn) {
+        upstreamTables = []
+        for (const depId of step.dependsOn) {
+          const depNode = graph.nodes.get(depId)
+          if (depNode?.kind === 'query' && depNode.payload) {
+            const queryPayload = depNode.payload as any
+            if (queryPayload.table) {
+              upstreamTables.push(queryPayload.table)
+            }
+          }
+        }
+        // Update the payload with extracted upstream tables for future use
+        if (!payload.upstreamTables) {
+          payload.upstreamTables = upstreamTables
+        }
+      }
+
+      console.log(
+        `[Plan] WriteNode '${nodeId}': upstreamTables=${JSON.stringify(upstreamTables)}, ` +
+        `upstreamFields=${JSON.stringify(upstreamFields)}, ` +
+        `columns=${JSON.stringify(payload.columns)}` 
+      )
+
+      // Build a simulated row from upstream field names (values don't matter for validation)
+      const simulatedRow = Object.fromEntries(upstreamFields.map(f => [f, '__present__']))
+
+      const unresolvable: string[] = []
+      const remapped: Array<{ writeCol: string; sourceField: string; via: string }> = []
+
+      for (const col of payload.columns) {
+        // Case 1: in staticValues AND value is not self-referential
+        if (staticKeys.has(col)) {
+          const staticVal = payload.staticValues?.[col]
+          if (staticVal !== col) continue  // genuine static value, skip FK check
+          // else: self-referential, fall through to FK resolution
+        }
+
+        // Case 2: direct match in upstream fields â OK
+        if (col in simulatedRow) continue
+
+        // Case 3: resolvable via FK
+        const foreignKeys = schema.foreignKeys ?? []
+        const sourceField = resolveWriteColumnSource(
+          payload.table, col, upstreamTables, foreignKeys, simulatedRow
+        )
+        if (sourceField !== col && sourceField in simulatedRow) {
+          // FK remapping found â auto-fix silently
+          remapped.push({
+            writeCol: col,
+            sourceField,
+            via: `${payload.table}.${col} â FK â ${sourceField}` 
+          })
+          // Inject columnAliases into payload so WriteNode uses it at runtime
+          if (!payload.columnAliases) payload.columnAliases = {}
+          payload.columnAliases[col] = sourceField
+          continue
+        }
+
+        // Case 4: unresolvable
+        unresolvable.push(col)
+      }
+
+      // Log auto-remappings (not an error, just informational)
+      if (remapped.length > 0) {
+        console.log(
+          `[Plan] WriteNode '${nodeId}': auto-remapped fields via FK:\n` +
+          remapped.map(r => `  ${r.writeCol} â ${r.sourceField} (${r.via})`).join('\n')
+        )
+      }
+
+      // Return errors for unresolvable columns
+      if (unresolvable.length > 0) {
+        const available = [
+          ...upstreamFields,
+          ...Object.keys(payload.staticValues ?? {})
+        ].join(', ')
+
+        errors.push({
+          code: 'WRITE_FIELD_UNRESOLVABLE',
+          stepId: nodeId,
+          message:
+            `Write to '${payload.table}' needs column(s) [${unresolvable.join(', ')}] ` +
+            `but they are not in the upstream output or staticValues.\n` +
+            `Available fields: ${available || 'none'}\n` +
+            `Fix: ensure the upstream query selects a field that maps to ` +
+            `[${unresolvable.join(', ')}], or add it to staticValues.`,
+          // Structured data for CLI display and AI analyzer
+          missingColumns: unresolvable.map(col => ({
+            column: col,
+            table: payload.table,
+            availableFields: upstreamFields,
+            suggestion: suggestFix(col, payload.table, upstreamFields, schema.foreignKeys ?? [])
+          }))
+        })
+      }
+    }
+
+    return errors
   }
 
   private getAvailableFields(
@@ -1233,12 +1624,49 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
 
   private async enrichWriteNode(
     step: PipelineStepIntent,
-    fieldMap: Map<string, string[]>
+    fieldMap: Map<string, string[]>,
+    intent: PipelineIntent,
+    graph: PipelineGraph,
+    userId?: string,
+    workspaceId?: number
   ): Promise<WritePayload> {
     const availableFields = this.getAvailableFields(step.id, { description: '', steps: [step], budget: {} }, fieldMap);
     
     // Extract existing fields from the original step configuration
     const originalFields = step.config?.fields as Record<string, any> || {};
+    console.log('[Write Enrichment] Raw step.config.fields:', step.config?.fields);
+    console.log('[Write Enrichment] originalFields type:', Array.isArray(originalFields) ? 'array' : 'object');
+    
+    // ColumnClassifier integration: auto-inject session-scoped values
+    const targetTable = step.config?.table as string;
+    let autoValues: Record<string, any> = {};
+    let exclusions: string[] = [];
+    
+    if (targetTable && (crmSchema as any).parsed.tables.has(targetTable)) {
+      const operation = step.config?.operation as string | undefined;
+      const mode = operation?.toLowerCase() === 'update' ? 'update' : 'insert';
+      
+      // Build session context
+      const sessionCtx: SessionContext = {
+        userId: userId ? parseInt(userId, 10) : 1,  // Default to 1 if no userId
+        anchorIds: { workspaces: Number(workspaceId ?? 1) }
+      };
+      
+      const classifications = classifyAllColumns(
+        targetTable, 
+        crmSchema as any, 
+        sessionCtx, 
+        mode
+      );
+      autoValues = getAutoResolvedValues(classifications);
+      exclusions = buildIntentExclusionList(classifications);
+      
+      // Merge auto-resolved values into originalFields BEFORE LLM sees them
+      Object.assign(originalFields, autoValues);
+      
+      console.log(`[ColumnClassifier] Auto-injected for ${targetTable} (${mode}):`, autoValues);
+      console.log('[ColumnClassifier] Excluded from LLM:', exclusions);
+    }
     
     const prompt = `Extract database write configuration from this step description:
 "${step.description}"
@@ -1263,7 +1691,7 @@ Description: "update the email"
 -> columns: ['customer_id']
 -> staticValues: { 'subject': 'Test' }
 
-Available tables: ${Array.from(this.config.schema?.tables.keys() ?? []).join(', ')}
+Available tables: ${Array.from((this.config.schema as any)?.tables?.keys() ?? []).join(', ')}
 Available input fields: ${availableFields.join(', ')}
 
 Return JSON:
@@ -1291,12 +1719,13 @@ IMPORTANT:
   * Map 'customer_id' from orders query to 'customer_id' column
   * Map 'email' from customers query to 'email' column
 - If availableFields contains 'id' and table is 'email_log', include 'order_id' in columns
+${exclusions.length > 0 ? `Do not include these columns in the output — they are auto-resolved by the system: ${exclusions.join(', ')}` : ''}
 Return ONLY raw JSON.`;
 
     const response = await this.client.messages.create({
       model: MODELS.LLM_NODE,
       max_tokens: 300,
-      temperature: 0,
+      temperature: 0,     // deterministic output for structural calls
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -1306,60 +1735,143 @@ Return ONLY raw JSON.`;
 
     try {
       const config = JSON.parse(clean);
+      console.log('[Write Enrichment] Parsed config:', JSON.stringify(config, null, 2));
+      
+      // Sanitize staticValues: remove entries where value === key (LLM hallucination)
+      if (config.staticValues) {
+        for (const [key, val] of Object.entries(config.staticValues)) {
+          if (val === key) {
+            console.warn(
+              `[Write Enrichment] Dropping staticValue '${key}': value equals key name ` +
+              `(likely LLM hallucination). Will be left for user to supply or default.` 
+            )
+            delete config.staticValues[key]
+          }
+        }
+      }
+      
+      // Convert values based on DDLParser's accurate type info from crmSchema.parsed.tables
+      // (not from this.config.schema which has TEXT fallback types)
+      const convertIfNeeded = (obj: Record<string, any>) => {
+        for (const [key, val] of Object.entries(obj)) {
+          // Always use crmSchema.parsed.tables for type info
+          // this.config.schema has TEXT fallback types, not accurate INT types
+          const colDef = (crmSchema as any).parsed.tables
+            .get(config.table)?.columns.get(key);
+          const colType = colDef?.type?.toUpperCase() ?? 'TEXT';
+          
+          if (typeof val === 'number') {
+            if (colType === 'TEXT' || colType === 'VARCHAR' || colType === 'CHARACTER VARYING') {
+              obj[key] = String(val);
+              console.log(`[Write Enrichment] Converted ${key} from number to string for ${colType} column`);
+            }
+          }
+        }
+      };
+      
+      if (config.staticValues) {
+        convertIfNeeded(config.staticValues);
+      }
+      convertIfNeeded(originalFields);
+      
+      // ColumnClassifier: Ensure LLM didn't override auto-resolved columns
+      // by re-applying autoValues on top of LLM output
+      for (const [col, val] of Object.entries(autoValues)) {
+        if (config.staticValues?.[col] !== undefined && 
+            config.staticValues[col] !== val) {
+          console.warn(
+            `[ColumnClassifier] LLM tried to override auto-resolved ` +
+            `column ${col}. Reverting to system value: ${val}` 
+          );
+        }
+        if (!config.staticValues) config.staticValues = {};
+        config.staticValues[col] = val;
+      }
       
       // Preserve original table name from step.config
       const tableName = step.config?.table as string ?? config.table ?? 'output';
+      console.log('[Write Enrichment] Table name:', tableName);
       
       // Merge original fields with LLM-generated configuration
       const mergedColumns: string[] = [];
+      // Original static values take precedence over LLM-generated ones
       const mergedStaticValues: Record<string, any> = { ...config.staticValues };
+      console.log('[Write Enrichment] Original fields:', JSON.stringify(originalFields, null, 2));
+      console.log('[Write Enrichment] LLM config columns:', config.columns);
+      console.log('[Write Enrichment] LLM config staticValues:', config.staticValues);
       
       // Process original fields
-      for (const [fieldName, fieldValue] of Object.entries(originalFields)) {
-        const fieldValueStr = String(fieldValue);
-        
-        // Check if it's a template field (contains {{}})
-        if (fieldValueStr.includes('{{') && fieldValueStr.includes('}}')) {
-          // Extract the field name from template (e.g., "{{step.id}}" -> "id")
-          const templateMatch = fieldValueStr.match(/\{\{([^}]+)\.([^}]+)\}\}/);
-          if (templateMatch) {
-            const sourceStep = templateMatch[1]; // e.g., "get_globex_latest_order"
-            const templateField = templateMatch[2]; // e.g., "id"
-            
-            // Field mapping logic: map common field names to target column names
-            let mappedField = templateField;
-            
-            // Map id -> order_id when the target table is email_log and field comes from orders-like query
-            if (tableName === 'email_log' && templateField === 'id') {
-              mappedField = 'order_id';
+      if (Array.isArray(originalFields)) {
+        // Handle array case - just use the field names directly as columns
+        console.log('[Write Enrichment] Processing originalFields as array');
+        for (const fieldName of originalFields) {
+          console.log(`[Write Enrichment] Processing array field: '${fieldName}'`);
+          if (!mergedColumns.includes(fieldName)) {
+            mergedColumns.push(fieldName);
+          }
+        }
+      } else {
+        // Handle object case - process field/value pairs
+        console.log('[Write Enrichment] Processing originalFields as object');
+        for (const [fieldName, fieldValue] of Object.entries(originalFields)) {
+          const fieldValueStr = String(fieldValue);
+          
+          // Check if it's a template field (contains {{}})
+          if (fieldValueStr.includes('{{') && fieldValueStr.includes('}}')) {
+            // Extract the field name from template (e.g., "{{step.id}}" -> "id")
+            const templateMatch = fieldValueStr.match(/\{\{([^}]+)\.([^}]+)\}\}/);
+            if (templateMatch) {
+              const sourceStep = templateMatch[1]; // e.g., "get_globex_latest_order"
+              const templateField = templateMatch[2]; // e.g., "id"
+              
+              // Field mapping logic: map common field names to target column names
+              let mappedField = templateField;
+              
+              // Map id -> order_id when the target table is email_log and field comes from orders-like query
+              if (tableName === 'email_log' && templateField === 'id') {
+                mappedField = 'order_id';
+              }
+              
+              // Map id -> customer_id when the target table needs customer_id and field comes from customers-like query  
+              if (fieldName === 'customer_id' && templateField === 'id') {
+                mappedField = 'customer_id';
+              }
+              
+              if (!mergedColumns.includes(mappedField)) {
+                mergedColumns.push(mappedField);
+              }
+            } else {
+              // If it's a complex template, add the whole field as a column
+              if (!mergedColumns.includes(fieldName)) {
+                mergedColumns.push(fieldName);
+              }
             }
-            
-            // Map id -> customer_id when the target table needs customer_id and field comes from customers-like query  
-            if (fieldName === 'customer_id' && templateField === 'id') {
-              mappedField = 'customer_id';
-            }
-            
-            if (!mergedColumns.includes(mappedField)) {
-              mergedColumns.push(mappedField);
+          } else if (fieldValue === fieldName) {
+            // Field name used as its own value - LLM hallucination
+            // Treat as a dynamic column reference, not a static value
+            console.warn(`[Write Enrichment] Dropping self-referential value: '${fieldName}' = '${fieldValue}' - treating as dynamic column`)
+            if (!mergedColumns.includes(fieldName)) {
+              mergedColumns.push(fieldName)
             }
           } else {
-            // If it's a complex template, add the whole field as a column
-            if (!mergedColumns.includes(fieldName)) {
-              mergedColumns.push(fieldName);
-            }
+            // It's a literal value
+            mergedStaticValues[fieldName] = fieldValue;
           }
-        } else {
-          // It's a literal value
-          mergedStaticValues[fieldName] = fieldValue;
         }
       }
       
       // Add any additional columns from LLM config
+      console.log('[Write Enrichment] Adding LLM config columns to merged columns');
       for (const column of config.columns || []) {
+        console.log(`[Write Enrichment] Processing LLM column: '${column}'`);
         if (!mergedColumns.includes(column)) {
           mergedColumns.push(column);
+          console.log(`[Write Enrichment] Added column '${column}' to merged columns`);
+        } else {
+          console.log(`[Write Enrichment] Column '${column}' already exists in merged columns`);
         }
       }
+      console.log('[Write Enrichment] Final merged columns:', mergedColumns);
       
       // Special handling: if we're inserting into email_log and have 'id' in availableFields,
       // ensure 'order_id' is included in columns
@@ -1377,7 +1889,19 @@ Return ONLY raw JSON.`;
         mode = 'insert_ignore';
       }
       
-      return {
+      // Find upstream tables transitively (not just direct dependsOn)
+      const extractedUpstreamTables = this.getUpstreamTablesTransitive(step.id, intent, graph)
+
+      // Strip unresolved param references (values matching /^\$/) from mergedStaticValues
+      // These are template variables that weren't resolved and should be left for user to supply
+      for (const [key, val] of Object.entries(mergedStaticValues)) {
+        if (typeof val === 'string' && /^\$/.test(val)) {
+          console.log(`[Write Enrichment] Stripping unresolved param reference: ${key} = ${val}`);
+          delete mergedStaticValues[key];
+        }
+      }
+
+      const finalPayload = {
         table: tableName,
         mode,
         columns: mergedColumns,
@@ -1386,8 +1910,12 @@ Return ONLY raw JSON.`;
         conflictColumns: config.conflictColumns as string[],
         updateColumns: config.updateColumns as string[],
         whereColumns: config.whereColumns as string[],
+        upstreamTables: extractedUpstreamTables,
         datasource: 'default'
       };
+      
+      console.log('[Write Enrichment] Final payload:', JSON.stringify(finalPayload, null, 2));
+      return finalPayload;
     } catch {
       // Fallback to basic configuration with original fields
       const fallbackColumns: string[] = [];
@@ -1505,7 +2033,7 @@ Rules:
         outputFields: responseFieldNames,    // authoritative from registry
         outputSchema: { kind: 'any' as const },
         auth,
-        retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+        retryPolicy: { maxRetries: getAppConfig().http.defaultMaxRetries, backoffMs: getAppConfig().http.defaultBackoffMs },
         batchMode: matchedEndpoint.batchMode,
         endpointId: matchedEndpoint.id,
         responseMode: matchedEndpoint.responseMode,
@@ -1619,7 +2147,7 @@ Rules:
         outputFields: outputFields,
         outputSchema: { kind: 'any' },
         auth,
-        retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+        retryPolicy: { maxRetries: getAppConfig().http.defaultMaxRetries, backoffMs: getAppConfig().http.defaultBackoffMs },
         batchMode: config.batchMode ?? false,
         endpointId: matchedEndpoint?.id
       }
@@ -1636,7 +2164,7 @@ Rules:
         bodyFields: [],
         outputFields: ['http_response'],
         outputSchema: { kind: 'any' },
-        retryPolicy: { maxRetries: 2, backoffMs: 1000 },
+        retryPolicy: { maxRetries: getAppConfig().http.defaultMaxRetries, backoffMs: getAppConfig().http.defaultBackoffMs },
         batchMode: false,
         endpointId: matchedEndpoint?.id
       }

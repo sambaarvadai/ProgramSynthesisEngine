@@ -16,6 +16,7 @@ import { contextPushScope } from '../core/context/execution-context.js';
 import { scopeSet } from '../core/scope/scope.js';
 import { traceError } from '../core/context/execution-trace.js';
 import { ValidationError as EnhancedValidationError, SystemError, BudgetExceededError as EnhancedBudgetExceededError, ErrorUtils } from '../core/errors/index.js';
+import { extractCursor } from '../session/SessionCursor.js';
 
 export class SchedulerValidationError extends Error {
   errors: ValidationError[];
@@ -377,33 +378,92 @@ export class Scheduler {
                          outputState.output.kind !== 'void';
     }
 
-    // If _output node was executed and has data, collect its output
-    if (outputNodeExecuted && outputNodeHasData) {
+    // First, try to collect from exit nodes (this should be the primary behavior)
+    console.log(`[Scheduler] Collecting outputs from exit nodes: ${JSON.stringify(graph.exitNodes)}`);
+    let collectedFromExitNodes = false;
+    for (const exitNodeId of graph.exitNodes) {
+      const exitState = state.nodeStates.get(exitNodeId);
+      console.log(`[Scheduler] Exit node ${exitNodeId}: state=${exitState?.status}, hasOutput=${exitState?.output !== undefined}`);
+      if (exitState?.output !== undefined) {
+        outputs.set(exitNodeId, exitState.output);
+        collectedFromExitNodes = true;
+        console.log(`[Scheduler] Collected output from exit node: ${exitNodeId}`);
+      }
+    }
+    
+    // If _output node was executed and has data, use it (but only if we didn't get exit node data)
+    if (!collectedFromExitNodes && outputNodeExecuted && outputNodeHasData) {
       const outputState = state.nodeStates.get('_output');
       if (outputState?.output !== undefined) {
         outputs.set('_output', outputState.output);
       }
-    } else {
-      // Otherwise, collect from all exit nodes (including _output if it exists but has no data)
-      for (const exitNodeId of graph.exitNodes) {
-        const exitState = state.nodeStates.get(exitNodeId);
-                if (exitState?.output !== undefined) {
-          outputs.set(exitNodeId, exitState.output);
+    }
+    
+    // Only use the special fallback case if we still have no outputs
+    if (outputs.size === 0 && outputNode && outputNode.kind === 'output') {
+      console.log(`[Scheduler] Using fallback case - collecting from _output inputs`);
+      const incomingEdges = getIncomingDataEdges(graph, '_output');
+      console.log(`[Scheduler] _output incoming edges: ${JSON.stringify(incomingEdges.map(e => ({from: e.from, to: e.to})))}`);
+      for (const edge of incomingEdges) {
+        const sourceState = state.nodeStates.get(edge.from);
+        console.log(`[Scheduler] Checking edge from ${edge.from}: state=${sourceState?.status}, hasOutput=${sourceState?.output !== undefined}`);
+        if (sourceState?.output !== undefined) {
+          // Use the edge's outputKey if specified, otherwise use 'result'
+          const outputKey = (outputNode.payload as any)?.outputKey ?? 'result';
+          outputs.set(outputKey, sourceState.output);
+          console.log(`[Scheduler] Fallback: collected output from ${edge.from} with key ${outputKey}`);
+          break; // Only take the first input
         }
       }
-      
-      // Special case: if _output node exists but wasn't executed, collect from its inputs
-      if (outputNode && outputNode.kind === 'output') {
-        const incomingEdges = getIncomingDataEdges(graph, '_output');
-        for (const edge of incomingEdges) {
-          const sourceState = state.nodeStates.get(edge.from);
-          if (sourceState?.output !== undefined) {
-            // Use the edge's outputKey if specified, otherwise use 'result'
-            const outputKey = (outputNode.payload as any)?.outputKey ?? 'result';
-            outputs.set(outputKey, sourceState.output);
-            break; // Only take the first input
+    }
+
+    // Extract and store session cursor if available
+    if (this.config.sessionCursorStore && outputs.size > 0) {
+      // Get the first tabular output for cursor extraction
+      let firstTabularOutput: DataValue | null = null;
+      let outputNodeId: string | null = null;
+
+      for (const [nodeId, output] of outputs) {
+        if (output.kind === 'tabular') {
+          firstTabularOutput = output;
+          outputNodeId = nodeId;
+          break;
+        }
+      }
+
+      if (firstTabularOutput && outputNodeId) {
+        // Extract rows from tabular output
+        const rows = firstTabularOutput.data.rows;
+
+        // Try to get filter AST from query nodes in the graph
+        let filterAST: object | null = null;
+        for (const [nodeId, node] of graph.nodes) {
+          if (node.kind === 'query') {
+            const payload = node.payload as any;
+            if (payload?.intent?.filter) {
+              filterAST = payload.intent.filter;
+              break;
+            }
           }
         }
+
+        // Get pipeline description from graph metadata
+        const description = graph.metadata.description || '';
+
+        // Extract cursor
+        const cursor = extractCursor(
+          rows,
+          'id',
+          filterAST,
+          ctx.pipelineId,
+          description
+        );
+
+        // Store cursor
+        this.config.sessionCursorStore.set(cursor);
+
+        // Debug log
+        console.log(`[SessionCursor] Stored cursor for table=${cursor.table}, rows=${cursor.rowCount}, strategy=${cursor.ids ? 'ids' : 'filter'}`);
       }
     }
 

@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
-import { randomUUID } from 'crypto';
+import { randomUUID } from 'node:crypto';
+import { getDatabaseConfig } from '../config/database-config.js';
 
 export enum AuditAction {
   PIPELINE_PLANNED = 'pipeline.planned',
@@ -29,8 +30,9 @@ export interface AuditEntry {
 export class AuditStore {
   private db: Database.Database;
 
-  constructor(dbPath: string = './pipelines.db') {
-    this.db = new Database(dbPath);
+  constructor(dbPath?: string) {
+    const config = getDatabaseConfig();
+    this.db = new Database(dbPath || config.authDbPath);
     this.initializeSchema();
   }
 

@@ -135,19 +135,44 @@ export class QueryExecutor {
       const conditions = intent.filters.map(f => {
         // Use table alias if available, otherwise use table name
         const tableRef = f.table ? tableAliases.get(f.table) || f.table : null;
-        const field = tableRef ? `"${tableRef}"."${f.field}"` : `"${f.field}"`;
         
+        // Special handling for NOT IN subqueries that reference tables not in JOINs
         if (f.operator === 'NOT IN' && typeof f.value === 'string' && f.value.trim().toLowerCase().startsWith('select')) {
+          // If the filter references a table that's not joined, use a NOT EXISTS approach instead
+          if (f.table && !tableAliases.has(f.table)) {
+            // Find the correct foreign key mapping
+            const fk = this.config.schema.foreignKeys.find(
+              fk => fk.fromTable === f.table && fk.toTable === intent.table
+            );
+            
+            if (fk) {
+              // Use the foreign key mapping: fromColumn in filter table maps to toColumn in main table
+              return `NOT EXISTS (SELECT 1 FROM "${f.table}" WHERE "${f.table}"."${fk.fromColumn}" = "${intent.table}"."${fk.toColumn}")`;
+            } else {
+              // Fallback to original logic if no foreign key found
+              return `NOT EXISTS (SELECT 1 FROM "${f.table}" WHERE "${f.table}"."${f.field}" = "${intent.table}"."${f.field}")`;
+            }
+          }
+          const field = tableRef ? `"${tableRef}"."${f.field}"` : `"${f.field}"`;
           return `${field} NOT IN (${f.value.trim()})`;
         } else if (f.operator === 'IN' && typeof f.value === 'string' && f.value.trim().toLowerCase().startsWith('select')) {
+          const field = tableRef ? `"${tableRef}"."${f.field}"` : `"${f.field}"`;
           return `${field} IN (${f.value.trim()})`;
-        } else if (f.operator === 'IS NULL') {
-          return `${field} IS NULL`;
-        } else if (f.operator === 'IS NOT NULL') {
-          return `${field} IS NOT NULL`;
         } else {
-          const value = typeof f.value === 'string' ? `'${f.value}'` : f.value;
-          return `${field} ${f.operator} ${value}`;
+          // For regular operators, if table is not in joins, we can't reference it
+          if (f.table && !tableAliases.has(f.table)) {
+            throw new Error(`Cannot reference table '${f.table}' in filter because it's not included in the FROM clause or JOINs`);
+          }
+          const field = tableRef ? `"${tableRef}"."${f.field}"` : `"${f.field}"`;
+          
+          if (f.operator === 'IS NULL') {
+            return `${field} IS NULL`;
+          } else if (f.operator === 'IS NOT NULL') {
+            return `${field} IS NOT NULL`;
+          } else {
+            const value = typeof f.value === 'string' ? `'${f.value}'` : f.value;
+            return `${field} ${f.operator} ${value}`;
+          }
         }
       });
       sql += conditions.join(' AND ');

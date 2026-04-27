@@ -9,7 +9,7 @@ async function verify() {
   const backend = new PostgresBackend(process.env.DATABASE_URL!);
   await backend.connect();
 
-  for (const tableName of crmSchema.tables.keys()) {
+  for (const tableName of (crmSchema as any).parsed.tables.keys()) {
     const exists = await backend.tableExists(tableName);
     if (!exists) {
       console.log(`❌ Table '${tableName}' does not exist`);

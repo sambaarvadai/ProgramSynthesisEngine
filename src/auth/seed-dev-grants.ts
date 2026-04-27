@@ -1,7 +1,8 @@
 import Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
+import { getDatabaseConfig } from '../config/database-config.js';
 
-const db = new Database('./pipelines.db');
+const db = new Database(getDatabaseConfig().authDbPath);
 
 // Define the users to seed
 const users = [
@@ -12,7 +13,48 @@ const users = [
 ];
 
 // Define the CRM tables
-const crmTables = ['customers', 'products', 'orders', 'order_items', 'support_tickets', 'email_log'];
+const crmTables = [
+  'workspaces',
+  'users',
+  'teams',
+  'roles',
+  'user_workspace_memberships',
+  'accounts',
+  'contacts',
+  'contact_account_links',
+  'leads',
+  'pipelines',
+  'pipeline_stages',
+  'opportunities',
+  'opportunity_stage_history',
+  'assignments_history',
+  'products',
+  'opportunity_products',
+  'quotes',
+  'quote_items',
+  'tasks',
+  'activities',
+  'notes',
+  'attachments',
+  'emails',
+  'email_participants',
+  'calls',
+  'messages',
+  'tickets',
+  'ticket_comments',
+  'tags',
+  'entity_tags',
+  'custom_fields',
+  'custom_field_values',
+  'lead_score_events',
+  'integrations',
+  'webhooks',
+  'workflow_rules',
+  'imports',
+  'dedup_rules',
+  'merge_history',
+  'audit_logs'
+];
 
 function seedUsers() {
   console.log('Seeding users...');

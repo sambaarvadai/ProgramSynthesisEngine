@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
+import { getDatabaseConfig } from './database-config.js';
 
 export type ApiEndpointRow = {
   id: string
@@ -34,7 +35,8 @@ export class ApiRegistryStore {
   private db: Database.Database;
 
   constructor(dbPath?: string) {
-    this.db = new Database(dbPath || 'pipelines.db');
+    const config = getDatabaseConfig();
+    this.db = new Database(dbPath || config.apiRegistryPath);
     this.initializeSchema();
   }
 

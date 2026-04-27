@@ -1,25 +1,32 @@
 import type { QueryIntent } from '../query-ast/query-intent.js'
 import type { WritePayload } from '../../nodes/payloads.js'
 import type { SchemaConfig } from '../schema/schema-config.js'
+import { getAppConfig } from '../../config/app-config.js'
 
 export type CalciteCompileResult = {
   sql: string
   paramColumns: string[]    // row field names -> $1, $2...
   staticParams: unknown[]   // literal values appended
-  optimizations: string[]
+  aggregated: boolean      // whether aggregation is present
+  writePayload?: WritePayload
   dialect: string
+  optimizations: string[]  // list of optimizations applied
 }
 
 export class CalciteClient {
   private baseUrl: string
+  private config: ReturnType<typeof getAppConfig>
 
-  constructor(baseUrl = 'http://localhost:8765') {
-    this.baseUrl = baseUrl
+  constructor(baseUrl?: string) {
+    this.config = getAppConfig();
+    this.baseUrl = baseUrl || this.config.services.calciteUrl;
   }
 
   async isAvailable(): Promise<boolean> {
     try {
-      const res = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(1000) })
+      const res = await fetch(`${this.baseUrl}/health`, { 
+        signal: AbortSignal.timeout(this.config.services.calciteHealthTimeout) 
+      })
       return res.ok
     } catch { return false }
   }
@@ -28,19 +35,30 @@ export class CalciteClient {
     intent: QueryIntent,
     schema: SchemaConfig
   ): Promise<CalciteCompileResult> {
+    console.log('[Calcite Client] Original intent table:', intent.table);
+    console.log('[Calcite Client] Original intent joins:', intent.joins);
+    console.log('[Calcite Client] Original intent filters:', intent.filters);
+    console.log('[Calcite Client] Original intent columns:', intent.columns);
+    console.log('[Calcite Client] Original intent orderBy:', intent.orderBy);
+    console.log('[Calcite Client] Original intent groupBy:', intent.groupBy);
+    console.log('[Calcite Client] Original intent having:', intent.having);
+    
+    const calciteSchema = schemaToCalcite(schema, intent);
+    console.log('[Calcite Client] Calcite schema tables:', calciteSchema.map(t => t.name));
+    
     const body = {
-      schema: schemaToCalcite(schema, intent),
-      table: intent.table,
+      schema: calciteSchema,
+      table: intent.table, // Keep original case
       columns: intent.columns,
       joins: intent.joins?.map(j => ({
-        table: j.table,
+        table: j.table, // Keep original case
         kind: j.kind ?? 'INNER',
         onLeft: j.on?.left,
         onRight: j.on?.right
       })),
       filters: intent.filters?.map(f => ({
         field: f.field,
-        table: f.table,
+        table: f.table, // Keep original case
         operator: f.operator,
         value: f.value
       })),
@@ -59,11 +77,22 @@ export class CalciteClient {
     payload: WritePayload,
     schema: SchemaConfig
   ): Promise<CalciteCompileResult> {
+    // Deduplicate columns: separate dynamic from static columns
+    const staticKeys = new Set(Object.keys(payload.staticValues ?? {}))
+    
+    // Dynamic columns: from input rows only (not also in staticValues)
+    const dynamicColumns = payload.columns.filter(col => !staticKeys.has(col))
+    
+    console.log(`[Calcite Client] Deduplicating columns:`);
+    console.log(`  Original columns: [${payload.columns.join(', ')}]`);
+    console.log(`  Static keys: [${Array.from(staticKeys).join(', ')}]`);
+    console.log(`  Dynamic columns: [${dynamicColumns.join(', ')}]`);
+
     const body = {
       schema: schemaToCalcite(schema, null, payload.table),
-      table: payload.table,
-      columns: payload.columns,
-      staticValues: payload.staticValues,
+      table: payload.table, // Keep original case
+      columns: dynamicColumns, // Send only dynamic columns to Calcite
+      staticValues: payload.staticValues, // Static values are added by CalciteCompiler
       mode: payload.mode,
       conflictColumns: payload.conflictColumns,
       updateColumns: payload.updateColumns,
@@ -78,11 +107,11 @@ export class CalciteClient {
   ): Promise<CalciteCompileResult> {
     const body = {
       schema: schemaToCalcite(schema, null, payload.table),
-      table: payload.table,
+      table: payload.table, // Keep original case
       setColumns: payload.columns,
       staticSets: payload.staticValues,
       whereColumns: payload.whereColumns ?? [],
-      staticWhere: payload.staticWhere ?? {},
+      whereFilters: payload.staticWhere ?? {},
       dialect: 'POSTGRESQL'
     }
     return this.post('/compile/update', body)
@@ -94,7 +123,7 @@ export class CalciteClient {
   ): Promise<CalciteCompileResult> {
     const body = {
       schema: schemaToCalcite(schema, null, payload.table),
-      table: payload.table,
+      table: payload.table, // Keep original case
       whereColumns: payload.whereColumns,
       dialect: 'POSTGRESQL'
     }
@@ -106,7 +135,7 @@ export class CalciteClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(this.config.services.calciteRequestTimeout)
     })
     
     if (!res.ok) {
@@ -114,8 +143,26 @@ export class CalciteClient {
       throw new Error(`Calcite error: ${err.error}`)
     }
     
-    return res.json()
+    const result = await res.json()
+    return {
+      ...result,
+      optimizations: result.optimizations || []
+    }
   }
+}
+
+function extractSubqueryTables(filters: any[]): string[] {
+  const tables: string[] = []
+  for (const f of filters ?? []) {
+    if (typeof f.value === 'string' && f.value.trim().toLowerCase().startsWith('select')) {
+      // Extract table names from simple subqueries: "SELECT x FROM table_name WHERE ..."
+      const fromMatch = f.value.match(/\bFROM\s+(\w+)/i)
+      const joinMatches = f.value.matchAll(/\bJOIN\s+(\w+)/gi)
+      if (fromMatch) tables.push(fromMatch[1])
+      for (const m of joinMatches) tables.push(m[1])
+    }
+  }
+  return tables
 }
 
 function schemaToCalcite(
@@ -123,38 +170,35 @@ function schemaToCalcite(
   intent: QueryIntent | null,
   specificTable?: string
 ): any[] {
-  // Include only tables relevant to this query
-  const relevantTables = new Set<string>()
+  // Pass every table in the schema - Calcite needs to see any table that 
+  // could appear in a subquery, even if it's not in the main FROM/JOIN list
+  console.log('[schemaToCalcite] Schema tables passed to Calcite:', Array.from(schema.tables.keys()));
+  console.log('[schemaToCalcite] Note: including all schema tables (not just query tables) to support subqueries');
   
-  if (specificTable) {
-    relevantTables.add(specificTable)
-  }
-  
-  if (intent) {
-    relevantTables.add(intent.table)
-    intent.joins?.forEach(j => relevantTables.add(j.table))
+  // Safety net: extract tables from subquery filter values
+  const subqueryTables = intent ? extractSubqueryTables(intent.filters || []) : []
+  if (subqueryTables.length > 0) {
+    console.log('[schemaToCalcite] Tables found in subqueries:', subqueryTables);
   }
   
   const result = []
-  for (const [name, table] of schema.tables) {
-    if (relevantTables.size === 0 || relevantTables.has(name)) {
-      result.push({
-        name,
-        columns: table.columns.map(col => ({
-          name: col.name,
-          type: engineTypeToCalcite(col.type),
-          nullable: col.nullable
-        })),
-        primaryKey: table.primaryKey,
-        foreignKeys: schema.foreignKeys
-          .filter(fk => fk.fromTable === name)
-          .map(fk => ({
-            fromColumn: fk.fromColumn,
-            toTable: fk.toTable,
-            toColumn: fk.toColumn
-          }))
-      })
-    }
+  for (const [name, table] of Array.from(schema.tables.entries())) {
+    result.push({
+      name: name, // Keep original case
+      columns: table.columns.map(col => ({
+        name: col.name,
+        type: engineTypeToCalcite(col.type),
+        nullable: col.nullable
+      })),
+      primaryKey: table.primaryKey,
+      foreignKeys: schema.foreignKeys
+        .filter(fk => fk.fromTable === name)
+        .map(fk => ({
+          fromColumn: fk.fromColumn,
+          toTable: fk.toTable, // Keep original case
+          toColumn: fk.toColumn
+        }))
+    })
   }
   return result
 }

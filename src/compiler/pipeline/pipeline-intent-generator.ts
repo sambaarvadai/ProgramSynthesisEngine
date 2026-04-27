@@ -3,13 +3,17 @@ import type {
   PipelineIntent,
   PipelineStepIntent,
 } from './pipeline-intent.js';
-import type { SchemaConfig } from '../schema/schema-config.js';
 import { MODELS } from '../../config/models.js';
+import { getAppConfig } from '../../config/app-config.js';
+import type { SchemaConfig } from '../schema/schema-config.js';
+import { isReferentialQuery, buildCursorSystemPromptFragment } from '../../session/ReferentialResolver.js';
+import type { SessionCursorStore } from '../../session/SessionCursor.js';
 
 export type PipelineIntentGeneratorConfig = {
   anthropicApiKey: string;
   model?: string;
   schema?: SchemaConfig;
+  sessionCursorStore?: SessionCursorStore;
 };
 
 export class PipelineIntentGenerator {
@@ -27,7 +31,22 @@ export class PipelineIntentGenerator {
       sessionHistory?: string;
     },
   ): Promise<{ intent: PipelineIntent; raw: string }> {
-    const systemPrompt = this.buildSystemPrompt();
+    let systemPrompt = this.buildSystemPrompt();
+
+    // Inject cursor context if this is a referential query
+    if (isReferentialQuery(naturalLanguageDescription) && this.config.sessionCursorStore) {
+      const cursor = this.config.sessionCursorStore.get();
+
+      if (cursor) {
+        systemPrompt += '\n\n' + buildCursorSystemPromptFragment(cursor);
+        console.log(`[ReferentialResolver] Detected referential query, injecting cursor context for table=${cursor.table}`);
+      } else {
+        // Cursor expired or not available
+        systemPrompt += '\n\nThe user appears to be referencing a prior result but no valid session context is available. Ask the user to clarify which record(s) they mean.';
+        console.log('[ReferentialResolver] Detected referential query but no valid cursor available');
+      }
+    }
+
     const userPrompt = this.buildUserPrompt(naturalLanguageDescription, context);
 
     const response = await this.client.messages.create({
@@ -53,8 +72,9 @@ export class PipelineIntentGenerator {
 
     // Sanitize LLM-generated budget values
     if (intent.budget) {
-      // Never let LLM set timeout below 30s
-      if (intent.budget.timeoutMs && intent.budget.timeoutMs < 30000) {
+      // Never let LLM set timeout below minimum
+      const minTimeout = getAppConfig().execution.minTimeoutMs;
+      if (intent.budget.timeoutMs && intent.budget.timeoutMs < minTimeout) {
         delete intent.budget.timeoutMs; // let config/defaults handle it
       }
       // Never let LLM set maxLLMCalls to 0 or negative
@@ -103,8 +123,9 @@ Please revise the pipeline intent based on the feedback. Return ONLY valid JSON,
 
     // Sanitize LLM-generated budget values
     if (revisedIntent.budget) {
-      // Never let LLM set timeout below 30s
-      if (revisedIntent.budget.timeoutMs && revisedIntent.budget.timeoutMs < 30000) {
+      // Never let LLM set timeout below minimum
+      const minTimeout = getAppConfig().execution.minTimeoutMs;
+      if (revisedIntent.budget.timeoutMs && revisedIntent.budget.timeoutMs < minTimeout) {
         delete revisedIntent.budget.timeoutMs;
       }
       // Never let LLM set maxLLMCalls to 0 or negative

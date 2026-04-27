@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
 import type { SchemaConfig, TableConfig, ColumnConfig } from '../compiler/schema/schema-config.js';
 import { auditStore, AuditAction } from './audit-store.js';
+import { getDatabaseConfig } from '../config/database-config.js';
 
 export interface AccessRequest {
   id: string;
@@ -21,6 +22,7 @@ export interface User {
   role: string;
   createdAt: number;
   lastLogin?: number;
+  workspaceId?: number;  // Optional: workspace context from CRM
 }
 
 export interface TableGrant {
@@ -43,8 +45,9 @@ export interface ColumnGrant {
 export class GrantStore {
   private db: Database.Database;
 
-  constructor(dbPath: string = './pipelines.db') {
-    this.db = new Database(dbPath);
+  constructor(dbPath?: string) {
+    const config = getDatabaseConfig();
+    this.db = new Database(dbPath || config.authDbPath);
     this.initializeSchema();
   }
 

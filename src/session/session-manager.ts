@@ -3,6 +3,7 @@ import type { PipelineIntent } from '../compiler/pipeline/pipeline-intent.js';
 import type { PlanResult } from '../pipeline-engine.js';
 import Anthropic from '@anthropic-ai/sdk';
 import { MODELS } from '../config/models.js';
+import { getAppConfig } from '../config/app-config.js';
 
 export interface SessionTurn {
   id: string;
@@ -108,7 +109,7 @@ export class SessionManager {
     try {
       const response = await this.anthropicClient.messages.create({
         model: MODELS.PIPELINE_INTENT_GENERATOR,
-        max_tokens: 1000,
+        max_tokens: getAppConfig().llm.maxTokens.sessionManager,
         messages: [
           {
             role: 'user',

@@ -10,25 +10,25 @@ import {
   ErrorSeverity,
   ErrorLevel,
   ERROR_CODES
-} from './core/errors/error-taxonomy.js';
+} from '../../src/core/errors/error-taxonomy.js';
 
 import { 
   ValidationError, 
   QueryExecutionError, 
   BudgetExceededError
-} from './core/errors/specific-errors.js';
+} from '../../src/core/errors/specific-errors.js';
 
 // Import ErrorCapture directly
-import { ErrorCapture } from './core/errors/error-capture.js';
+import { ErrorCapture } from '../../src/core/errors/error-capture.js';
 
 // Import ErrorFramer directly  
-import { ErrorFramer, Audience } from './core/errors/error-response.js';
+import { ErrorFramer, Audience } from '../../src/core/errors/error-response.js';
 
 // Import ErrorMonitoring directly
-import { ErrorMonitoring } from './core/errors/error-monitoring.js';
+import { ErrorMonitoring } from '../../src/core/errors/error-monitoring.js';
 
 // Import ErrorUtils from index file
-import { ErrorUtils } from './core/errors/index.js';
+import { ErrorUtils } from '../../src/core/errors/index.js';
 
 console.log('=== Error Handling System Standalone Test ===\n');
 

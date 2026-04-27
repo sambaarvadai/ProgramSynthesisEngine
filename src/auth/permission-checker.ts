@@ -47,73 +47,70 @@ export class PermissionChecker {
    * Scans the raw NL string for any table names or column names from schema
    * that appear as whole words (case-insensitive) and checks access permissions.
    */
-  checkExplicitMentions(input: string, userId: string, schema: SchemaConfig): PermissionCheckResult {
-    const denied: string[] = [];
-    const inputLower = input.toLowerCase();
-    const foundMentions: string[] = [];
-    
-    console.log(`[DEBUG] Checking explicit mentions for user ${userId} in input: "${input}"`);
-    
-    // Check table mentions - improved regex for multi-word table names
-    for (const tableName of schema.tables.keys()) {
-      // Use word boundaries and escape special characters in table names
-      const escapedTableName = tableName.toLowerCase().replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-      const tablePattern = new RegExp(`\\b${escapedTableName}\\b`, 'i');
+  checkExplicitMentions(input: string, userId: string, schema: any): PermissionCheckResult {
+    try {
+      const denied: string[] = [];
+      const inputLower = input.toLowerCase();
+      const foundMentions: string[] = [];
       
-      if (tablePattern.test(inputLower)) {
-        foundMentions.push(tableName);
-        console.log(`[DEBUG] Found table mention: ${tableName}`);
-        
-        if (!grantStore.checkTableAccess(userId, tableName, 'read')) {
-          denied.push(tableName);
-          console.log(`[DEBUG] Access denied for table: ${tableName}`); 
-        } else {
-          console.log(`[DEBUG] Access granted for table: ${tableName}`);
-        }
+      // Handle both SchemaConfig (tables) and BuiltSchema (parsed.tables)
+      const tables = schema.tables || schema.parsed?.tables;
+      if (!tables) {
+        return { allowed: true, denied: [] };
       }
-    }
-    
-    // Check column mentions - more restrictive to avoid false matches
-    for (const [tableName, tableConfig] of schema.tables) {
-      for (const column of tableConfig.columns) {
-        // Skip common words that could appear in normal text
-        const commonWords = ['id', 'name', 'email', 'created', 'updated', 'status', 'type'];
-        if (commonWords.includes(column.name.toLowerCase())) {
-          console.log(`[DEBUG] Skipping common word column: ${column.name}`);
-          continue;
-        }
+      
+      // Check table mentions - improved regex for multi-word table names
+      for (const tableName of tables.keys()) {
+        if (!tableName) continue;
+        // Use word boundaries and escape special characters in table names
+        const escapedTableName = tableName.toLowerCase().replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+        const tablePattern = new RegExp(`\\b${escapedTableName}\\b`, 'i');
         
-        const escapedColumnName = column.name.toLowerCase().replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-        const columnPattern = new RegExp(`\\b${escapedColumnName}\\b`, 'i');
-        
-        if (columnPattern.test(inputLower)) {
-          foundMentions.push(`${tableName}.${column.name}`);
-          console.log(`[DEBUG] Found column mention: ${tableName}.${column.name}`);
+        if (tablePattern.test(inputLower)) {
+          foundMentions.push(tableName);
           
-          if (!grantStore.checkColumnAccess(userId, tableName, column.name, 'read')) {
-            denied.push(`${tableName}.${column.name}`);
-            console.log(`[DEBUG] Access denied for column: ${tableName}.${column.name}`);
-          } else {
-            console.log(`[DEBUG] Access granted for column: ${tableName}.${column.name}`);
+          if (!grantStore.checkTableAccess(userId, tableName, 'read')) {
+            denied.push(tableName); 
           }
         }
       }
+      
+      // Check column mentions - more restrictive to avoid false matches
+      for (const [tableName, tableConfig] of tables) {
+        if (!tableConfig?.columns) continue;
+        for (const column of tableConfig.columns) {
+          if (!column?.name) continue;
+          // Skip common words that could appear in normal text
+          const commonWords = ['id', 'name', 'email', 'created', 'updated', 'status', 'type'];
+          if (commonWords.includes(column.name.toLowerCase())) {
+            continue;
+          }
+          
+          const escapedColumnName = column.name.toLowerCase().replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+          const columnPattern = new RegExp(`\\b${escapedColumnName}\\b`, 'i');
+          
+          if (columnPattern.test(inputLower)) {
+            foundMentions.push(`${tableName}.${column.name}`);
+            
+            if (!grantStore.checkColumnAccess(userId, tableName, column.name, 'read')) {
+              denied.push(`${tableName}.${column.name}`);
+            }
+          }
+        }
+      }
+      
+      if (denied.length > 0) {
+        return {
+          allowed: false,
+          denied
+        };
+      }
+      
+      return { allowed: true, denied: [] };
+    } catch (e) {
+      console.error('[PermissionChecker] Error in checkExplicitMentions:', e);
+      return { allowed: true, denied: [] };
     }
-    
-    console.log(`[DEBUG] Total mentions found: ${foundMentions.join(', ')}`);
-    console.log(`[DEBUG] Total denied: ${denied.join(', ')}`);
-    
-    if (denied.length > 0) {
-      console.log(`[DEBUG] Returning permission denied result`);
-      return {
-        allowed: false,
-        denied,
-        message: `You don't have access to: [${denied.join(', ')}]. Request access with: request access to [table/column]`
-      };
-    }
-    
-    console.log(`[DEBUG] Returning permission allowed result`);
-    return { allowed: true };
   }
   
   /**
@@ -670,7 +667,31 @@ export class PermissionChecker {
       throw new Error(`Table ${tableName} not found in schema`);
     }
 
-    // Get required columns for the table
+    // Required column check only applies to INSERT and UPSERT modes.
+    // For UPDATE: only the SET columns need to be present.
+    // For DELETE: only WHERE columns matter.
+    const isInsertMode = ['insert', 'insert_ignore', 'upsert'].includes(writePayload.mode)
+    
+    if (!isInsertMode) {
+      // For UPDATE specifically, validate that at least one SET column is provided
+      if (writePayload.mode === 'update') {
+        const hasSetColumns = (writePayload.columns?.length ?? 0) > 0 || 
+                              Object.keys(writePayload.staticValues ?? {}).length > 0
+        if (!hasSetColumns) {
+          return {
+            complete: false,
+            missing: [{
+              column: '(SET clause)',
+              nullable: false,
+              description: 'UPDATE requires at least one column to set'
+            }]
+          }
+        }
+      }
+      return { complete: true }  // UPDATE/DELETE never fails required-column check
+    }
+
+    // Get required columns for the table (INSERT/UPSERT only)
     const requiredColumns = this.getRequiredColumns(tableName, schema);
 
     // Build set of available columns from:

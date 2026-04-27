@@ -4,7 +4,7 @@
  * Test script for the error analyzer
  */
 
-import { ErrorAnalyzer } from './src/core/llm/error-analyzer.js';
+import { ErrorAnalyzer } from '../../src/core/llm/error-analyzer.js';
 
 async function testErrorAnalyzer() {
   console.log('Testing Error Analyzer...\n');

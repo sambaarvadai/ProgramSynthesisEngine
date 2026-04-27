@@ -152,4 +152,8 @@ export type WritePayload = {
   returning?: string[];
   batchSize?: number;
   datasource: string;
+  upstreamTables?: string[];
+  columnAliases?: Record<string, string>;  // maps write column name -> upstream row field name
+                                     // populated automatically during plan() validation when FK remapping applies
+                                     // e.g. { order_id: 'id' } means "read 'id' from row, write as 'order_id'"
 };

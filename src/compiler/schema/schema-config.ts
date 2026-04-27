@@ -159,3 +159,51 @@ export function getRelatedTables(schema: SchemaConfig, table: string): string[] 
 export function tableExists(schema: SchemaConfig, name: string): boolean {
   return schema.tables.has(name);
 }
+
+export function resolveWriteColumnSource(
+  targetTable: string,
+  targetColumn: string,
+  upstreamTables: string[],
+  foreignKeys: any[] | undefined | null,
+  simulatedRow: Record<string, any>
+): string {
+  const fks = foreignKeys ?? []
+
+  // Case 1: Direct match
+  if (targetColumn in simulatedRow) return targetColumn
+
+  // Case 2: FK with upstream table check (precise)
+  for (const fk of fks) {
+    if (
+      fk.fromTable === targetTable &&
+      fk.fromColumn === targetColumn &&
+      upstreamTables.includes(fk.toTable) &&
+      fk.toColumn in simulatedRow
+    ) {
+      return fk.toColumn
+    }
+    if (
+      fk.toTable === targetTable &&
+      fk.toColumn === targetColumn &&
+      upstreamTables.includes(fk.fromTable) &&
+      fk.fromColumn in simulatedRow
+    ) {
+      return fk.fromColumn
+    }
+  }
+
+  // Case 3: FK fallback - table tracking may be incomplete,
+  // but if the source field exists in the row, use it
+  for (const fk of fks) {
+    if (
+      fk.fromTable === targetTable &&
+      fk.fromColumn === targetColumn &&
+      fk.toColumn in simulatedRow
+    ) {
+      return fk.toColumn
+    }
+  }
+
+  // Case 4: No FK resolution found
+  return targetColumn
+}

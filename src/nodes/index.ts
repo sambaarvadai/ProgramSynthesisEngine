@@ -32,14 +32,14 @@ import { validationFail } from '../core/types/validation.js';
 
 export function registerAllNodes(
   registry: NodeRegistry,
-  deps?: { anthropicApiKey?: string; evaluator?: any; storageBackend?: any; schema?: any; calciteClient?: any },
+  deps?: { anthropicApiKey?: string; evaluator?: any; storageBackend?: any; schema?: any; calciteClient?: any; sessionCursorStore?: any },
 ): void {
   registry.register(inputNodeDefinition);
   registry.register(outputNodeDefinition);
   registry.register(transformNodeDefinition);
   registry.register(queryNodeDefinition);
   registry.register(createHttpNodeDefinition(deps?.evaluator));
-  registry.register(createWriteNodeDefinition(deps?.storageBackend, deps?.schema, deps?.calciteClient));
+  registry.register(createWriteNodeDefinition(deps?.storageBackend, deps?.schema, deps?.calciteClient, deps?.sessionCursorStore));
   registry.register(conditionalNodeDefinition);
   registry.register(mergeNodeDefinition);
   registry.register(parallelNodeDefinition);

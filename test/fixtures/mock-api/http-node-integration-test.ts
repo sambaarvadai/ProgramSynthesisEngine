@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { createInterface } from 'readline';
-import { PipelineEngine } from '../pipeline-engine.js';
+import { PipelineEngine } from '../../../src/pipeline-engine.js';
 import { startServer } from './customer-enrichment-server.js';
-import { crmSchema } from '../config/crm-schema.js';
+import { crmSchema } from '../../../src/config/crm-schema.js';
 
 // CLI utilities
 const rl = createInterface({

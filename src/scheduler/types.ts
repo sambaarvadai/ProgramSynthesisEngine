@@ -11,6 +11,7 @@ import type { ExecutionContext } from '../core/context/execution-context.js';
 import type { ExecutionTrace } from '../core/context/execution-trace.js';
 import type { ExecutionBudget } from '../core/context/execution-budget.js';
 import type { DataValue } from '../core/types/data-value.js';
+import type { SessionCursorStore } from '../session/SessionCursor.js';
 
 // ============================================================================
 // Scheduler Configuration
@@ -22,6 +23,7 @@ export type SchedulerConfig = {
   evaluator: ExprEvaluator;
   maxParallelBranches: number;
   defaultBatchSize: number;
+  sessionCursorStore?: SessionCursorStore;
 };
 
 // ============================================================================

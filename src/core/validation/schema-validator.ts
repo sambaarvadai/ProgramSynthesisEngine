@@ -5,6 +5,7 @@
 import type { SchemaConfig } from '../../compiler/schema/schema-config.js';
 import type { PipelineGraph, PipelineNode } from '../graph/index.js';
 import type { WritePayload } from '../../nodes/payloads.js';
+import { crmSchema } from '../../schema/crm-schema.js';
 
 // Define types locally to avoid import issues
 interface TableSchema {
@@ -162,8 +163,13 @@ export class SchemaValidator {
     const tableColumns = new Map(Object.entries(tableSchema.columns));
 
     // Validate target columns
+    console.log(`[Schema Validator] Validating write node ${nodeId} for table ${payload.table}`);
+    console.log(`[Schema Validator] Payload columns:`, payload.columns);
+    console.log(`[Schema Validator] Table columns available:`, Array.from(tableColumns.keys()));
+    
     for (const column of payload.columns || []) {
       if (!tableColumns.has(column)) {
+        console.log(`[Schema Validator] Column '${column}' not found in table '${payload.table}'`);
         errors.push({
           nodeId,
           operation: 'write',
@@ -191,25 +197,39 @@ export class SchemaValidator {
       }
     }
 
-    // Check for missing required columns (check both columns and staticValues)
-    const missingRequired = this.findMissingRequiredColumns(payload, tableSchema);
-    for (const missing of missingRequired) {
-      errors.push({
-        nodeId,
-        operation: 'write',
-        table: payload.table,
-        column: missing,
-        error: `Required column '${missing}' is missing from write operation`,
-        severity: 'error',
-        suggestion: `Add '${missing}' to columns or provide a default value`
-      });
+    // Check for missing required columns only for INSERT and UPSERT modes
+    const isInsertMode = ['insert', 'insert_ignore', 'upsert'].includes(payload.mode);
+    
+    if (isInsertMode) {
+      const missingRequired = this.findMissingRequiredColumns(payload, tableSchema, payload.table);
+      for (const missing of missingRequired) {
+        errors.push({
+          nodeId,
+          operation: 'write',
+          table: payload.table,
+          column: missing,
+          error: `Required column '${missing}' is missing from write operation`,
+          severity: 'error',
+          suggestion: `Add '${missing}' to columns or provide a default value`
+        });
+      }
     }
+    // For UPDATE/DELETE: don't check required columns - only SET columns need to be present
 
     // Validate static values for column types
+    const tableColumnNames = new Set(tableColumns.keys());
     for (const [column, value] of Object.entries(payload.staticValues || {})) {
       if (tableColumns.has(column)) {
+        // Skip type checking for values that look like field references
+        if (typeof value === 'string' && tableColumnNames.has(value)) {
+          // Value looks like a field reference, not a literal - skip type check
+          console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
+            `value '${value}' looks like a field reference`)
+          continue
+        }
+        
         const columnSchema = tableColumns.get(column)!;
-        const typeValidation = this.validateColumnType(column, value, columnSchema);
+        const typeValidation = this.validateColumnType(column, value, columnSchema, payload.table);
         if (!typeValidation.isValid) {
           errors.push({
             nodeId,
@@ -228,6 +248,47 @@ export class SchemaValidator {
     const modeValidation = this.validateWriteMode(payload, tableSchema);
     errors.push(...modeValidation.errors);
     warnings.push(...modeValidation.warnings);
+
+    // Additional UPDATE-specific validation
+    if (payload.mode === 'update') {
+      const tableColumnNames = new Set(Object.keys(tableSchema.columns));
+      
+      // For UPDATE, the columns being SET must exist in the table
+      // (payload.columns = dynamic SET columns, payload.staticValues keys = static SET values)
+      const allSetColumns = [
+        ...payload.columns,
+        ...Object.keys(payload.staticValues ?? {})
+      ];
+      
+      for (const col of allSetColumns) {
+        if (!tableColumnNames.has(col)) {
+          errors.push({
+            nodeId,
+            operation: 'write',
+            table: payload.table,
+            column: col,
+            error: `SET column '${col}' does not exist in table '${payload.table}'`,
+            severity: 'error',
+            suggestion: `Remove '${col}' from the update or check the column name`
+          });
+        }
+      }
+      
+      // Also validate staticWhere columns exist
+      for (const col of Object.keys(payload.staticWhere ?? {})) {
+        if (!tableColumnNames.has(col)) {
+          errors.push({
+            nodeId,
+            operation: 'write',
+            table: payload.table,
+            column: col,
+            error: `WHERE column '${col}' does not exist in table '${payload.table}'`,
+            severity: 'error',
+            suggestion: `Check the column name in staticWhere`
+          });
+        }
+      }
+    }
 
     return { errors, warnings };
   }
@@ -269,7 +330,7 @@ export class SchemaValidator {
   /**
    * Get live database schema
    */
-  private async getLiveSchema(): Promise<Map<string, TableSchema>> {
+  public async getLiveSchema(): Promise<Map<string, TableSchema>> {
     try {
       // This would typically query the database information schema
       // For now, we'll use the configured schema as a fallback
@@ -310,7 +371,7 @@ export class SchemaValidator {
   /**
    * Find missing required columns for write operation
    */
-  private findMissingRequiredColumns(payload: WritePayload, tableSchema: TableSchema): string[] {
+  private findMissingRequiredColumns(payload: WritePayload, tableSchema: TableSchema, tableName: string): string[] {
     const missing: string[] = [];
     const providedColumns = new Set([
       ...(payload.columns || []),
@@ -320,10 +381,17 @@ export class SchemaValidator {
     ]);
 
     for (const [columnName, columnSchema] of Object.entries(tableSchema.columns)) {
+      // Use DDLParser's accurate default info from crmSchema.parsed.tables
+      // (not from live schema which may lack defaults)
+      const colDef = (crmSchema as any).parsed.tables
+        .get(tableName)?.columns.get(columnName);
+      
       // Check if column is required (not nullable and no default)
       // Skip columns that have defaults or are primary keys (typically auto-generated)
       const hasDefault = columnSchema.hasDefault || 
-                        columnSchema.primaryKey;
+                        columnSchema.primaryKey ||
+                        (columnSchema as any).defaultRaw !== null ||
+                        (colDef?.defaultRaw !== null);
       
       if (columnSchema.nullable === false && !hasDefault) {
         if (!providedColumns.has(columnName)) {
@@ -341,7 +409,8 @@ export class SchemaValidator {
   private validateColumnType(
     columnName: string,
     value: any,
-    columnSchema: ColumnSchema
+    columnSchema: ColumnSchema,
+    tableName: string
   ): { isValid: boolean; error: string; suggestion: string } {
     // Basic type validation - could be enhanced with more sophisticated checks
     if (value === null || value === undefined) {
@@ -355,60 +424,39 @@ export class SchemaValidator {
       return { isValid: true, error: '', suggestion: '' };
     }
 
-    // Simple type checks (could be expanded)
-    const columnType = columnSchema.type.toLowerCase();
-    const valueType = typeof value;
-
-    switch (columnType) {
-      case 'integer':
-      case 'int':
-      case 'bigint':
-      case 'smallint':
-        if (valueType !== 'number' || !Number.isInteger(value)) {
-          return {
-            isValid: false,
-            error: `Column '${columnName}' expects integer, got ${valueType}`,
-            suggestion: `Convert value to integer or use appropriate data type`
-          };
-        }
-        break;
-      
-      case 'varchar':
-      case 'text':
-      case 'char':
-        if (valueType !== 'string') {
-          return {
-            isValid: false,
-            error: `Column '${columnName}' expects string, got ${valueType}`,
-            suggestion: `Convert value to string`
-          };
-        }
-        break;
-      
-      case 'boolean':
-      case 'bool':
-        if (valueType !== 'boolean') {
-          return {
-            isValid: false,
-            error: `Column '${columnName}' expects boolean, got ${valueType}`,
-            suggestion: `Convert value to boolean`
-          };
-        }
-        break;
-      
-      case 'timestamp':
-      case 'datetime':
-        if (valueType !== 'string' && !(value instanceof Date)) {
-          return {
-            isValid: false,
-            error: `Column '${columnName}' expects timestamp, got ${valueType}`,
-            suggestion: `Convert value to timestamp string or Date object`
-          };
-        }
-        break;
+    // Use DDLParser's accurate type info from crmSchema.parsed.tables
+    // (not from engine SchemaConfig which has TEXT fallback)
+    const colDef = (crmSchema as any).parsed.tables
+      .get(tableName)?.columns.get(columnName);
+    const sqlType = colDef?.type?.toUpperCase() ?? 'TEXT';
+    
+    const expectedJsType = this.sqlTypeToJsType(sqlType);
+    const actualJsType = typeof value;
+    
+    if (actualJsType !== expectedJsType) {
+      return {
+        isValid: false,
+        error: `Column '${columnName}' expects ${expectedJsType}, got ${actualJsType}`,
+        suggestion: `Convert value to ${expectedJsType}`
+      };
     }
 
     return { isValid: true, error: '', suggestion: '' };
+  }
+
+  /**
+   * Map SQL types to JavaScript types
+   */
+  private sqlTypeToJsType(sqlType: string): string {
+    const t = sqlType.toUpperCase();
+    if (t === 'INT' || t === 'INTEGER' || t === 'SERIAL' || 
+        t === 'BIGINT' || t === 'SMALLINT' || t === 'INT2' || t === 'INT4' || t === 'INT8' ||
+        t.startsWith('NUMERIC') || t === 'REAL' || t === 'DOUBLE PRECISION' || t === 'FLOAT') {
+      return 'number';
+    }
+    if (t === 'BOOLEAN' || t === 'BOOL') return 'boolean';
+    if (t === 'JSONB' || t === 'JSON') return 'object';
+    return 'string';  // TEXT, VARCHAR, CHAR, TIMESTAMPTZ, DATE, INET, etc.
   }
 
   /**
@@ -450,14 +498,17 @@ export class SchemaValidator {
         break;
       
       case 'update':
-        if (!payload.whereColumns || payload.whereColumns.length === 0) {
+        const hasDynamicWhere = payload.whereColumns && payload.whereColumns.length > 0
+        const hasStaticWhere = payload.staticWhere && Object.keys(payload.staticWhere).length > 0
+        
+        if (!hasDynamicWhere && !hasStaticWhere) {
           errors.push({
             nodeId: '',
             operation: 'write',
             table: payload.table,
             error: 'UPDATE mode requires where conditions',
             severity: 'error',
-            suggestion: 'Specify whereColumns for UPDATE operation'
+            suggestion: 'Specify whereColumns for dynamic WHERE, or staticWhere for literal conditions (e.g. staticWhere: { id: 107 })'
           });
         }
         break;
@@ -493,7 +544,16 @@ export class SchemaValidator {
       parts.push(`${warnings.length} warning${warnings.length > 1 ? 's' : ''}`);
     }
 
-    return `Schema validation: ${parts.join(', ')}`;
+    // Extract the most common operation mode from errors for context
+    let modeContext = '';
+    if (errors.length > 0) {
+      const modes = errors.map(e => e.operation).filter((op, i, arr) => arr.indexOf(op) === i);
+      if (modes.length === 1) {
+        modeContext = ` (${modes[0]})`;
+      }
+    }
+
+    return `Schema validation${modeContext}: ${parts.join(', ')}`;
   }
 
   /**

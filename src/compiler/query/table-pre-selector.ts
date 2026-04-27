@@ -124,7 +124,7 @@ Return ONLY raw JSON with no markdown formatting, no backticks, no explanation.`
       const columnNames = tableConfig.columns.map(col => col.name).join(', ');
       lines.push(`  Columns: ${columnNames}`);
       
-      if (tableConfig.primaryKey.length > 0) {
+      if (tableConfig.primaryKey && tableConfig.primaryKey.length > 0) {
         lines.push(`  Primary Key: ${tableConfig.primaryKey.join(', ')}`);
       }
       lines.push('');

@@ -1,20 +1,25 @@
 import readline from 'node:readline';
-import { PipelineEngine } from './pipeline-engine.js';
-import { crmSchema } from './config/index.js';
+import { PipelineEngine, type PipelineEngineConfig } from './pipeline-engine.js';
+import type { WritePayload } from './nodes/payloads.js';
+import { crmSchema } from './schema/crm-schema.js';
 import { PostgresBackend } from './storage/index.js';
 import { isTabular, isRecord, isScalar, isCollection, isVoid, toTabular } from './core/types/data-value.js';
 import type { DataValue } from './core/types/data-value.js';
 import { SessionManager } from './session/session-manager.js';
+import { SessionCursorStore, extractCursor } from './session/SessionCursor.js';
 // Import error analyzer for detailed LLM-based error analysis
 import { ErrorAnalyzer } from './core/llm/error-analyzer.js';
 import { grantStore } from './auth/grant-store.js';
 import { auditStore, AuditAction } from './auth/audit-store.js';
 import { apiRegistryStore } from './config/api-registry-store.js';
+import { getDatabaseConfig } from './config/database-config.js';
+import { coerceColumnValue } from './write/coerceColumnValue.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
 async function main() {
-  const backend = new PostgresBackend(process.env.DATABASE_URL!);
+  const dbConfig = getDatabaseConfig();
+  const backend = new PostgresBackend(dbConfig.crmPostgresUrl!);
   await backend.connect();
 
   const rl = readline.createInterface({
@@ -26,7 +31,7 @@ async function main() {
     new Promise(resolve => rl.question(q, resolve));
 
   // User authentication
-  let currentUser: { id: string; username: string; role: string } | null = null;
+  let currentUser: { id: string; username: string; role: string; workspaceId?: number } | null = null;
 
   async function login() {
     console.log('\n\uFE0F ProgramExecutionEngine CLI');
@@ -57,7 +62,7 @@ async function main() {
       
       // In a real implementation, you'd verify the password hash
       // For now, we'll just accept any password for demo purposes
-      currentUser = { id: user.id, username: user.username, role: user.role };
+      currentUser = { id: user.id, username: user.username, role: user.role, workspaceId: user.workspaceId ?? 1 };
       grantStore.updateLastLogin(user.id);
       
       // Add audit logging for successful login
@@ -80,15 +85,73 @@ async function main() {
   // Now create session manager with authenticated user
   const sessionManager = new SessionManager(process.env.ANTHROPIC_API_KEY!, currentUser!.id);
 
+  // Create session cursor store for lightweight result pagination
+  const sessionCursorStore = new SessionCursorStore();
+
   // Initialize error analyzer for detailed LLM-based error analysis
   const errorAnalyzer = new ErrorAnalyzer({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY!
   });
 
+  // Build SchemaConfig from BuiltSchema for the engine
+  // Convert DDLParser RawTableMap → SchemaConfig tables Map
+  // SchemaConfig table shape: { columns: Array, primaryKey: string[], ... }
+  // DDLParser table shape:    { columns: Map, foreignKeys: [], ... }
+  
+  const schemaConfigTables = new Map<string, any>();
+  
+  for (const [tableName, rawTable] of crmSchema.parsed.tables) {
+    // Convert columns Map → Array in SchemaConfig format
+    const columns = Array.from(rawTable.columns.entries()).map(
+      ([colName, colDef]) => ({
+        name:        colName,
+        type:        { kind: colDef.type },   // SchemaConfig wraps type in { kind }
+        nullable:    colDef.nullable,
+        primaryKey:  colDef.primaryKey,
+        unique:      colDef.unique,
+        description: undefined,
+        examples:    undefined,
+      })
+    );
+    
+    // Extract primary key column names
+    const primaryKey = columns
+      .filter(c => c.primaryKey)
+      .map(c => c.name);
+    
+    schemaConfigTables.set(tableName, {
+      columns,
+      primaryKey,
+      description: undefined,
+      alias:       undefined,
+    });
+  }
+
+  // Convert FKGraph edges → flat FK array
+  const foreignKeys: any[] = [];
+  for (const edges of crmSchema.parsed.fkGraph.outbound.values()) {
+    for (const edge of edges) {
+      foreignKeys.push({
+        fromTable:  edge.fromTable,
+        fromColumn: edge.fromColumn,
+        toTable:    edge.toTable,
+        toColumn:   edge.toColumn,
+        onDelete:   edge.onDelete,
+      });
+    }
+  }
+
+  const engineSchema = {
+    tables:      schemaConfigTables,
+    foreignKeys,
+    version:     '1',
+  };
+
   const engine = new PipelineEngine({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
-    schema: crmSchema,
+    schema: engineSchema as any,
     storageBackend: backend,
+    sessionCursorStore,
     budget: {
       maxLLMCalls: 20,
       maxIterations: 100,
@@ -217,7 +280,7 @@ async function main() {
       const schema = crmSchema;
       let hasAnyAccess = false;
       
-      for (const [tableName] of schema.tables) {
+      for (const [tableName] of schema.parsed.tables) {
         const canRead = grantStore.checkTableAccess(currentUser!.id, tableName, 'read');
         const canWrite = grantStore.checkTableAccess(currentUser!.id, tableName, 'write');
         
@@ -358,7 +421,7 @@ async function main() {
   console.log('Type "exit" to quit.\n');
 
   console.log('\ud83d\udd52 Connected to Postgres:', process.env.DATABASE_URL?.replace(/:\/\/.*@/, '://***@'));
-  console.log('\ud83d\udcca Schema:', [...crmSchema.tables.keys()].join(', '));
+  console.log('\ud83d\udcca Schema:', [...crmSchema.parsed.tables.keys()].join(', '));
   console.log(`\ud83d\udd11 Session ID: ${sessionManager.getSessionId()}`);
   console.log('\ud83d\udce7 Email: Resend API', process.env.RESEND_API_KEY ? '??' : '?? (set RESEND_API_KEY)');
   console.log();
@@ -414,32 +477,56 @@ async function main() {
       if (plan.compilationErrors.length > 0) {
         // Check if this is a write completeness error that we can handle interactively
         const writeIncompleteError = plan.compilationErrors.find(err => err.code === 'WRITE_INCOMPLETE');
+        const writeFieldUnresolvableError = plan.compilationErrors.find(err => err.code === 'WRITE_FIELD_UNRESOLVABLE');
+        
         if (writeIncompleteError && writeIncompleteError.missingColumns) {
           console.log('\n\u26A0\ufe0f  Write completeness check:');
           console.log(writeIncompleteError.message);
           
           console.log('\nThe write operation needs a few more values:');
           
-          const collectedValues: Record<string, string> = {};
-          let cancelled = false;
+          // Get the write payload to determine table and column types
+          const writeNode = plan.graph.nodes.get(writeIncompleteError.stepId!);
+          const writePayload = writeNode?.kind === 'write' ? writeNode.payload as WritePayload : null;
+          const tableColumns = writePayload?.table ? (crmSchema as any).parsed?.tables.get(writePayload.table)?.columns : undefined;
           
-          for (const col of writeIncompleteError.missingColumns) {
+          const collectedValues: Record<string, any> = {};
+          let cancelled = false;
+                    for (const col of writeIncompleteError.missingColumns) {
             if (cancelled) break;
-            const label = col.nullable ? '(optional)' : '(required)';
+            const label = 'nullable' in col ? (col.nullable ? '(optional)' : '(required)') : '(required)';
+            const description = 'description' in col ? col.description : 'Required field';
+            const colDef = tableColumns?.get(col.column);
+            const colType = colDef?.type ?? 'TEXT';
+            
+            // Get enum values from schema traits if available
+            const traits = writePayload?.table ? (crmSchema as any).traits.get(writePayload.table)?.get(col.column) : undefined;
+            const enumValues = traits?.enumValues;
             
             while (true) {
-              const value = await ask(`  ${col.column} ${label} - ${col.description}: `);
+              const value = await ask(`  ${col.column} (${colType}, required): `);
               
               if (value.trim().toLowerCase() === 'cancel') {
                 console.log('\nWrite cancelled.');
                 cancelled = true;
                 break;
               }
-              if (!value.trim() && !col.nullable) {
+              if (!value.trim() && 'nullable' in col && !col.nullable) {
                 console.log('  This field is required, please enter a value.');
                 continue;
               }
-              if (value.trim()) collectedValues[col.column] = value.trim();
+              if (value.trim()) {
+                // Coerce to correct type before storing
+                try {
+                  const coerced = coerceColumnValue(value.trim(), colType, enumValues);
+                  if (coerced !== null) {
+                    collectedValues[col.column] = coerced;
+                  }
+                } catch (e) {
+                  console.log(`  Error: ${(e as Error).message}`);
+                  continue;
+                }
+              }
               break;
             }
           }
@@ -472,6 +559,110 @@ async function main() {
           const confirmAfterFill = await ask('\nExecute this plan? (y/n) ');
           if (confirmAfterFill.trim() !== 'y') continue;
           // fall through to execution
+        } else if (writeFieldUnresolvableError && writeFieldUnresolvableError.missingColumns && 'table' in writeFieldUnresolvableError.missingColumns[0]) {
+          console.log(`\n\u26A0\ufe0f  Write field resolution failed for step '${writeFieldUnresolvableError.stepId}':`);
+          console.log(writeFieldUnresolvableError.message);
+          
+          console.log('\nThe write operation needs a few more values:');
+          
+          const collectedValues: Record<string, any> = {};
+          let cancelled = false;
+          
+          // Resolve table column definitions once for filtering
+          const _writeNode = plan.graph.nodes.get(writeFieldUnresolvableError.stepId!);
+          const _writePayload = _writeNode?.kind === 'write'
+            ? _writeNode.payload as WritePayload
+            : null;
+          const _tableColumns = _writePayload?.table
+            ? (crmSchema as any).parsed?.tables.get(_writePayload.table)?.columns
+            : undefined;
+
+          // Filter: only prompt for columns that are truly required
+          // Skip nullable columns and columns with schema defaults
+          const mustPromptCols = writeFieldUnresolvableError.missingColumns.filter(col => {
+            if (!('table' in col)) return false;
+            const colDef = _tableColumns?.get(col.column);
+            if (!colDef) return true;            // unknown — prompt to be safe
+            if (colDef.nullable) return false;   // nullable → optional
+            if (colDef.defaultRaw !== null) return false;  // has DB default → optional
+            return true;
+          });
+
+          const skippedCols = writeFieldUnresolvableError.missingColumns
+            .filter(col => 'table' in col && !mustPromptCols.includes(col))
+            .map((col: any) => col.column);
+
+          if (skippedCols.length > 0) {
+            console.log(
+              `[WriteCompleteness] Skipping optional/defaulted columns: ${skippedCols.join(', ')}` 
+            );
+          }
+
+          if (mustPromptCols.length === 0) {
+            console.log('[WriteCompleteness] All required values provided!');
+            // skip the prompt loop entirely, fall through to execution
+          }
+
+          for (const col of mustPromptCols) {
+            if (cancelled) break;
+            if ('table' in col) {
+              console.log(`   \u2717 '${col.column}' not found for table '${col.table}'`);
+              console.log(`     \u2192 ${col.suggestion}`);
+              
+              while (true) {
+                const value = await ask(`  ${col.column} (required) - ${col.suggestion}: `);
+                
+                if (value.trim().toLowerCase() === 'cancel') {
+                  console.log('\nWrite cancelled.');
+                  cancelled = true;
+                  break;
+                }
+                if (!value.trim()) {
+                  console.log('  This field is required, please enter a value.');
+                  continue;
+                }
+                if (value.trim()) {
+                  const colDef = _tableColumns?.get(col.column);
+                  const colType = colDef?.type ?? 'TEXT';
+                  const colTraits = _writePayload?.table
+                    ? (crmSchema as any).traits?.get(_writePayload.table)?.get(col.column)
+                    : undefined;
+                  const enumValues = colTraits?.enumValues;
+                  console.log(`[DEBUG] Column ${col.column} has type: ${colType}`);
+                  try {
+                    const coerced = coerceColumnValue(value.trim(), colType, enumValues);
+                    if (coerced !== null) {
+                      collectedValues[col.column] = coerced;
+                      console.log(`[DEBUG] Coerced ${col.column}: ${value.trim()} (${typeof value.trim()}) -> ${coerced} (${typeof coerced})`);
+                    }
+                  } catch (e) {
+                    console.log(`  Error: ${(e as Error).message}`);
+                    continue;
+                  }
+                }
+                break;
+              }
+            }
+          }
+          
+          if (cancelled) continue;
+          
+          // Patch the existing plan in place - add missing values to staticValues
+          const writeNode = plan.graph.nodes.get(writeFieldUnresolvableError.stepId!);
+          if (writeNode && writeNode.kind === 'write') {
+            const payload = writeNode.payload as WritePayload;
+            payload.staticValues = { ...payload.staticValues, ...collectedValues };
+            
+            // Clear the compilation errors since we've resolved the missing fields
+            plan.compilationErrors = [];
+          }
+          
+          // Plan is now complete - show it and ask for confirmation
+          console.log('\n' + engine.formatPlan(plan));
+          console.log('\n\u2705 All required values provided!');
+          const confirmAfterFill = await ask('\nExecute this plan? (y/n) ');
+          if (confirmAfterFill.trim() !== 'y') continue;
+          // fall through to execution
         } else {
           // Handle other compilation errors normally
           console.log('\n\u26A0\ufe0f  Compilation errors:');
@@ -494,7 +685,22 @@ async function main() {
       }
 
       // Confirm for non-conversational inputs
+      const hasWriteNode = plan.intent.steps.some(s => s.kind === 'write');
+      const cursor = sessionCursorStore.get();
+
+      if (hasWriteNode && cursor && cursor.rowCount > 50) {
+        console.warn(
+          `⚠️  This will affect ~${cursor.rowCount} rows in ` +
+          `'${cursor.table}' matching the prior query filter.`
+        );
+      }
+
       const confirm = await ask('\nExecute this plan? (y/n/refine) ');
+
+      if (confirm.trim() === 'n') {
+        sessionCursorStore.clear();
+        continue;
+      }
 
       if (confirm.trim() === 'refine') {
         const feedback = await ask('What should be changed? ');
@@ -633,6 +839,8 @@ async function main() {
     } catch (error) {
       console.log();
       console.log('\nError:', (error as Error).message);
+      console.log('\nStack trace:');
+      console.log((error as Error).stack);
       
       // Get detailed error analysis from LLM
       console.log('\nAnalyzing error with AI...');

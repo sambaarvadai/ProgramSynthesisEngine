@@ -5,7 +5,7 @@
  * This file can be executed directly to test the error handling implementation
  */
 
-import { demonstrateErrorHandling, demonstratePipelineErrorIntegration } from './src/core/errors/demo.js';
+import { demonstrateErrorHandling, demonstratePipelineErrorIntegration } from '../../src/core/errors/demo.js';
 
 console.log('Starting Error Handling System Tests...\n');
 
@@ -55,7 +55,7 @@ try {
     ErrorCategory,
     ErrorSeverity,
     ErrorLevel
-  } = await import('./src/core/errors/index.js');
+  } = await import('../../src/core/errors/index.js');
 
   // Create different error types
   const validationError = new ValidationError('Test validation error', 'VAL001');
@@ -101,7 +101,7 @@ try {
     ErrorFramer,
     Audience,
     ValidationError
-  } = await import('./src/core/errors/index.js');
+  } = await import('../../src/core/errors/index.js');
 
   const error = new ValidationError('Test error', 'VAL001');
   
@@ -145,7 +145,7 @@ try {
     ValidationError,
     BudgetExceededError,
     ErrorSeverity
-  } = await import('./src/core/errors/index.js');
+  } = await import('../../src/core/errors/index.js');
 
   const monitoring = new ErrorMonitoring({
     alertThresholds: {
@@ -198,7 +198,7 @@ try {
     BaseError,
     ErrorCategory,
     ErrorSeverity
-  } = await import('./src/core/errors/index.js');
+  } = await import('../../src/core/errors/index.js');
 
   // Test error wrapping
   const regularError = new Error('Regular error');

@@ -10,9 +10,10 @@ import type {
   PipelineStepIntent,
   PipelineIntentValidationError,
 } from './pipeline-intent.js';
-import type { SchemaConfig } from '../schema/schema-config.js';
 import type { QueryIntent } from '../query-ast/query-intent.js';
+import type { SchemaConfig } from '../schema/schema-config.js';
 import { MODELS } from '../../config/models.js';
+import { getAppConfig } from '../../config/app-config.js';
 import type {
   QueryPayload,
   TransformPayload,
@@ -204,7 +205,10 @@ export class PipelineCompiler {
         // write nodes should have a dependsOn unless they have explicit filtering or are INSERT operations
         const hasExplicitFilter = step.config?.filter || step.config?.where || step.config?.whereColumns
         const isInsertOperation = step.config?.operation === 'INSERT' || step.config?.mode === 'insert'
-        if ((!step.dependsOn || step.dependsOn.length === 0) && !hasExplicitFilter && !isInsertOperation) {
+        // Allow pure-static operations with explicit filtering (no dependencies needed)
+        const hasStaticWhere = step.config?.filter || step.config?.where
+        const hasStaticValues = Object.keys(step.config?.fields || step.config?.staticValues || {}).length > 0
+        if ((!step.dependsOn || step.dependsOn.length === 0) && !hasExplicitFilter && !isInsertOperation && !hasStaticWhere && !hasStaticValues) {
           errors.push({
             stepId: step.id,
             code: 'WRITE_MISSING_INPUT',
@@ -350,7 +354,7 @@ export class PipelineCompiler {
             parts: [{ kind: 'literal', text: step.description }],
           },
           outputSchema,
-          maxTokens: 1000,
+          maxTokens: getAppConfig().llm.maxTokens.pipelineCompiler,
         } as LLMPayload;
         break;
       }
@@ -583,16 +587,25 @@ export class PipelineCompiler {
       }
     }
 
-    // Find exit steps and connect to _output
-    const exitSteps = this.findExitSteps(intent, loopBodySteps, mergeSources);
-    for (const exitStepId of exitSteps) {
-      const edgeId = `e_${exitStepId}__output`;
+    // Find exit nodes - nodes that no other node depends on
+    const allDependencies = new Set(
+      intent.steps.flatMap(s => s.dependsOn ?? [])
+    )
+    console.log(`[PipelineCompiler] All dependencies: ${JSON.stringify(Array.from(allDependencies))}`);
+    const exitNodes = intent.steps
+      .filter(s => !allDependencies.has(s.id))
+      .map(s => s.id)
+    console.log(`[PipelineCompiler] Exit nodes detected: ${JSON.stringify(exitNodes)}`);
+
+    // Connect each exit node to _output
+    for (const exitNodeId of exitNodes) {
+      const edgeId = `${exitNodeId}->_output` 
       edges.set(edgeId, {
         id: edgeId,
-        from: exitStepId,
+        from: exitNodeId,
         to: '_output',
-        kind: 'data',
-      });
+        kind: 'data'
+      })
     }
 
     return edges;
