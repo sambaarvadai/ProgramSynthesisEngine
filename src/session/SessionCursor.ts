@@ -46,7 +46,8 @@ export function extractCursor(
   primaryKey: string,
   filter: object | null,
   pipelineId: string,
-  description: string
+  description: string,
+  table: string = 'unknown'
 ): SessionCursor {
   const rowCount = rows.length;
   const expiresAt = new Date(Date.now() + 300 * 1000); // now + 300 seconds
@@ -61,9 +62,6 @@ export function extractCursor(
     ids = null;
     sourceFilter = filter;
   }
-
-  // Infer table name from filter or use a default
-  const table = (filter as any)?.table || 'unknown';
 
   return {
     table,

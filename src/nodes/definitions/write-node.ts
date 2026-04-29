@@ -454,61 +454,44 @@ export function createWriteNodeDefinition(
                 );
               }
 
-              // Resolve SET values: prioritize upstream data, then staticValues
-              const resolvedValues: Record<string, any> = {};
-              const whereKeys = new Set(Object.keys(payload.staticWhere ?? {}));
-
-              // For each column in payload.columns (dynamic columns):
-              for (const col of payload.columns) {
-                // Check upstream row first
-                const alias = payload.columnAliases?.[col];
-                const upstreamField = alias ?? col;
-
-                if (dataRows.length > 0 && dataRows[0][upstreamField] !== undefined) {
-                  // Use upstream value — this is the intended data flow
-                  resolvedValues[col] = dataRows[0][upstreamField];
-                  console.log(`[WriteNode] Resolved '${col}' from upstream field '${upstreamField}': ${resolvedValues[col]}`);
-                } else if (payload.staticValues?.[col] !== undefined && !whereKeys.has(col)) {
-                  // Fall back to staticValue only if not in upstream and not a WHERE key
-                  resolvedValues[col] = payload.staticValues[col];
-                  console.log(`[WriteNode] Resolved '${col}' from staticValues: ${resolvedValues[col]}`);
-                } else {
-                  // Column has no value — drop it
-                  console.log(`[WriteNode] Dropping column '${col}' - not resolvable`);
-                }
-              }
-
-              // Static-only columns (not in payload.columns but in staticValues):
-              for (const [col, val] of Object.entries(payload.staticValues ?? {})) {
-                if (!payload.columns.includes(col) && !(col in resolvedValues) && !whereKeys.has(col)) {
-                  resolvedValues[col] = val;
-                  console.log(`[WriteNode] Added static-only column '${col}': ${val}`);
-                }
-              }
-
-              // SQL expressions that must be embedded directly
-              // not passed as string parameters
-              const SQL_EXPRESSIONS = new Set([
-                'NOW()',
-                'CURRENT_TIMESTAMP', 
-                'CURRENT_DATE',
-                'CURRENT_USER',
-                'gen_random_uuid()'
-              ]);
-
+              // Build SET clause from both dynamic columns and static values
               const setClauses: string[] = [];
               const setParams: any[] = [];
               let paramIndex = 1;
 
-              for (const [col, val] of Object.entries(resolvedValues)) {
+              // 1. Dynamic columns — resolved from upstream row via columnAliases
+              const dataRow = dataRows[0] ?? {};
+              for (const col of payload.columns) {
+                const val = dataRow[col];  // dataRow is the merged row from prepareRows
+                if (val === undefined) {
+                  console.log(`[WriteNode] Dropping dynamic column '${col}' - not resolvable`);
+                  continue;
+                }
+                setClauses.push(`"${col}" = $${paramIndex}`);
+                setParams.push(val);
+                paramIndex++;
+                console.log(`[WriteNode] Added dynamic column '${col}': ${val}`);
+              }
+
+              // 2. Static values — literal values from staticValues
+              //    Skip columns already covered by dynamic columns above
+              const dynamicCols = new Set(payload.columns);
+              const whereKeys = new Set(Object.keys(payload.staticWhere ?? {}));
+              
+              for (const [col, val] of Object.entries(payload.staticValues ?? {})) {
+                if (dynamicCols.has(col)) continue;  // already in SET via dynamic path
+                if (whereKeys.has(col)) continue;   // skip WHERE keys
+                
+                const SQL_EXPRESSIONS = new Set(['NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_USER', 'gen_random_uuid()']);
                 if (typeof val === 'string' && SQL_EXPRESSIONS.has(val.trim())) {
-                  // Embed directly as SQL expression — no parameter
                   setClauses.push(`"${col}" = ${val.trim()}`);
-                  // do NOT push to params, do NOT increment paramIndex
+                  // no param push — SQL expression embedded directly
+                  console.log(`[WriteNode] Added static column '${col}' as SQL expression: ${val.trim()}`);
                 } else {
                   setClauses.push(`"${col}" = $${paramIndex}`);
                   setParams.push(val);
                   paramIndex++;
+                  console.log(`[WriteNode] Added static column '${col}': ${val}`);
                 }
               }
 

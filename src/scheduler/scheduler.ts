@@ -459,11 +459,8 @@ export class Scheduler {
           description
         );
 
-        // Store cursor
-        this.config.sessionCursorStore.set(cursor);
-
-        // Debug log
-        console.log(`[SessionCursor] Stored cursor for table=${cursor.table}, rows=${cursor.rowCount}, strategy=${cursor.ids ? 'ids' : 'filter'}`);
+        // Note: Session cursor storage is now handled by cli.ts after execution
+        // to ensure proper primaryTable detection and table name resolution
       }
     }
 
@@ -634,13 +631,49 @@ export class Scheduler {
         
       } else {
         // Multiple inputs - merge all into a single flat row (fan-in)
+        // Prioritize query node outputs over write node outputs to preserve query result fields
         const mergedRow: Record<string, unknown> = {};
-        for (const value of Object.values(inputs)) {
+        const queryInputs: DataValue[] = [];
+        const otherInputs: DataValue[] = [];
+
+        // Separate query inputs from other inputs
+        for (const [nodeId, value] of Object.entries(inputs)) {
           if (!value) continue;
+          const sourceNode = graph.nodes.get(nodeId);
+          if (sourceNode?.kind === 'query') {
+            queryInputs.push(value);
+          } else {
+            otherInputs.push(value);
+          }
+        }
+
+        // First, merge query inputs (highest priority)
+        for (const value of queryInputs) {
           if (value.kind === 'tabular' && value.data.rows.length > 0) {
             Object.assign(mergedRow, value.data.rows[0]);
           } else if (value.kind === 'record') {
             Object.assign(mergedRow, value.data);
+          } else if (value.kind === 'scalar') {
+            // scalar - skip, can't merge into row
+          }
+        }
+
+        // Then, merge other inputs (write summaries, etc.) - they don't overwrite query fields
+        for (const value of otherInputs) {
+          if (value.kind === 'tabular' && value.data.rows.length > 0) {
+            for (const [key, val] of Object.entries(value.data.rows[0])) {
+              // Only add if not already present from query inputs
+              if (!(key in mergedRow)) {
+                mergedRow[key] = val;
+              }
+            }
+          } else if (value.kind === 'record') {
+            for (const [key, val] of Object.entries(value.data)) {
+              // Only add if not already present from query inputs
+              if (!(key in mergedRow)) {
+                mergedRow[key] = val;
+              }
+            }
           } else if (value.kind === 'scalar') {
             // scalar - skip, can't merge into row
           }

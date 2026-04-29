@@ -225,8 +225,29 @@ public class CalciteCompiler {
         if (!validColumns.contains(e.getKey())) {
           throw new Exception("WHERE column '" + e.getKey() + "' not in table");
         }
-        String val = formatLiteral(e.getValue());
-        whereClauses.add("\"" + e.getKey() + "\" = " + val);
+        
+        Object val = e.getValue();
+        String column = "\"" + e.getKey() + "\"";
+        
+        if (val instanceof List) {
+          List<?> list = (List<?>) val;
+          if (list.isEmpty()) continue;
+          
+          if (list.size() == 1) {
+            // Single element — use scalar equality
+            whereClauses.add(column + " = " + formatLiteral(list.get(0)));
+          } else {
+            // Multiple elements — use IN (...) which Calcite handles cleanly
+            List<String> literals = new ArrayList<>();
+            for (Object item : list) {
+              literals.add(formatLiteral(item));
+            }
+            whereClauses.add(column + " IN (" + String.join(", ", literals) + ")");
+          }
+        } else {
+          // Scalar value — existing behaviour
+          whereClauses.add(column + " = " + formatLiteral(e.getValue()));
+        }
       }
     }
 
@@ -248,19 +269,63 @@ public class CalciteCompiler {
   }
 
   public CompileResult compileDelete(DeleteRequest req) throws Exception {
-    if (req.whereColumns == null || req.whereColumns.isEmpty()) {
-      throw new Exception("DELETE requires whereColumns - refusing full table delete");
-    }
-    
     SchemaPlus rootSchema = Frameworks.createRootSchema(true);
     for (TableSchema table : req.schema) {
       rootSchema.add(table.name, buildCalciteTable(table));
     }
     
-    List<String> paramColumns = new ArrayList<>(req.whereColumns);
+    TableSchema targetTable = req.schema.stream()
+      .filter(t -> t.name.equals(req.table))
+      .findFirst()
+      .orElseThrow(() -> new Exception("Table not found: " + req.table));
+    
+    Set<String> validColumns = new HashSet<>();
+    for (ColumnDef col : targetTable.columns) validColumns.add(col.name);
+    
+    List<String> paramColumns = new ArrayList<>();
     List<String> whereClauses = new ArrayList<>();
-    for (int i = 0; i < req.whereColumns.size(); i++) {
-      whereClauses.add("\"" + req.whereColumns.get(i) + "\" = $" + (i + 1));
+    List<Object> staticParams = new ArrayList<>();
+    
+    // Dynamic WHERE (from input rows)
+    if (req.whereColumns != null) {
+      for (int i = 0; i < req.whereColumns.size(); i++) {
+        if (!validColumns.contains(req.whereColumns.get(i))) {
+          throw new Exception("WHERE column '" + req.whereColumns.get(i) + "' not in table");
+        }
+        paramColumns.add(req.whereColumns.get(i));
+        whereClauses.add("\"" + req.whereColumns.get(i) + "\" = $" + paramColumns.size());
+      }
+    }
+    
+    // Static WHERE (literal values from whereFilters)
+    if (req.whereFilters != null) {
+      for (FilterSpec f : req.whereFilters) {
+        if (!validColumns.contains(f.field)) {
+          throw new Exception("WHERE column '" + f.field + "' not in table");
+        }
+        String column = "\"" + f.field + "\"";
+        
+        if (f.value instanceof List) {
+          List<?> list = (List<?>) f.value;
+          if (list.isEmpty()) continue;
+          
+          if (list.size() == 1) {
+            whereClauses.add(column + " = " + formatLiteral(list.get(0)));
+          } else {
+            List<String> literals = new ArrayList<>();
+            for (Object item : list) {
+              literals.add(formatLiteral(item));
+            }
+            whereClauses.add(column + " IN (" + String.join(", ", literals) + ")");
+          }
+        } else {
+          whereClauses.add(column + " " + f.operator + " " + formatLiteral(f.value));
+        }
+      }
+    }
+    
+    if (whereClauses.isEmpty()) {
+      throw new Exception("DELETE requires at least one WHERE condition");
     }
     
     String sql = "DELETE FROM \"" + req.table + "\" WHERE " +
@@ -269,7 +334,7 @@ public class CalciteCompiler {
     CompileResult out = new CompileResult();
     out.sql = sql;
     out.paramColumns = paramColumns;
-    out.staticParams = List.of();
+    out.staticParams = staticParams;
     out.optimizations = List.of("calcite_schema_validation");
     out.dialect = req.dialect != null ? req.dialect : "POSTGRESQL";
     return out;
@@ -379,8 +444,16 @@ public class CalciteCompiler {
 
   private String formatLiteral(Object val) {
     if (val == null) return "NULL";
-    if (val instanceof String) return "'" + val + "'";
+    if (val instanceof String) return "'" + ((String) val).replace("'", "''") + "'";
     if (val instanceof Boolean) return val.toString().toUpperCase();
+    if (val instanceof List) {
+      // Should not reach here directly — handled in caller
+      // But as fallback, format as IN list
+      List<?> list = (List<?>) val;
+      List<String> parts = new ArrayList<>();
+      for (Object item : list) parts.add(formatLiteral(item));
+      return "(" + String.join(", ", parts) + ")";
+    }
     return val.toString();  // numbers inline
   }
 

@@ -158,13 +158,29 @@ async function main() {
     where: Record<string, any>
   ): Promise<Record<string, any> | null> {
     try {
-      const conditions = Object.entries(where)
-        .map(([col, val], i) => `"${col}" = $${i + 1}`)
-        .join(' AND ');
-      const values = Object.values(where);
-      
-      const sql = `SELECT * FROM "${table}" WHERE ${conditions} LIMIT 1`;
-      
+      // Replace scalar WHERE builder with array-aware version:
+      const conditions: string[] = [];
+      const values: any[] = [];
+      let paramIndex = 1;
+
+      for (const [col, val] of Object.entries(where)) {
+        if (Array.isArray(val)) {
+          if (val.length === 1) {
+            conditions.push(`"${col}" = $${paramIndex}`);
+            values.push(val[0]);
+          } else {
+            // Multi-row — skip pre-fetch, it's not a single row
+            return null;
+          }
+        } else {
+          conditions.push(`"${col}" = $${paramIndex}`);
+          values.push(val);
+        }
+        paramIndex++;
+      }
+
+      const sql = `SELECT * FROM "${table}" WHERE ${conditions.join(' AND ')} LIMIT 1`;
+
       const result = await backend.rawQuery(sql, values);
       return result.rows[0] ?? null;
     } catch (e) {
@@ -703,21 +719,15 @@ async function main() {
         const writeFieldUnresolvableError = plan.compilationErrors.find(err => err.code === 'WRITE_FIELD_UNRESOLVABLE');
         
         if (writeIncompleteError && writeIncompleteError.missingColumns) {
-          console.log('\n\u26A0\ufe0f  Write completeness check:');
-          console.log(writeIncompleteError.message);
-
           // Get the write payload to determine table and column types
           const writeNode = plan.graph.nodes.get(writeIncompleteError.stepId!);
           const writePayload = writeNode?.kind === 'write' ? writeNode.payload as WritePayload : null;
           const tableColumns = writePayload?.table ? (crmSchema as any).parsed?.tables.get(writePayload.table)?.columns : undefined;
 
           // Check if write intent is complete (has both WHERE and WHAT to update)
+          // Do this FIRST — before printing anything to avoid unnecessary warnings
           if (writePayload && isWriteIntentComplete(writePayload)) {
-            console.log(
-              '[WriteCompleteness] Write intent is complete. ' +
-              'Adding updated_at and proceeding.'
-            );
-            // Just add updated_at
+            // Silent — no warning shown to user at all
             if (writePayload.staticValues) {
               writePayload.staticValues['updated_at'] = 'NOW()';
             }
@@ -725,9 +735,13 @@ async function main() {
             plan.compilationErrors = [];
             // Skip form entirely - continue to execution
           } else {
+            // Only reach here when there is genuinely something missing
+            // Now safe to show the warning
+            console.log('\u26A0\ufe0f  Write completeness check:');
+            console.log(writeIncompleteError.message);
             // Show form — genuinely missing intent
           
-          // Detect single-row UPDATE
+            // Detect single-row UPDATE
           const isSingleRowUpdate = 
             writePayload?.mode === 'update' &&
             (
@@ -772,7 +786,9 @@ async function main() {
             const field: FieldPrompt = {
               column:       col.column,
               type:         colDef?.type ?? 'TEXT',
-              required:     !('nullable' in col) || !col.nullable,
+              required:     writePayload?.mode === 'insert' 
+                ? !('nullable' in col) || !col.nullable  // INSERT: required = NOT NULL
+                : false,  // UPDATE: no required fields (partial updates valid)
               defaultValue: colDef?.defaultRaw ?? null,
               enumValues:   colTraits?.enumValues ?? [],
               fkTarget:     colTraits?.foreignKey
@@ -927,7 +943,9 @@ async function main() {
             const field: FieldPrompt = {
               column:       col.column,
               type:         colDef?.type ?? 'TEXT',
-              required:     !!(colDef && !colDef.nullable && colDef.defaultRaw === null),
+              required:     _writePayload?.mode === 'insert' 
+                ? !!(colDef && !colDef.nullable && colDef.defaultRaw === null)  // INSERT: required = NOT NULL
+                : false,  // UPDATE: no required fields (partial updates valid)
               defaultValue: colDef?.defaultRaw ?? null,
               enumValues:   colTraits?.enumValues ?? [],
               fkTarget:     colTraits?.foreignKey

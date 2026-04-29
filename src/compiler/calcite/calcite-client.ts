@@ -127,16 +127,6 @@ export class CalciteClient {
     payload: WritePayload,
     schema: SchemaConfig
   ): Promise<CalciteCompileResult> {
-    // Check for array values in staticWhere - Calcite can't handle IN/ANY arrays
-    const hasArrayWhere = Object.values(payload.staticWhere ?? {})
-      .some(v => Array.isArray(v) && v.length > 1);
-
-    if (hasArrayWhere) {
-      // Calcite staticWhere can't handle IN/ANY arrays
-      // Skip Calcite, use fallback directly
-      throw new Error('SKIP_CALCITE: array WHERE requires fallback');
-    }
-
     // Separate literal values from SQL expressions in staticSets
     const SQL_EXPRESSIONS = new Set([
       'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE',
@@ -154,12 +144,41 @@ export class CalciteClient {
       }
     }
 
+    // Deduplicate: setColumns drives dynamic $N params (from upstream row)
+    // staticSets/sqlExprSets drive literal inline values
+    // If a column appears in both, setColumns wins (it has the actual resolved value from upstream)
+    const setColumnsSet = new Set(payload.columns);
+    
+    const deduplicatedStaticSets: Record<string, any> = {};
+    for (const [col, val] of Object.entries(staticSets)) {
+      if (!setColumnsSet.has(col)) {
+        deduplicatedStaticSets[col] = val;
+      } else {
+        console.log(
+          `[CalciteClient] Deduplicating: ${col} already in setColumns, ` +
+          `skipping from staticSets` 
+        );
+      }
+    }
+
+    const deduplicatedSqlExprSets: Record<string, string> = {};
+    for (const [col, val] of Object.entries(sqlExprSets)) {
+      if (!setColumnsSet.has(col)) {
+        deduplicatedSqlExprSets[col] = val;
+      } else {
+        console.log(
+          `[CalciteClient] Deduplicating: ${col} already in setColumns, ` +
+          `skipping from sqlExprSets` 
+        );
+      }
+    }
+
     const body = {
       schema: schemaToCalcite(schema, null, payload.table),
       table: payload.table, // Keep original case
       setColumns: payload.columns,
-      staticSets: staticSets,
-      sqlExprSets: sqlExprSets,
+      staticSets: deduplicatedStaticSets,
+      sqlExprSets: deduplicatedSqlExprSets,
       staticWhere: payload.staticWhere,
       whereColumns: payload.whereColumns ?? [],
       dialect: 'POSTGRESQL'

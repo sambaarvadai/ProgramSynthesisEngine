@@ -1902,7 +1902,55 @@ Return ONLY raw JSON.`;
         mergedStaticValues[col] = val;
         console.log(`[Write Enrichment] Re-applied auto-injected value: ${col} = ${val}`);
       }
-      
+
+      // AUDIT_TABLES: auto-inject timestamp = NOW() for audit/history tables
+      const AUDIT_TABLES = new Set([
+        'assignments_history', 'audit_logs',
+        'opportunity_stage_history', 'lead_score_events'
+      ]);
+
+      if (AUDIT_TABLES.has(tableName)) {
+        // Find the correct timestamp column for this audit table
+        const tableColumns = (crmSchema as any).parsed.tables
+          .get(tableName)?.columns;
+        
+        // Use changed_at if it exists, else fall back to null
+        // (created_at is server_generated, don't inject it)
+        const timestampCol = tableColumns?.has('changed_at') 
+          ? 'changed_at' 
+          : null;
+        
+        if (timestampCol) {
+          if (!mergedStaticValues[timestampCol]) {
+            mergedStaticValues[timestampCol] = 'NOW()';
+            console.log(`[Write Enrichment] Auto-injected ${timestampCol} = NOW() for audit table: ${tableName}`);
+          }
+          
+          // Remove timestamp column from dynamic columns (it's not coming from upstream, it's always NOW())
+          const timestampIndex = mergedColumns.indexOf(timestampCol);
+          if (timestampIndex !== -1) {
+            mergedColumns.splice(timestampIndex, 1);
+            console.log(`[Write Enrichment] Removed ${timestampCol} from dynamic columns for audit table: ${tableName}`);
+          }
+        }
+
+        // Auto-derive action from write mode for audit_logs
+        if (targetTable === 'audit_logs' && !mergedStaticValues['action']) {
+          const modeToAction: Record<string, string> = {
+            'insert':        'create',
+            'update':        'update',
+            'delete':        'delete',
+            'upsert':        'update',
+            'insert_ignore': 'create'
+          };
+          // Derive from the upstream write node's mode if available
+          // For now, default to 'update' since most audit logs are updates
+          const writeMode = config.mode ?? (step.config?.mode as string ?? 'insert');
+          mergedStaticValues['action'] = modeToAction[writeMode] ?? 'system';
+          console.log(`[WriteEnrichment] Auto-derived action=${mergedStaticValues['action']} for audit_logs`);
+        }
+      }
+
       // Special handling: if we're inserting into email_log and have 'id' in availableFields,
       // ensure 'order_id' is included in columns
       if (tableName === 'email_log' && availableFields.includes('id')) {
@@ -2018,15 +2066,30 @@ Return ONLY raw JSON.`;
                 `Using schema default: "${defaultVal}"`
               );
               mergedStaticValues[col] = defaultVal;
-            } else {
-              // No default — remove the invalid value entirely
-              // Let DB enforce NOT NULL if applicable
-              console.warn(
-                `[Write Enrichment] Invalid enum value for ${col}: ` +
-                `"${strVal}" not in [${enumValues.join(', ')}]. ` +
-                `Removing — column has no default.`
-              );
-              delete mergedStaticValues[col];
+            } else if (!match) {
+              const colDef = (crmSchema as any).parsed.tables
+                .get(tableName)?.columns.get(col);
+              
+              if (colDef?.defaultRaw) {
+                // Use schema default
+                const defaultVal = colDef.defaultRaw.replace(/^'(.*)'$/, '$1');
+                mergedStaticValues[col] = defaultVal;
+                console.warn(`[WriteEnrichment] Invalid enum: ${col}="${strVal}" → using default "${defaultVal}"`);
+              } else if (!colDef?.nullable) {
+                // NOT NULL, no default — substitute closest valid value
+                // For action column: 'resolved' maps to 'update' (status change)
+                // Log the substitution clearly
+                const fallback = findClosestEnumValue(strVal, enumValues);
+                mergedStaticValues[col] = fallback;
+                console.warn(
+                  `[WriteEnrichment] Invalid enum: ${col}="${strVal}" has no default. ` +
+                  `Substituting closest valid value: "${fallback}"` 
+                );
+              } else {
+                // Nullable — safe to remove
+                delete mergedStaticValues[col];
+                console.warn(`[WriteEnrichment] Invalid enum: ${col}="${strVal}" removed (nullable)`);
+              }
             }
           }
           // else: valid match with correct casing — leave as-is
@@ -2366,4 +2429,15 @@ Rules:
 
     return { parts: parts.length > 0 ? parts : [{ kind: 'literal', text: url }] }
   }
+}
+
+// Helper: find closest valid enum value by string similarity
+function findClosestEnumValue(input: string, validValues: string[]): string {
+  // Simple approach: return the first value that shares a prefix,
+  // or the first value as fallback
+  const lower = input.toLowerCase();
+  const match = validValues.find(v => 
+    v.toLowerCase().startsWith(lower[0]) 
+  );
+  return match ?? validValues[0];
 }
