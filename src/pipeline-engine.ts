@@ -530,43 +530,15 @@ export class PipelineEngine {
             const currentStaticValues = writePayload.staticValues || {};
             const missingRequired = getUserSuppliedRequired(classifications, currentStaticValues);
             
-            // Additionally filter: skip columns that have a schema default
-            const tableColumns = (crmSchema as any).parsed.tables.get(writePayload.table)?.columns;
-            const mustPrompt = missingRequired.filter(c => {
-              const colDef = tableColumns?.get(c.column);
-              if (!colDef) return false;
-              
-              // Skip nullable columns — they're truly optional
-              if (colDef.nullable) return false;
-              
-              // Skip columns with any default value (literal or SQL expr)
-              // They'll use their DB default if not provided
-              if (colDef.defaultRaw !== null) return false;
-              
-              // Skip columns with schema-defined enum defaults
-              // (e.g. status defaults to 'open', priority to 'medium')
-              const traits = (crmSchema as any).traits.get(writePayload.table)?.get(c.column);
-              if (traits?.default !== undefined) return false;
-              
-              return true;
-            });
-            
-            // Log what will and won't be prompted
-            const skipped = missingRequired
-              .filter(c => !mustPrompt.find(m => m.column === c.column))
-              .map(c => c.column);
-            
-            if (skipped.length > 0) {
-              console.log(
-                `[WriteCompleteness] Skipping optional/defaulted columns: ${skipped.join(', ')}` 
-              );
-            }
-            
-            if (mustPrompt.length > 0) {
-              const missingList = mustPrompt.map(c => {
+            // Always return WRITE_INCOMPLETE if there are missing columns
+            // Let the CLI handle separating required vs optional in the form
+            if (missingRequired.length > 0) {
+              const tableColumns = (crmSchema as any).parsed.tables.get(writePayload.table)?.columns;
+              const missingList = missingRequired.map(c => {
                 const colDef = tableColumns?.get(c.column);
                 const colType = colDef?.type ?? 'TEXT';
-                return `${c.column} (${colType}, required)`;
+                const isRequired = colDef && !colDef.nullable && colDef.defaultRaw === null;
+                return `${c.column} (${colType}, ${isRequired ? 'required' : 'optional'})`;
               }).join('\n  ');
               
               return {
@@ -574,13 +546,17 @@ export class PipelineEngine {
                 graph,
                 compilationErrors: [{
                   code: 'WRITE_INCOMPLETE',
-                  message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
+                  message: `The ${writePayload.mode} into ${writePayload.table} is missing values:\n  ${missingList}`,
                   stepId: step.id,
-                  missingColumns: mustPrompt.map(c => ({
-                    column: c.column,
-                    nullable: false,
-                    description: 'Required field'
-                  }))
+                  missingColumns: missingRequired.map(c => {
+                    const colDef = tableColumns?.get(c.column);
+                    const isRequired = colDef && !colDef.nullable && colDef.defaultRaw === null;
+                    return {
+                      column: c.column,
+                      nullable: !isRequired,
+                      description: isRequired ? 'Required field' : 'Optional field'
+                    };
+                  })
                 }],
                 intentRaw: description,
               };

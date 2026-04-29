@@ -82,6 +82,204 @@ async function main() {
 
   await login();
 
+  // Field collection interface and helpers
+  interface FieldPrompt {
+    column:       string;
+    type:         string;
+    required:     boolean;
+    defaultValue: string | null;
+    enumValues:   string[];
+    fkTarget:     { table: string; column: string } | null;
+  }
+
+  function buildFieldHint(field: FieldPrompt): string {
+    const parts: string[] = [];
+    
+    // Type label — simplified for readability
+    const typeLabel = field.type.startsWith('INT') || field.type === 'SERIAL'
+      ? '(integer)'
+      : field.type === 'BOOLEAN'
+      ? '(true/false)'
+      : field.type === 'TIMESTAMPTZ' || field.type === 'DATE'
+      ? '(date)'
+      : field.type.startsWith('NUMERIC')
+      ? '(number)'
+      : '(text)';
+    
+    parts.push(typeLabel.padEnd(12));
+    
+    // Enum values
+    if (field.enumValues.length > 0) {
+      parts.push(`[${field.enumValues.join(', ')}]`);
+    }
+    
+    // Default value — strip surrounding quotes from SQL literal
+    if (field.defaultValue !== null) {
+      const displayDefault = field.defaultValue
+        .replace(/^'(.*)'$/, '$1');   // "'medium'" → "medium"
+      parts.push(`default: ${displayDefault}`);
+    }
+    
+    // FK hint
+    if (field.fkTarget) {
+      parts.push(`FK → ${field.fkTarget.table}.${field.fkTarget.column}`);
+    }
+    
+    return parts.join('  ');
+  }
+
+  async function fetchCurrentRow(
+    table: string,
+    where: Record<string, any>
+  ): Promise<Record<string, any> | null> {
+    try {
+      const conditions = Object.entries(where)
+        .map(([col, val], i) => `"${col}" = $${i + 1}`)
+        .join(' AND ');
+      const values = Object.values(where);
+      
+      const sql = `SELECT * FROM "${table}" WHERE ${conditions} LIMIT 1`;
+      
+      const result = await backend.rawQuery(sql, values);
+      return result.rows[0] ?? null;
+    } catch (e) {
+      console.warn(`[PreFetch] Could not fetch current row: ${e}`);
+      return null;
+    }
+  }
+
+  function displayCurrentRow(currentRow: Record<string, any>): void {
+    console.log('\n📋 Current record:');
+    console.log('─'.repeat(60));
+    
+    for (const [col, val] of Object.entries(currentRow)) {
+      if (val === null || val === undefined) continue;
+      if (['created_at', 'updated_at', 'deleted_at'].includes(col)) continue;
+      if (col === 'id') continue;
+      
+      const displayVal = typeof val === 'object' 
+        ? JSON.stringify(val)
+        : String(val);
+      
+      console.log(`  ${col.padEnd(25)} ${displayVal}`);
+    }
+    console.log('─'.repeat(60));
+    console.log('');
+  }
+
+  async function collectFieldsFromUser(
+    required: FieldPrompt[],
+    optional: FieldPrompt[],
+    currentRow: Record<string, any> | null = null
+  ): Promise<Record<string, any>> {
+    
+    const collected: Record<string, any> = {};
+    
+    if (required.length === 0 && optional.length === 0) {
+      return collected;
+    }
+
+    if (currentRow) {
+      console.log('\n✏️  Edit fields below. Press Enter to keep current value.\n');
+    } else {
+      console.log('\n📝 To complete this operation, please fill in the following:');
+      console.log('   Press Enter to skip optional fields.\n');
+    }
+
+    // ── REQUIRED ──────────────────────────────────────
+    if (required.length > 0) {
+      console.log('REQUIRED');
+      for (const field of required) {
+        const hint = buildFieldHint(field);
+        const currentVal = currentRow?.[field.column];
+        const currentDisplay = currentVal !== null && currentVal !== undefined
+          ? String(currentVal)
+          : null;
+        const currentHint = currentDisplay
+          ? ` (current: ${currentDisplay})` 
+          : '';
+        
+        let value: string | undefined;
+        
+        // Loop until user provides a non-empty value
+        while (!value?.trim()) {
+          value = await ask(
+            `  ${field.column.padEnd(20)} ${hint}${currentHint}: ` 
+          );
+          if (!value?.trim()) {
+            if (currentRow && currentDisplay !== null) {
+              // Keep current value
+              collected[field.column] = currentVal;
+              break;
+            }
+            console.log(`  ⚠ ${field.column} is required. Please enter a value.`);
+          }
+        }
+        
+        if (value?.trim()) {
+          try {
+            const coerced = coerceColumnValue(
+              value.trim(), 
+              field.type, 
+              field.enumValues.length > 0 ? field.enumValues : undefined
+            );
+            if (coerced !== null) collected[field.column] = coerced;
+          } catch (e) {
+            console.log(`  ✗ ${(e as Error).message}`);
+            // Re-add to required and retry — simplest approach
+            // for now: just store raw and let validator catch it
+            collected[field.column] = value.trim();
+          }
+        }
+      }
+      console.log('');
+    }
+
+    // ── OPTIONAL ──────────────────────────────────────
+    if (optional.length > 0) {
+      console.log(currentRow ? 'FIELDS  (press Enter to keep current value)' : 'OPTIONAL  (press Enter to skip)');
+      for (const field of optional) {
+        const hint = buildFieldHint(field);
+        const currentVal = currentRow?.[field.column];
+        const currentDisplay = currentVal !== null && currentVal !== undefined
+          ? String(currentVal)
+          : null;
+        const currentHint = currentDisplay
+          ? ` (current: ${currentDisplay})` 
+          : '';
+        
+        const value = await ask(
+          `  ${field.column.padEnd(20)} ${hint}${currentHint}: ` 
+        );
+        
+        if (!value?.trim()) {
+          if (currentRow && currentDisplay !== null) {
+            // Keep current value
+            collected[field.column] = currentVal;
+          }
+          // else: User skipped — do not add to collected
+          // DB default or NULL will be used
+          continue;
+        }
+
+        try {
+          const coerced = coerceColumnValue(
+            value.trim(),
+            field.type,
+            field.enumValues.length > 0 ? field.enumValues : undefined
+          );
+          if (coerced !== null) collected[field.column] = coerced;
+        } catch (e) {
+          console.log(`  ✗ Invalid: ${(e as Error).message}. Field skipped.`);
+          // Skip invalid optional values silently
+        }
+      }
+    }
+
+    console.log('');
+    return collected;
+  }
+
   // Now create session manager with authenticated user
   const sessionManager = new SessionManager(process.env.ANTHROPIC_API_KEY!, currentUser!.id);
 
@@ -483,61 +681,120 @@ async function main() {
           console.log('\n\u26A0\ufe0f  Write completeness check:');
           console.log(writeIncompleteError.message);
           
-          console.log('\nThe write operation needs a few more values:');
-          
           // Get the write payload to determine table and column types
           const writeNode = plan.graph.nodes.get(writeIncompleteError.stepId!);
           const writePayload = writeNode?.kind === 'write' ? writeNode.payload as WritePayload : null;
           const tableColumns = writePayload?.table ? (crmSchema as any).parsed?.tables.get(writePayload.table)?.columns : undefined;
           
-          const collectedValues: Record<string, any> = {};
-          let cancelled = false;
-                    for (const col of writeIncompleteError.missingColumns) {
-            if (cancelled) break;
-            const label = 'nullable' in col ? (col.nullable ? '(optional)' : '(required)') : '(required)';
-            const description = 'description' in col ? col.description : 'Required field';
-            const colDef = tableColumns?.get(col.column);
-            const colType = colDef?.type ?? 'TEXT';
-            
-            // Get enum values from schema traits if available
-            const traits = writePayload?.table ? (crmSchema as any).traits.get(writePayload.table)?.get(col.column) : undefined;
-            const enumValues = traits?.enumValues;
-            
-            while (true) {
-              const value = await ask(`  ${col.column} (${colType}, required): `);
-              
-              if (value.trim().toLowerCase() === 'cancel') {
-                console.log('\nWrite cancelled.');
-                cancelled = true;
-                break;
-              }
-              if (!value.trim() && 'nullable' in col && !col.nullable) {
-                console.log('  This field is required, please enter a value.');
-                continue;
-              }
-              if (value.trim()) {
-                // Coerce to correct type before storing
-                try {
-                  const coerced = coerceColumnValue(value.trim(), colType, enumValues);
-                  if (coerced !== null) {
-                    collectedValues[col.column] = coerced;
-                  }
-                } catch (e) {
-                  console.log(`  Error: ${(e as Error).message}`);
-                  continue;
-                }
-              }
-              break;
-            }
+          // Detect single-row UPDATE
+          const isSingleRowUpdate = 
+            writePayload?.mode === 'update' &&
+            (
+              Object.keys(writePayload.staticWhere ?? {}).length === 1 ||
+              (writePayload.whereColumns?.length === 1 && 
+               Object.keys(writePayload.staticValues ?? {}).some(k => 
+                 k === 'id' || k.endsWith('_id')
+               ))
+            );
+
+          // Pre-fetch current row for single-row UPDATE
+          const whereClause = writePayload?.staticWhere ?? {};
+          const currentRow = isSingleRowUpdate && writePayload?.table
+            ? await fetchCurrentRow(writePayload.table, whereClause)
+            : null;
+
+          // Display current row if found
+          if (currentRow) {
+            displayCurrentRow(currentRow);
+          } else if (isSingleRowUpdate) {
+            console.warn(
+              '⚠️  Multi-row update detected. ' +
+              'Changes will apply to all matching rows.'
+            );
           }
           
-          if (cancelled) continue;
+          // Build field manifest
+          const requiredFields: FieldPrompt[] = [];
+          const optionalFields: FieldPrompt[] = [];
+
+          for (const col of writeIncompleteError.missingColumns) {
+            // Skip auto-managed columns
+            if (['id', 'created_at', 'updated_at', 'deleted_at', 'converted_at'].includes(col.column)) {
+              continue;
+            }
+
+            const colDef = tableColumns?.get(col.column);
+            const colTraits = writePayload?.table
+              ? (crmSchema as any).traits.get(writePayload.table)?.get(col.column)
+              : undefined;
+
+            const field: FieldPrompt = {
+              column:       col.column,
+              type:         colDef?.type ?? 'TEXT',
+              required:     !('nullable' in col) || !col.nullable,
+              defaultValue: colDef?.defaultRaw ?? null,
+              enumValues:   colTraits?.enumValues ?? [],
+              fkTarget:     colTraits?.foreignKey
+                ? { table: colTraits.foreignKey.references, 
+                    column: colTraits.foreignKey.column }
+                : null,
+            };
+
+            if (field.required) {
+              requiredFields.push(field);
+            } else {
+              optionalFields.push(field);
+            }
+          }
+
+          // Collect values from user using structured form
+          const collectedValues = await collectFieldsFromUser(
+            requiredFields, 
+            optionalFields,
+            currentRow
+          );
+          
+          // For UPDATE: diff against current row and only include changed fields
+          let finalValues = collectedValues;
+          if (isSingleRowUpdate && currentRow) {
+            const changedFields: Record<string, any> = {};
+            
+            for (const [col, newVal] of Object.entries(collectedValues)) {
+              const oldVal = currentRow[col];
+              
+              // Include if value changed or was not in current row
+              const changed = String(newVal) !== String(oldVal ?? '');
+              if (changed) {
+                changedFields[col] = newVal;
+              }
+            }
+            
+            // Always include the intent's explicit changes
+            const intentFields = writePayload?.staticValues ?? {};
+            for (const [col, val] of Object.entries(intentFields)) {
+              // Skip auto-injected system columns
+              if (['workspace_id', 'created_at', 'updated_at'].includes(col)) continue;
+              changedFields[col] = val;
+            }
+            
+            console.log('\n📝 Changes to apply:');
+            for (const [col, val] of Object.entries(changedFields)) {
+              if (col === 'updated_at') continue;
+              const oldVal = currentRow[col];
+              console.log(
+                `  ${col.padEnd(25)} ${String(oldVal ?? 'null')} → ${String(val)}` 
+              );
+            }
+            console.log('');
+            
+            finalValues = changedFields;
+          }
           
           // Patch the existing plan in place - no re-planning
           const enrichedPlan = engine.planWithMissingValues(
             plan,                                    // pass full plan
             writeIncompleteError.stepId!,
-            collectedValues
+            finalValues
           );
           
           plan.intent = enrichedPlan.intent;
@@ -563,11 +820,6 @@ async function main() {
           console.log(`\n\u26A0\ufe0f  Write field resolution failed for step '${writeFieldUnresolvableError.stepId}':`);
           console.log(writeFieldUnresolvableError.message);
           
-          console.log('\nThe write operation needs a few more values:');
-          
-          const collectedValues: Record<string, any> = {};
-          let cancelled = false;
-          
           // Resolve table column definitions once for filtering
           const _writeNode = plan.graph.nodes.get(writeFieldUnresolvableError.stepId!);
           const _writePayload = _writeNode?.kind === 'write'
@@ -577,81 +829,117 @@ async function main() {
             ? (crmSchema as any).parsed?.tables.get(_writePayload.table)?.columns
             : undefined;
 
-          // Filter: only prompt for columns that are truly required
-          // Skip nullable columns and columns with schema defaults
-          const mustPromptCols = writeFieldUnresolvableError.missingColumns.filter(col => {
-            if (!('table' in col)) return false;
-            const colDef = _tableColumns?.get(col.column);
-            if (!colDef) return true;            // unknown — prompt to be safe
-            if (colDef.nullable) return false;   // nullable → optional
-            if (colDef.defaultRaw !== null) return false;  // has DB default → optional
-            return true;
-          });
+          // Detect single-row UPDATE
+          const isSingleRowUpdate = 
+            _writePayload?.mode === 'update' &&
+            (
+              Object.keys(_writePayload.staticWhere ?? {}).length === 1 ||
+              (_writePayload.whereColumns?.length === 1 && 
+               Object.keys(_writePayload.staticValues ?? {}).some(k => 
+                 k === 'id' || k.endsWith('_id')
+               ))
+            );
 
-          const skippedCols = writeFieldUnresolvableError.missingColumns
-            .filter(col => 'table' in col && !mustPromptCols.includes(col))
-            .map((col: any) => col.column);
+          // Pre-fetch current row for single-row UPDATE
+          const whereClause = _writePayload?.staticWhere ?? {};
+          const currentRow = isSingleRowUpdate && _writePayload?.table
+            ? await fetchCurrentRow(_writePayload.table, whereClause)
+            : null;
 
-          if (skippedCols.length > 0) {
-            console.log(
-              `[WriteCompleteness] Skipping optional/defaulted columns: ${skippedCols.join(', ')}` 
+          // Display current row if found
+          if (currentRow) {
+            displayCurrentRow(currentRow);
+          } else if (isSingleRowUpdate) {
+            console.warn(
+              '⚠️  Multi-row update detected. ' +
+              'Changes will apply to all matching rows.'
             );
           }
 
-          if (mustPromptCols.length === 0) {
-            console.log('[WriteCompleteness] All required values provided!');
-            // skip the prompt loop entirely, fall through to execution
-          }
+          // Build field manifest from ALL missing columns
+          const requiredFields: FieldPrompt[] = [];
+          const optionalFields: FieldPrompt[] = [];
 
-          for (const col of mustPromptCols) {
-            if (cancelled) break;
-            if ('table' in col) {
-              console.log(`   \u2717 '${col.column}' not found for table '${col.table}'`);
-              console.log(`     \u2192 ${col.suggestion}`);
-              
-              while (true) {
-                const value = await ask(`  ${col.column} (required) - ${col.suggestion}: `);
-                
-                if (value.trim().toLowerCase() === 'cancel') {
-                  console.log('\nWrite cancelled.');
-                  cancelled = true;
-                  break;
-                }
-                if (!value.trim()) {
-                  console.log('  This field is required, please enter a value.');
-                  continue;
-                }
-                if (value.trim()) {
-                  const colDef = _tableColumns?.get(col.column);
-                  const colType = colDef?.type ?? 'TEXT';
-                  const colTraits = _writePayload?.table
-                    ? (crmSchema as any).traits?.get(_writePayload.table)?.get(col.column)
-                    : undefined;
-                  const enumValues = colTraits?.enumValues;
-                  console.log(`[DEBUG] Column ${col.column} has type: ${colType}`);
-                  try {
-                    const coerced = coerceColumnValue(value.trim(), colType, enumValues);
-                    if (coerced !== null) {
-                      collectedValues[col.column] = coerced;
-                      console.log(`[DEBUG] Coerced ${col.column}: ${value.trim()} (${typeof value.trim()}) -> ${coerced} (${typeof coerced})`);
-                    }
-                  } catch (e) {
-                    console.log(`  Error: ${(e as Error).message}`);
-                    continue;
-                  }
-                }
-                break;
-              }
+          for (const col of writeFieldUnresolvableError.missingColumns) {
+            if (!('table' in col)) continue;
+
+            // Skip auto-managed columns
+            if (['id', 'created_at', 'updated_at', 'deleted_at', 'converted_at'].includes(col.column)) {
+              continue;
+            }
+
+            const colDef = _tableColumns?.get(col.column);
+            const colTraits = _writePayload?.table
+              ? (crmSchema as any).traits?.get(_writePayload.table)?.get(col.column)
+              : undefined;
+
+            const field: FieldPrompt = {
+              column:       col.column,
+              type:         colDef?.type ?? 'TEXT',
+              required:     !!(colDef && !colDef.nullable && colDef.defaultRaw === null),
+              defaultValue: colDef?.defaultRaw ?? null,
+              enumValues:   colTraits?.enumValues ?? [],
+              fkTarget:     colTraits?.foreignKey
+                ? { table: colTraits.foreignKey.references, 
+                    column: colTraits.foreignKey.column }
+                : null,
+            };
+
+            if (field.required) {
+              requiredFields.push(field);
+            } else {
+              optionalFields.push(field);
             }
           }
+
+          // Collect values from user using structured form
+          const collectedValues = await collectFieldsFromUser(
+            requiredFields, 
+            optionalFields,
+            currentRow
+          );
           
-          if (cancelled) continue;
+          // For UPDATE: diff against current row and only include changed fields
+          let finalValues = collectedValues;
+          if (isSingleRowUpdate && currentRow) {
+            const changedFields: Record<string, any> = {};
+            
+            for (const [col, newVal] of Object.entries(collectedValues)) {
+              const oldVal = currentRow[col];
+              
+              // Include if value changed or was not in current row
+              const changed = String(newVal) !== String(oldVal ?? '');
+              if (changed) {
+                changedFields[col] = newVal;
+              }
+            }
+            
+            // Always include the intent's explicit changes
+            const intentFields = _writePayload?.staticValues ?? {};
+            for (const [col, val] of Object.entries(intentFields)) {
+              // Skip auto-injected system columns
+              if (['workspace_id', 'created_at', 'updated_at'].includes(col)) continue;
+              changedFields[col] = val;
+            }
+            
+            console.log('\n📝 Changes to apply:');
+            for (const [col, val] of Object.entries(changedFields)) {
+              if (col === 'updated_at') continue;
+              const oldVal = currentRow[col];
+              console.log(
+                `  ${col.padEnd(25)} ${String(oldVal ?? 'null')} → ${String(val)}` 
+              );
+            }
+            console.log('');
+            
+            finalValues = changedFields;
+          }
           
           // Patch the existing plan in place - add missing values to staticValues
           const writeNode = plan.graph.nodes.get(writeFieldUnresolvableError.stepId!);
           if (writeNode && writeNode.kind === 'write') {
             const payload = writeNode.payload as WritePayload;
-            payload.staticValues = { ...payload.staticValues, ...collectedValues };
+            payload.staticValues = { ...payload.staticValues, ...finalValues };
             
             // Clear the compilation errors since we've resolved the missing fields
             plan.compilationErrors = [];
