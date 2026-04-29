@@ -563,7 +563,7 @@ export const crmSchema: SchemaConfig = {
             type: { kind: 'string' },
             nullable: false,
             hasDefault: true,
-            defaultValue: 'lead'
+            defaultValue: 'mql'
           },
           {
             name: 'source',

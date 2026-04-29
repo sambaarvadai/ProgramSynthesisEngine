@@ -16,6 +16,7 @@ export interface QueryIntentFilter {
   value?: Value | Value[];
   valueRef?: string; // reference to a pipeline variable instead of literal
   expr?: string; // raw SQL expression for complex filter values (e.g., "NOW() - INTERVAL 90 DAY")
+  caseInsensitive?: boolean; // enable case-insensitive matching for text columns
 }
 
 export interface QueryIntentJoin {

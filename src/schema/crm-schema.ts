@@ -12,6 +12,11 @@ const __dirname = dirname(__filename);
 const ddlPath = join(__dirname, '../../crm_postgres.sql');
 const ddl = readFileSync(ddlPath, 'utf-8');
 
+console.log('[crm-schema] Building schema from:', ddlPath);
+console.log('[crm-schema] DDL length:', ddl.length);
+
 export const crmSchema = buildSchemaFromSQL(ddl, {
   sessionAnchorTables: ['workspaces']
 });
+
+console.log('[crm-schema] Schema built, traits for contacts.lifecycle_stage:', JSON.stringify(crmSchema.traits.get('contacts')?.get('lifecycle_stage'), null, 2));

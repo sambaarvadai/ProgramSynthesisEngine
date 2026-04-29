@@ -74,11 +74,22 @@ export class QueryExecutor {
     const params: unknown[] = [];
     let sql = 'SELECT ';
     
+    // Create a map of table aliases (needed before SELECT columns)
+    const tableAliases = new Map<string, string>();
+    tableAliases.set(intent.table, intent.table);
+    if (intent.joins) {
+      for (const join of intent.joins) {
+        const alias = join.alias || join.table;
+        tableAliases.set(join.table, alias);
+      }
+    }
+    
     // Build SELECT columns
     const columns = intent.columns.map(col => {
       let field: string;
       if (col.table) {
-        field = `"${col.table}"."${col.field}"`;
+        const tableRef = tableAliases.get(col.table) || col.table;
+        field = `"${tableRef}"."${col.field}"`;
       } else if (col.field === '*') {
         field = '*';
       } else {
@@ -96,15 +107,10 @@ export class QueryExecutor {
     // Build FROM and JOINs
     sql += ` FROM "${intent.table}"`;
     
-    // Create a map of table aliases
-    const tableAliases = new Map<string, string>();
-    tableAliases.set(intent.table, intent.table);
-    
     if (intent.joins) {
       for (const join of intent.joins) {
         const joinKind = join.kind || 'INNER';
         const alias = join.alias || join.table;
-        tableAliases.set(join.table, alias);
         
         const onLeft = join.on?.left?.includes('.') ? 
           (() => {
@@ -169,6 +175,15 @@ export class QueryExecutor {
             return `${field} IS NULL`;
           } else if (f.operator === 'IS NOT NULL') {
             return `${field} IS NOT NULL`;
+          } else if (f.operator === 'IN' || f.operator === 'NOT IN') {
+            // Handle array values for IN/NOT IN
+            if (Array.isArray(f.value)) {
+              const values = f.value.map(v => typeof v === 'string' ? `'${v}'` : v).join(', ');
+              return `${field} ${f.operator} (${values})`;
+            } else {
+              const value = typeof f.value === 'string' ? `'${f.value}'` : f.value;
+              return `${field} ${f.operator} (${value})`;
+            }
           } else {
             const value = typeof f.value === 'string' ? `'${f.value}'` : f.value;
             return `${field} ${f.operator} ${value}`;
@@ -180,7 +195,15 @@ export class QueryExecutor {
     
     // Build GROUP BY
     if (intent.groupBy && intent.groupBy.length > 0) {
-      sql += ' GROUP BY ' + intent.groupBy.map(g => `"${g}"`).join(', ');
+      sql += ' GROUP BY ' + intent.groupBy.map(g => {
+        if (g.includes('.')) {
+          const [table, field] = g.split('.');
+          const tableRef = tableAliases.get(table) || table;
+          return `"${tableRef}"."${field}"`;
+        } else {
+          return `"${g}"`;
+        }
+      }).join(', ');
     }
     
     // Build ORDER BY

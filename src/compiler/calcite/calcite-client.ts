@@ -2,6 +2,28 @@ import type { QueryIntent } from '../query-ast/query-intent.js'
 import type { WritePayload } from '../../nodes/payloads.js'
 import type { SchemaConfig } from '../schema/schema-config.js'
 import { getAppConfig } from '../../config/app-config.js'
+import { buildWritePredicate, predicateToSQL } from '../../nodes/definitions/write-predicate-builder.js'
+
+/**
+ * Validate that params are compatible with Calcite
+ * Arrays should only be used with ANY($N) syntax, not as literal arrays
+ */
+function assertCalciteCompatibleParams(params: any[]): void {
+  for (let i = 0; i < params.length; i++) {
+    const p = params[i];
+    if (Array.isArray(p)) {
+      // Arrays are only valid as $N in ANY($N) context
+      // Calcite handles this if the SQL uses ANY() syntax
+      // If the SQL uses [1,2] literal instead — that's the bug
+      // We can't detect that here without parsing the SQL
+      // So just log it for visibility
+      console.log(
+        `[CalciteClient] Param $${i+1} is array (${p.length} elements) ` +
+        `— ensure SQL uses ANY($${i+1}) not literal array syntax`
+      );
+    }
+  }
+}
 
 export type CalciteCompileResult = {
   sql: string
@@ -105,13 +127,41 @@ export class CalciteClient {
     payload: WritePayload,
     schema: SchemaConfig
   ): Promise<CalciteCompileResult> {
+    // Check for array values in staticWhere - Calcite can't handle IN/ANY arrays
+    const hasArrayWhere = Object.values(payload.staticWhere ?? {})
+      .some(v => Array.isArray(v) && v.length > 1);
+
+    if (hasArrayWhere) {
+      // Calcite staticWhere can't handle IN/ANY arrays
+      // Skip Calcite, use fallback directly
+      throw new Error('SKIP_CALCITE: array WHERE requires fallback');
+    }
+
+    // Separate literal values from SQL expressions in staticSets
+    const SQL_EXPRESSIONS = new Set([
+      'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE',
+      'CURRENT_USER', 'gen_random_uuid()'
+    ]);
+
+    const staticSets: Record<string, any> = {};
+    const sqlExprSets: Record<string, string> = {};
+
+    for (const [col, val] of Object.entries(payload.staticValues ?? {})) {
+      if (typeof val === 'string' && SQL_EXPRESSIONS.has(val.trim())) {
+        sqlExprSets[col] = val.trim();    // SQL expression
+      } else {
+        staticSets[col] = val;           // literal value
+      }
+    }
+
     const body = {
       schema: schemaToCalcite(schema, null, payload.table),
       table: payload.table, // Keep original case
       setColumns: payload.columns,
-      staticSets: payload.staticValues,
+      staticSets: staticSets,
+      sqlExprSets: sqlExprSets,
+      staticWhere: payload.staticWhere,
       whereColumns: payload.whereColumns ?? [],
-      whereFilters: payload.staticWhere ?? {},
       dialect: 'POSTGRESQL'
     }
     return this.post('/compile/update', body)

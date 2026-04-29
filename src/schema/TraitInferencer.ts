@@ -58,6 +58,7 @@ export function inferTraits(
       ) {
         colTraits.trait = 'system_audited';
         // resolvedValue = session.userId at runtime
+        console.log(`[TraitInferencer] Set system_audited trait for ${tableName}.${columnName}`);
       }
 
       // --- soft_delete_marker ---
@@ -123,6 +124,12 @@ export function inferTraits(
 
       if (colDef.unique) colTraits.unique = true;
       if (colDef.defaultRaw !== null) colTraits.default = colDef.defaultRaw;
+
+      // Debug: log lifecycle_stage trait
+      if (columnName === 'lifecycle_stage' && tableName === 'contacts') {
+        console.log('[TraitInferencer] contacts.lifecycle_stage trait:', JSON.stringify(colTraits, null, 2));
+        console.log('[TraitInferencer] contacts.lifecycle_stage colDef:', JSON.stringify(colDef, null, 2));
+      }
 
       tableTraits.set(columnName, colTraits);
     }

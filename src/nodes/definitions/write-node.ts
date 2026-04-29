@@ -25,12 +25,13 @@ import type { CalciteClient } from '../../compiler/calcite/index.js'
 import { validationOk, validationFail } from '../../core/types/validation.js'
 import type { SessionCursorStore } from '../../session/SessionCursor.js'
 import { buildWhereFromCursor } from '../../session/SessionCursor.js'
-import { 
+import {
   classifyAllColumns,
   getBlockedOnUpdate,
   type SessionContext
 } from '../../schema/ColumnClassifier.js'
 import { crmSchema } from '../../schema/crm-schema.js'
+import { buildWritePredicate, predicateToSQL } from './write-predicate-builder.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -106,7 +107,7 @@ export function createWriteNodeDefinition(
       // ColumnClassifier: strip immutable columns from UPDATE
       if (payload.mode === 'update' && payload.table && (crmSchema as any).parsed?.tables.has(payload.table)) {
         const sessionCtx: SessionContext = {
-          userId: 1,  // Default for now - should come from context
+          userId: _ctx.userId ? parseInt(_ctx.userId, 10) : 1,  // Use userId from execution context
           anchorIds: { workspaces: Number(1) }
         };
         const classifications = classifyAllColumns(payload.table, crmSchema, sessionCtx, 'update');
@@ -244,7 +245,15 @@ export function createWriteNodeDefinition(
             const allParams = [...dynamicParams, ...compiled.staticParams]
             const result = await pool.query(compiled.sql, allParams)
             console.log(`[WriteNode] Calcite ${payload.mode} on ${payload.table}: ${result.rowCount} rows affected`)
-            return input
+
+            const rowsAffected = result.rowCount ?? result.rowsAffected ?? 0;
+
+            const filteredStaticValues = Object.fromEntries(
+              Object.entries(payload.staticValues ?? {})
+                .filter(([k]) => k !== 'workspace_id')
+            );
+
+            return createWriteSummaryResult(payload.table, payload.mode, rowsAffected, payload.staticWhere, filteredStaticValues);
           }
           
           // Per-row iteration (dynamic WHERE from input rows)
@@ -337,7 +346,7 @@ export function createWriteNodeDefinition(
               break
             case 'update':
               console.log(`[WriteNode] Running UPDATE on ${payload.table}`);
-              await runUpdate(backend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning)
+              await runUpdate(backend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning, payload)
               console.log(`[WriteNode] UPDATE completed successfully`);
               break
             case 'upsert':
@@ -405,13 +414,16 @@ export function createWriteNodeDefinition(
           return input
         }
         // Has values and WHERE - proceed even if dynamicColumns is empty
-      } else if (!effectiveColumns.length && payload.mode !== 'delete') {
-        console.log(`[WriteNode] No effective columns and not delete mode, returning early`);
+      } else if (!effectiveColumns.length && payload.mode !== 'delete' && !payload.staticValues) {
+        // Only return early if there are no effective columns AND no static values
+        console.log(`[WriteNode] No effective columns and no static values, returning early`);
         return input
       }
 
       const batchSize = payload.batchSize ?? 100
       console.log(`[WriteNode] Fallback executing ${payload.mode} with ${dataRows.length} rows`);
+
+      let rowsAffected = 0; // Track actual rows affected for summary
 
       try {
         switch (payload.mode) {
@@ -427,48 +439,101 @@ export function createWriteNodeDefinition(
 
           case 'update':
             console.log(`[WriteNode] Fallback running UPDATE on ${payload.table}`);
-            
+
             // Handle pure-static UPDATE (no dynamic columns, only staticValues)
             if (dynamicColumns.length === 0 && Object.keys(payload.staticValues ?? {}).length > 0) {
-              const setClauses = Object.entries(payload.staticValues ?? {})
-                .map(([col, val], i) => `"${col}" = $${i + 1}`)
-                .join(', ')
-              const setParams = Object.values(payload.staticValues ?? {})
-              
-              const whereClauses: string[] = []
-              const whereParams: any[] = []
-              
-              // Static WHERE conditions
-              for (const [col, val] of Object.entries(payload.staticWhere ?? {})) {
-                whereClauses.push(`"${col}" = $${setParams.length + whereParams.length + 1}`)
-                whereParams.push(val)
+              // Build predicate from staticWhere if wherePredicate not set
+              const predicate = payload.wherePredicate
+                ?? buildWritePredicate(payload.staticWhere ?? {});
+
+              if (!predicate && payload.mode === 'update') {
+                // No WHERE clause on UPDATE — require explicit confirmation
+                throw new Error(
+                  'UPDATE without WHERE clause is not permitted. ' +
+                  'Provide a filter to identify which rows to update.'
+                );
               }
-              
-              // Dynamic WHERE conditions (if any)
-              if (payload.whereColumns && payload.whereColumns.length > 0 && dataRows.length > 0) {
-                const firstRow = dataRows[0]
-                for (const col of payload.whereColumns) {
-                  if (col in firstRow) {
-                    whereClauses.push(`"${col}" = $${setParams.length + whereParams.length + 1}`)
-                    whereParams.push(firstRow[col])
-                  }
+
+              // Resolve SET values: prioritize upstream data, then staticValues
+              const resolvedValues: Record<string, any> = {};
+              const whereKeys = new Set(Object.keys(payload.staticWhere ?? {}));
+
+              // For each column in payload.columns (dynamic columns):
+              for (const col of payload.columns) {
+                // Check upstream row first
+                const alias = payload.columnAliases?.[col];
+                const upstreamField = alias ?? col;
+
+                if (dataRows.length > 0 && dataRows[0][upstreamField] !== undefined) {
+                  // Use upstream value — this is the intended data flow
+                  resolvedValues[col] = dataRows[0][upstreamField];
+                  console.log(`[WriteNode] Resolved '${col}' from upstream field '${upstreamField}': ${resolvedValues[col]}`);
+                } else if (payload.staticValues?.[col] !== undefined && !whereKeys.has(col)) {
+                  // Fall back to staticValue only if not in upstream and not a WHERE key
+                  resolvedValues[col] = payload.staticValues[col];
+                  console.log(`[WriteNode] Resolved '${col}' from staticValues: ${resolvedValues[col]}`);
+                } else {
+                  // Column has no value — drop it
+                  console.log(`[WriteNode] Dropping column '${col}' - not resolvable`);
                 }
               }
-              
-              if (whereClauses.length === 0) {
-                throw new Error('UPDATE requires WHERE clause')
+
+              // Static-only columns (not in payload.columns but in staticValues):
+              for (const [col, val] of Object.entries(payload.staticValues ?? {})) {
+                if (!payload.columns.includes(col) && !(col in resolvedValues) && !whereKeys.has(col)) {
+                  resolvedValues[col] = val;
+                  console.log(`[WriteNode] Added static-only column '${col}': ${val}`);
+                }
               }
-              
-              const sql = `UPDATE "${payload.table}" SET ${setClauses} WHERE ${whereClauses.join(' AND ')}` 
-              const params = [...setParams, ...whereParams]
-              
-              console.log('[WriteNode] Pure-static UPDATE SQL:', sql)
-              console.log('[WriteNode] Pure-static UPDATE params:', params)
-              
-              await backend.rawQuery(sql, params)
+
+              // SQL expressions that must be embedded directly
+              // not passed as string parameters
+              const SQL_EXPRESSIONS = new Set([
+                'NOW()',
+                'CURRENT_TIMESTAMP', 
+                'CURRENT_DATE',
+                'CURRENT_USER',
+                'gen_random_uuid()'
+              ]);
+
+              const setClauses: string[] = [];
+              const setParams: any[] = [];
+              let paramIndex = 1;
+
+              for (const [col, val] of Object.entries(resolvedValues)) {
+                if (typeof val === 'string' && SQL_EXPRESSIONS.has(val.trim())) {
+                  // Embed directly as SQL expression — no parameter
+                  setClauses.push(`"${col}" = ${val.trim()}`);
+                  // do NOT push to params, do NOT increment paramIndex
+                } else {
+                  setClauses.push(`"${col}" = $${paramIndex}`);
+                  setParams.push(val);
+                  paramIndex++;
+                }
+              }
+
+              const setClause = setClauses.join(', ');
+
+              // Build WHERE clause from predicate
+              const whereResult = predicate
+                ? predicateToSQL(predicate, setParams.length + 1)
+                : null;
+
+              const sql = whereResult
+                ? `UPDATE "${payload.table}" SET ${setClause} WHERE ${whereResult.sql}`
+                : `UPDATE "${payload.table}" SET ${setClause}`;
+
+              const params = [...setParams, ...(whereResult?.params ?? [])];
+
+              console.log(`[WriteNode] Bulk UPDATE SQL: ${sql}`);
+              console.log(`[WriteNode] Bulk UPDATE params: ${JSON.stringify(params)}`);
+
+              const result = await backend.rawQuery(sql, params);
+              rowsAffected = result.rowCount ?? 0;
+              console.log(`[WriteNode] ${result.rowCount} rows affected`);
             } else {
               // Standard UPDATE with dynamic columns
-              await runUpdate(backend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning)
+              await runUpdate(backend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning, payload)
             }
             break
 
@@ -501,10 +566,8 @@ export function createWriteNodeDefinition(
 
       // For UPDATE/DELETE operations, return summary result instead of input rows
       if (payload.mode === 'update' || payload.mode === 'delete') {
-        // Note: For fallback execution, we don't have accurate rowsAffected count
-        // Using 0 as placeholder - in real implementation, this should be tracked
         console.log(`[WriteNode] Fallback returning summary for ${payload.mode}`);
-        return createWriteSummaryResult(payload.table, payload.mode, 0, payload.staticWhere, payload.staticValues)
+        return createWriteSummaryResult(payload.table, payload.mode, rowsAffected, payload.staticWhere, payload.staticValues)
       }
       
       // Pass input through unchanged for INSERT operations - downstream nodes see what was written
@@ -532,19 +595,33 @@ function getColumnValue(
   col: string,
   row: Record<string, any>,
   staticValues?: Record<string, any>,
-  columnAliases?: Record<string, string>
+  columnAliases?: Record<string, string>,
+  isDynamicColumn: boolean = false
 ): any {
-  // Check staticValues first (highest priority)
-  if (staticValues && col in staticValues) return staticValues[col]
-  
-  // Check direct column match in row
-  if (col in row) return row[col]
-  
-  // Check alias match
-  const aliasedField = columnAliases?.[col]
-  if (aliasedField && aliasedField in row) return row[aliasedField]
-  
-  // 4. Not found
+  // For dynamic columns, check upstream row data first (higher priority than staticValues)
+  if (isDynamicColumn) {
+    // Check direct column match in row
+    if (col in row) return row[col]
+
+    // Check alias match
+    const aliasedField = columnAliases?.[col]
+    if (aliasedField && aliasedField in row) return row[aliasedField]
+
+    // Fall back to staticValues if no upstream data
+    if (staticValues && col in staticValues) return staticValues[col]
+  } else {
+    // For static columns, staticValues takes priority
+    if (staticValues && col in staticValues) return staticValues[col]
+
+    // Check direct column match in row
+    if (col in row) return row[col]
+
+    // Check alias match
+    const aliasedField = columnAliases?.[col]
+    if (aliasedField && aliasedField in row) return row[aliasedField]
+  }
+
+  // Not found
   return undefined
 }
 
@@ -617,9 +694,9 @@ function prepareRows(
   
   // Calculate effectiveColumns using the same resolution logic as row building
   const effectiveColumns = payload.columns.filter(col => {
-    const value = getColumnValue(col, firstRow, payload.staticValues, payload.columnAliases)
+    const value = getColumnValue(col, firstRow, payload.staticValues, payload.columnAliases, true)
     if (value !== undefined) return true
-    
+
     console.warn(`[WriteNode] Dropping column '${col}' - not resolvable`)
     return false
   })
@@ -635,10 +712,10 @@ function prepareRows(
   // Merge static values into each row
   const dataRows = inputRows.map((row, index) => {
     const mergedRow: Row = {}
-    
+
     // Resolve each column through the proper hierarchy
     for (const col of payload.columns) {
-      const value = getColumnValue(col, row, payload.staticValues, payload.columnAliases)
+      const value = getColumnValue(col, row, payload.staticValues, payload.columnAliases, true)
       if (value !== undefined) {
         mergedRow[col] = resolveValue(value)
       }
@@ -733,6 +810,7 @@ async function runUpdate(
   rows: Row[],
   whereColumns: string[],
   returning?: string[],
+  payload?: WritePayload
 ): Promise<void> {
   // Validate whereColumns are in the rows
   const firstRow = rows[0]
@@ -755,6 +833,16 @@ async function runUpdate(
 
   const returningClause = returning?.length ? ` RETURNING ${returning.map(qi).join(', ')}` : ''
 
+  // Build predicate from staticWhere if available
+  const predicate = payload?.wherePredicate
+    ?? buildWritePredicate(payload?.staticWhere ?? {});
+
+  if (!predicate && payload?.mode === 'update' && whereColumns.length === 0) {
+    throw new Error(
+      `UPDATE on ${table} refused — no WHERE clause`
+    );
+  }
+
   // Execute one UPDATE per row (each row may match different WHERE values)
   for (const row of rows) {
     const params: unknown[] = []
@@ -764,10 +852,26 @@ async function runUpdate(
       return `${qi(col)} = $${params.length}`
     }).join(', ')
 
-    const whereClause = whereColumns.map(col => {
-      params.push(row[col])
-      return `${qi(col)} = $${params.length}`
-    }).join(' AND ')
+    // Build WHERE clause using predicateToSQL for static conditions,
+    // or dynamic whereColumns for row-specific conditions
+    let whereClause: string;
+    if (predicate) {
+      // Static WHERE conditions from predicateToSQL
+      const setParamCount = actualSetCols.length;
+      const whereResult = predicateToSQL(predicate, setParamCount + 1);
+      whereClause = whereResult.sql;
+      params.push(...whereResult.params);
+    } else if (whereColumns.length > 0) {
+      // Dynamic WHERE conditions from row values
+      whereClause = whereColumns.map(col => {
+        params.push(row[col])
+        return `${qi(col)} = $${params.length}`
+      }).join(' AND ');
+    } else {
+      throw new Error(
+        `UPDATE on ${table} refused — no WHERE clause`
+      );
+    }
 
     const sql = `UPDATE ${qi(table)} SET ${setClause} WHERE ${whereClause}${returningClause}`
     await backend.rawQuery(sql, params)

@@ -8,6 +8,7 @@ import type { RowSchema } from '../core/types/schema.js';
 import type { Value } from '../core/types/value.js';
 import type { EngineType } from '../core/types/engine-type.js';
 import type { ExprAST } from '../core/ast/expr-ast.js';
+import { isTextColumn, normalizeStringParam } from './column-type-helper.js';
 
 interface PoolConfig {
   max?: number;
@@ -91,7 +92,7 @@ export class PostgresBackend implements StorageBackend {
 
       if (opts.predicate && this.isSimplePredicate(opts.predicate)) {
         console.log(`[PostgresBackend] Processing predicate:`, JSON.stringify(opts.predicate, null, 2));
-        const { clause, params: sqlParams } = this.predicateToSQL(opts.predicate, []);
+        const { clause, params: sqlParams } = this.predicateToSQL(opts.predicate, [], opts.table);
         console.log(`[PostgresBackend] Generated WHERE clause:`, clause);
         console.log(`[PostgresBackend] WHERE params:`, sqlParams);
         whereClause = `WHERE ${clause}`;
@@ -332,7 +333,7 @@ export class PostgresBackend implements StorageBackend {
 
   private isSimplePredicate(pred: ExprAST): boolean {
     try {
-      this.predicateToSQL(pred, []);
+      this.predicateToSQL(pred, [], '');
       return true;
     } catch {
       return false; // Only throws for VarRef, WindowExpr, unknown functions
@@ -341,7 +342,8 @@ export class PostgresBackend implements StorageBackend {
 
   private predicateToSQL(
     pred: ExprAST,
-    params: Value[] = []
+    params: Value[] = [],
+    tableName: string = ''
   ): { clause: string; params: Value[] } {
     const addParam = (value: Value): string => {
       params.push(value);
@@ -375,8 +377,8 @@ export class PostgresBackend implements StorageBackend {
       }
 
       case 'BinaryOp': {
-        const left = this.predicateToSQL(pred.left, params);
-        const right = this.predicateToSQL(pred.right, params);
+        const left = this.predicateToSQL(pred.left, params, tableName);
+        const right = this.predicateToSQL(pred.right, params, tableName);
 
         // Arithmetic operators
         if (['+', '-', '*', '/', '%'].includes(pred.op)) {
@@ -398,6 +400,17 @@ export class PostgresBackend implements StorageBackend {
           if (pred.op === '!=' && pred.right.kind === 'SqlExpr') {
             return { clause: `${left.clause} NOT IN ${(pred.right as any).sql}`, params };
           }
+
+          // Case-insensitive matching for string columns
+          if ((pred.op === '=' || pred.op === '!=') && pred.left.kind === 'FieldRef') {
+            const fieldRef = pred.left;
+            const fieldTableName = fieldRef.table || tableName;
+            if (isTextColumn(fieldTableName, fieldRef.field)) {
+              const op = pred.op;
+              return { clause: `(LOWER(${left.clause}) ${op} LOWER(${right.clause}))`, params };
+            }
+          }
+
           return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
         }
 
@@ -411,7 +424,8 @@ export class PostgresBackend implements StorageBackend {
 
         // String operators
         if (pred.op === 'LIKE') {
-          return { clause: `(${left.clause} LIKE ${right.clause})`, params };
+          // Always use ILIKE for case-insensitive pattern matching
+          return { clause: `(${left.clause} ILIKE ${right.clause})`, params };
         }
         if (pred.op === 'CONCAT') {
           return { clause: `(${left.clause} || ${right.clause})`, params };
@@ -421,7 +435,7 @@ export class PostgresBackend implements StorageBackend {
       }
 
       case 'UnaryOp': {
-        const operand = this.predicateToSQL(pred.operand, params);
+        const operand = this.predicateToSQL(pred.operand, params, tableName);
         if (pred.op === 'NOT') {
           return { clause: `NOT (${operand.clause})`, params };
         }
@@ -432,7 +446,7 @@ export class PostgresBackend implements StorageBackend {
       }
 
       case 'FunctionCall': {
-        const args = pred.args.map(arg => this.predicateToSQL(arg, params).clause);
+        const args = pred.args.map(arg => this.predicateToSQL(arg, params, tableName).clause);
         
         // Map common function names to SQL equivalents
         const sqlFunction = pred.name.toUpperCase();
@@ -449,9 +463,9 @@ export class PostgresBackend implements StorageBackend {
       }
 
       case 'Conditional': {
-        const condition = this.predicateToSQL(pred.condition, params);
-        const thenClause = this.predicateToSQL(pred.then, params);
-        const elseClause = this.predicateToSQL(pred.else, params);
+        const condition = this.predicateToSQL(pred.condition, params, tableName);
+        const thenClause = this.predicateToSQL(pred.then, params, tableName);
+        const elseClause = this.predicateToSQL(pred.else, params, tableName);
         return {
           clause: `(CASE WHEN ${condition.clause} THEN ${thenClause.clause} ELSE ${elseClause.clause} END)`,
           params
@@ -459,34 +473,48 @@ export class PostgresBackend implements StorageBackend {
       }
 
       case 'IsNull': {
-        const operand = this.predicateToSQL(pred.expr, params);
+        const operand = this.predicateToSQL(pred.expr, params, tableName);
         return { clause: `(${operand.clause} IS NULL)`, params };
       }
 
       case 'In': {
-        const expr = this.predicateToSQL(pred.expr, params);
+        const expr = this.predicateToSQL(pred.expr, params, tableName);
+        
+        // Check if this is a text column for case-insensitive matching
+        const isText = pred.expr.kind === 'FieldRef' && 
+          isTextColumn((pred.expr as any).table || tableName, (pred.expr as any).field);
+        
         const values = pred.values.map(v => {
           if (v.kind === 'Literal') {
             const value = v.value;
             if (typeof value === 'number') {
               return `${addParam(value)}::numeric`;
             }
+            // Normalize string values to lowercase for text columns
+            if (isText && typeof value === 'string') {
+              return addParam(value.toLowerCase());
+            }
             return addParam(value);
           }
           throw new Error('IN operator only supports literal values');
         });
-        return { clause: `(${expr.clause} IN (${values.join(', ')}))`, params };
+        
+        const clause = isText 
+          ? `(LOWER(${expr.clause}) IN (${values.join(', ')}))`
+          : `(${expr.clause} IN (${values.join(', ')}))`;
+        
+        return { clause, params };
       }
 
       case 'Between': {
-        const expr = this.predicateToSQL(pred.expr, params);
-        const low = this.predicateToSQL(pred.low, params);
-        const high = this.predicateToSQL(pred.high, params);
+        const expr = this.predicateToSQL(pred.expr, params, tableName);
+        const low = this.predicateToSQL(pred.low, params, tableName);
+        const high = this.predicateToSQL(pred.high, params, tableName);
         return { clause: `(${expr.clause} BETWEEN ${low.clause} AND ${high.clause})`, params };
       }
 
       case 'Cast': {
-        const expr = this.predicateToSQL(pred.expr, params);
+        const expr = this.predicateToSQL(pred.expr, params, tableName);
         const pgType = this.engineTypeToPostgres(pred.to);
         return { clause: `(${expr.clause}::${pgType})`, params };
       }
@@ -497,58 +525,6 @@ export class PostgresBackend implements StorageBackend {
 
       case 'SqlExpr': {
         return { clause: (pred as any).sql, params };
-      }
-
-      case 'BinaryOp': {
-        const left = this.predicateToSQL(pred.left, params);
-        const right = this.predicateToSQL(pred.right, params);
-
-        // Arithmetic operators
-        if (['+', '-', '*', '/', '%'].includes(pred.op)) {
-          return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
-        }
-
-        // Comparison operators
-        if (['=', '!=', '<', '>', '<=', '>='].includes(pred.op)) {
-          // Special case for NULL comparisons
-          if (pred.right.kind === 'Literal' && pred.right.value === null) {
-            if (pred.op === '=') {
-              return { clause: `(${left.clause} IS NULL)`, params };
-            }
-            if (pred.op === '!=') {
-              return { clause: `(${left.clause} IS NOT NULL)`, params };
-            }
-          }
-          // Special case for NOT IN with SqlExpr (subquery)
-          if (pred.op === '!=' && pred.right.kind === 'SqlExpr') {
-            const fieldRef = pred.left as any;
-            const sqlExpr = pred.right as any;
-            const field = fieldRef.table 
-              ? `"${fieldRef.table}"."${fieldRef.field}"` 
-              : `"${fieldRef.field}"`;
-            const op = sqlExpr.sqlOp ?? 'IN';
-            return { clause: `${field} ${op} ${sqlExpr.sql}`, params };
-          }
-          return { clause: `(${left.clause} ${pred.op} ${right.clause})`, params };
-        }
-
-        // Logical operators
-        if (pred.op === 'AND') {
-          return { clause: `(${left.clause} AND ${right.clause})`, params };
-        }
-        if (pred.op === 'OR') {
-          return { clause: `(${left.clause} OR ${right.clause})`, params };
-        }
-
-        // String operators
-        if (pred.op === 'LIKE') {
-          return { clause: `(${left.clause} LIKE ${right.clause})`, params };
-        }
-        if (pred.op === 'CONCAT') {
-          return { clause: `(${left.clause} || ${right.clause})`, params };
-        }
-
-        throw new Error(`Unsupported binary operator: ${pred.op}`);
       }
 
       case 'Wildcard': {

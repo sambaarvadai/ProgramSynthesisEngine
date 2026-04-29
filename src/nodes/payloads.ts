@@ -140,12 +140,25 @@ export type SubPipelinePayload = {
 
 export type WriteMode = 'insert' | 'update' | 'upsert' | 'insert_ignore' | 'delete';
 
+// Full predicate AST for WHERE clause
+export type WritePredicate =
+  | { kind: 'eq'; column: string; value: any }
+  | { kind: 'in'; column: string; values: any[] }
+  | { kind: 'any'; column: string; values: any[] }
+  | { kind: 'range'; column: string; min: any; max: any }
+  | { kind: 'isNull'; column: string }
+  | { kind: 'notNull'; column: string }
+  | { kind: 'and'; left: WritePredicate; right: WritePredicate }
+  | { kind: 'or'; left: WritePredicate; right: WritePredicate }
+  | { kind: 'raw'; sql: string; params: any[] };
+
 export type WritePayload = {
   table: string;
   mode: WriteMode;
   columns: string[];
   staticValues?: Record<string, unknown>;
-  staticWhere?: Record<string, unknown>;
+  staticWhere?: Record<string, unknown>;  // keep for backward compat
+  wherePredicate?: WritePredicate;        // new — full predicate AST
   conflictColumns?: string[];
   updateColumns?: string[];
   whereColumns?: string[];

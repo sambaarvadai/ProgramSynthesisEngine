@@ -218,13 +218,30 @@ export class SchemaValidator {
 
     // Validate static values for column types
     const tableColumnNames = new Set(tableColumns.keys());
+    const dynamicColumns = new Set(payload.columns || []);
     for (const [column, value] of Object.entries(payload.staticValues || {})) {
       if (tableColumns.has(column)) {
+        // Skip type checking for columns that are also in dynamic columns array
+        // (will be resolved from upstream data at runtime)
+        if (dynamicColumns.has(column)) {
+          console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
+            `column is dynamic (will be resolved from upstream)`)
+          continue
+        }
+
         // Skip type checking for values that look like field references
         if (typeof value === 'string' && tableColumnNames.has(value)) {
           // Value looks like a field reference, not a literal - skip type check
           console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
             `value '${value}' looks like a field reference`)
+          continue
+        }
+
+        // Skip type checking for SQL subqueries
+        if (typeof value === 'string' && value.trim().toUpperCase().startsWith('SELECT')) {
+          // Value is a SQL subquery - will be executed at runtime, skip type check
+          console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
+            `value is a SQL subquery`)
           continue
         }
         
@@ -240,6 +257,29 @@ export class SchemaValidator {
             severity: 'error',
             suggestion: typeValidation.suggestion
           });
+        }
+        
+        // Layer 3: Validate enum values using trait data from crmSchema
+        const colTraits = (crmSchema as any).traits
+          ?.get(payload.table)?.get(column);
+        const enumValues: string[] | undefined = colTraits?.enumValues;
+        
+        if (enumValues?.length && value !== null) {
+          const strVal = String(value);
+          const valid = enumValues.some(
+            v => v.toLowerCase() === strVal.toLowerCase()
+          );
+          if (!valid) {
+            errors.push({
+              nodeId,
+              operation: 'write',
+              table: payload.table,
+              column,
+              error: `Column '${column}' value "${strVal}" is not in allowed values: [${enumValues.join(', ')}]`,
+              severity: 'error',
+              suggestion: `Use one of: ${enumValues.join(', ')}`
+            });
+          }
         }
       }
     }

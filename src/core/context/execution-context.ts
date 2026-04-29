@@ -11,6 +11,7 @@ export interface ExecutionContext {
   executionId: string;
   pipelineId: string;
   sessionId: string;
+  userId?: string;
   scope: Scope;
   nodeOutputs: Map<string, Value>; // NodeId -> Value
   trace: ExecutionTrace;
@@ -21,6 +22,7 @@ export interface ExecutionContext {
 export function createExecutionContext(opts: {
   pipelineId: string;
   sessionId: string;
+  userId?: string;
   params?: Record<string, Value>;
   budget?: Partial<ExecutionBudget>;
 }): ExecutionContext {
@@ -30,6 +32,7 @@ export function createExecutionContext(opts: {
     executionId: crypto.randomUUID(),
     pipelineId: opts.pipelineId,
     sessionId: opts.sessionId,
+    userId: opts.userId,
     scope: createScope('global', null),
     nodeOutputs: new Map(),
     trace: { events: [] },

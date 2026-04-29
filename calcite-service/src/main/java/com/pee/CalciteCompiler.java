@@ -202,9 +202,16 @@ public class CalciteCompiler {
         setClauses.add("\"" + e.getKey() + "\" = " + val);
       }
     }
+    if (req.getSqlExprSets() != null) {
+      for (Map.Entry<String, String> e : req.getSqlExprSets().entrySet()) {
+        // Embed SQL expressions as raw SQL (not quoted)
+        setClauses.add("\"" + e.getKey() + "\" = " + e.getValue());
+      }
+    }
     
-    // WHERE clause - combine dynamic whereColumns + staticWhere
+    // WHERE clause - build from whereColumns + staticWhere
     List<String> whereClauses = new ArrayList<>();
+    List<Object> staticParams = new ArrayList<>();
 
     // Dynamic WHERE (from input rows)
     for (String col : req.whereColumns) {
@@ -234,7 +241,7 @@ public class CalciteCompiler {
     CompileResult out = new CompileResult();
     out.sql = sql;
     out.paramColumns = paramColumns;
-    out.staticParams = List.of();
+    out.staticParams = staticParams;  // Include WHERE clause parameters from predicateToSQL
     out.optimizations = List.of("calcite_schema_validation");
     out.dialect = req.dialect != null ? req.dialect : "POSTGRESQL";
     return out;

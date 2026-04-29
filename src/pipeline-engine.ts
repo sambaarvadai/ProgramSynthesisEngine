@@ -656,7 +656,8 @@ export class PipelineEngine {
   planWithMissingValues(
     existingPlan: PlanResult,
     stepId: string,
-    additionalValues: Record<string, any>
+    additionalValues: Record<string, any>,
+    userId?: string
   ): PlanResult {
     // Find the write step and node in the existing plan
     const writeStep = existingPlan.intent.steps.find(step => step.id === stepId);
@@ -689,7 +690,7 @@ export class PipelineEngine {
     
     // Build session context for ColumnClassifier
     const sessionCtx: SessionContext = {
-      userId: 1,  // Default for planWithMissingValues
+      userId: userId ? parseInt(userId, 10) : 1,
       anchorIds: { workspaces: Number(1) }
     };
     
@@ -798,6 +799,7 @@ export class PipelineEngine {
     const ctx = createExecutionContext({
       pipelineId: plan.graph.id,
       sessionId: crypto.randomUUID(),
+      userId: plan.userId,
       params: params || {},
       budget,
     });
@@ -1623,8 +1625,34 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
       const mode = operation?.toLowerCase() === 'update' ? 'update' : 'insert';
       
       // Build session context
+      // Map auth user UUID to CRM user integer ID
+      let crmUserId = 1;  // Default
+      if (userId) {
+        // Try to find the user in CRM database by matching with auth user
+        // For now, use a simple lookup by username/email if available
+        // TODO: Add proper UUID-to-int mapping table
+        const user = grantStore.getUserById(userId);
+        if (user) {
+          // Query CRM database for user by email to get integer ID
+          try {
+            const result = await (this.storageBackend as any).pool.query(
+              'SELECT id FROM users WHERE email = $1 LIMIT 1',
+              [user.username]  // username is email in grant store
+            );
+            if (result.rows.length > 0) {
+              crmUserId = result.rows[0].id;
+              console.log(`[Write Enrichment] Mapped auth user ${userId} to CRM user ID ${crmUserId}`);
+            } else {
+              console.warn(`[Write Enrichment] CRM user not found for email ${user.username}, using default ID 1`);
+            }
+          } catch (err) {
+            console.warn(`[Write Enrichment] Failed to lookup CRM user: ${(err as Error).message}, using default ID 1`);
+          }
+        }
+      }
+      
       const sessionCtx: SessionContext = {
-        userId: userId ? parseInt(userId, 10) : 1,  // Default to 1 if no userId
+        userId: crmUserId,
         anchorIds: { workspaces: Number(workspaceId ?? 1) }
       };
       
@@ -1634,11 +1662,13 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
         sessionCtx, 
         mode
       );
+      
+      // Debug: log lifecycle_stage trait
+      const lifecycleTrait = classifications.get('lifecycle_stage');
+      console.log('[ColumnClassifier] lifecycle_stage trait:', JSON.stringify(lifecycleTrait, null, 2));
+      
       autoValues = getAutoResolvedValues(classifications);
       exclusions = buildIntentExclusionList(classifications);
-      
-      // Merge auto-resolved values into originalFields BEFORE LLM sees them
-      Object.assign(originalFields, autoValues);
       
       console.log(`[ColumnClassifier] Auto-injected for ${targetTable} (${mode}):`, autoValues);
       console.log('[ColumnClassifier] Excluded from LLM:', exclusions);
@@ -1695,7 +1725,24 @@ IMPORTANT:
   * Map 'customer_id' from orders query to 'customer_id' column
   * Map 'email' from customers query to 'email' column
 - If availableFields contains 'id' and table is 'email_log', include 'order_id' in columns
-${exclusions.length > 0 ? `Do not include these columns in the output — they are auto-resolved by the system: ${exclusions.join(', ')}` : ''}
+${exclusions.length > 0 ? `Do not include these columns — auto-resolved: ${exclusions.join(', ')}` : ''}
+${(() => {
+  // Layer 2: Add enum hints for columns the LLM can set
+  const enumHints: string[] = [];
+  if (targetTable && (crmSchema as any).traits?.has(targetTable)) {
+    const tableTraits = (crmSchema as any).traits.get(targetTable);
+    for (const [col, traits] of tableTraits.entries()) {
+      if (exclusions.includes(col)) continue;  // already excluded
+      if (!traits.enumValues?.length) continue;
+      enumHints.push(
+        `${col}: must be one of [${traits.enumValues.join(', ')}]`
+      );
+    }
+  }
+  return enumHints.length > 0
+    ? `\nValid enum values:\n${enumHints.map(h => `  ${h}`).join('\n')}`
+    : '';
+})()}
 Return ONLY raw JSON.`;
 
     const response = await this.client.messages.create({
@@ -1849,6 +1896,13 @@ Return ONLY raw JSON.`;
       }
       console.log('[Write Enrichment] Final merged columns:', mergedColumns);
       
+      // Re-apply auto-injected values (session_scoped, etc.) to ensure they're always preserved
+      // even if not in originalFields or LLM output
+      for (const [col, val] of Object.entries(autoValues)) {
+        mergedStaticValues[col] = val;
+        console.log(`[Write Enrichment] Re-applied auto-injected value: ${col} = ${val}`);
+      }
+      
       // Special handling: if we're inserting into email_log and have 'id' in availableFields,
       // ensure 'order_id' is included in columns
       if (tableName === 'email_log' && availableFields.includes('id')) {
@@ -1868,12 +1922,114 @@ Return ONLY raw JSON.`;
       // Find upstream tables transitively (not just direct dependsOn)
       const extractedUpstreamTables = this.getUpstreamTablesTransitive(step.id, intent, graph)
 
+      // Build columnAliases from FK relationships
+      // This maps write column names to upstream row field names
+      const columnAliases: Record<string, string> = {};
+      for (const col of mergedColumns) {
+        // Find FK for this column in the target table
+        const fkEdges = (crmSchema as any).parsed.fkGraph
+          .getOutbound(tableName);
+
+        if (fkEdges) {
+          const fk = fkEdges.find((e: any) => e.fromColumn === col);
+          if (fk && extractedUpstreamTables.includes(fk.toTable)) {
+            // This column's value comes from upstream table's PK
+            columnAliases[col] = fk.toColumn;  // e.g. owner_user_id → id
+            console.log(
+              `[WriteEnrichment] FK alias: ${col} ← ${fk.toTable}.${fk.toColumn}`
+            );
+          }
+        }
+      }
+
       // Strip unresolved param references (values matching /^\$/) from mergedStaticValues
       // These are template variables that weren't resolved and should be left for user to supply
       for (const [key, val] of Object.entries(mergedStaticValues)) {
         if (typeof val === 'string' && /^\$/.test(val)) {
           console.log(`[Write Enrichment] Stripping unresolved param reference: ${key} = ${val}`);
           delete mergedStaticValues[key];
+        }
+      }
+
+      // Type-based validity check: remove invalid string values for INT columns
+      // (e.g., hallucinated placeholders like "Karthik" for owner_user_id)
+      for (const [col, val] of Object.entries(mergedStaticValues)) {
+        if (val === null || val === undefined) continue;
+
+        const colDef = (crmSchema as any).parsed.tables
+          .get(tableName)?.columns.get(col);
+
+        if (!colDef) continue;
+
+        const colType = colDef.type?.toUpperCase() ?? 'TEXT';
+        const isIntType = colType === 'INT' || colType === 'INTEGER' ||
+                          colType === 'SERIAL' || colType === 'BIGINT';
+
+        if (isIntType && typeof val === 'string' && isNaN(Number(val))) {
+          // String value for INT column that isn't a number
+          // This is a hallucinated placeholder (e.g. "Karthik" for owner_user_id)
+          // Check if this column appears in upstreamTables — if so,
+          // it should be resolved from upstream, not staticValues
+          console.warn(
+            `[Write Enrichment] Removing invalid INT value for ${col}: ` +
+            `"${val}" — will be resolved from upstream row`
+          );
+          delete mergedStaticValues[col];
+        }
+      }
+
+      // Layer 1: Validate staticValues against enum constraints
+      const tableTraits = (crmSchema as any).traits?.get(tableName);
+      if (tableTraits) {
+        for (const [col, val] of Object.entries(mergedStaticValues)) {
+          if (val === null || val === undefined) continue;
+          
+          const colTraits = tableTraits.get(col);
+          const enumValues: string[] | undefined = colTraits?.enumValues;
+          
+          if (!enumValues || enumValues.length === 0) continue;
+          
+          const strVal = String(val);
+          
+          // Case-insensitive match against valid enum values
+          const match = enumValues.find(
+            v => v.toLowerCase() === strVal.toLowerCase()
+          );
+          
+          if (match && match !== strVal) {
+            // Correct casing silently
+            console.log(
+              `[Write Enrichment] Corrected enum casing: ` +
+              `${col} = "${strVal}" → "${match}"`
+            );
+            mergedStaticValues[col] = match;
+          } else if (!match) {
+            // Invalid enum value — check if column has a default
+            const colDef = (crmSchema as any).parsed.tables
+              .get(tableName)?.columns.get(col);
+            
+            if (colDef?.defaultRaw) {
+              // Strip SQL quotes from default e.g. "'mql'" → "mql"
+              const defaultVal = colDef.defaultRaw.replace(/^'(.*)'$/, '$1');
+              
+              console.warn(
+                `[Write Enrichment] Invalid enum value for ${col}: ` +
+                `"${strVal}" not in [${enumValues.join(', ')}]. ` +
+                `Using schema default: "${defaultVal}"`
+              );
+              mergedStaticValues[col] = defaultVal;
+            } else {
+              // No default — remove the invalid value entirely
+              // Let DB enforce NOT NULL if applicable
+              console.warn(
+                `[Write Enrichment] Invalid enum value for ${col}: ` +
+                `"${strVal}" not in [${enumValues.join(', ')}]. ` +
+                `Removing — column has no default.`
+              );
+              delete mergedStaticValues[col];
+            }
+          }
+          // else: valid match with correct casing — leave as-is
         }
       }
 
@@ -1887,10 +2043,30 @@ Return ONLY raw JSON.`;
         updateColumns: config.updateColumns as string[],
         whereColumns: config.whereColumns as string[],
         upstreamTables: extractedUpstreamTables,
+        columnAliases: Object.keys(columnAliases).length > 0 ? columnAliases : undefined,
         datasource: 'default'
       };
       
       console.log('[Write Enrichment] Final payload:', JSON.stringify(finalPayload, null, 2));
+
+      // Auto-refresh updated_at on every UPDATE
+      if (finalPayload.mode === 'update') {
+        const hasUpdatedAt = (crmSchema as any).parsed.tables
+          .get(tableName)?.columns.has('updated_at');
+        
+        if (hasUpdatedAt) {
+          finalPayload.staticValues = finalPayload.staticValues ?? {};
+          
+          // Only set if not already explicitly provided
+          if (!finalPayload.staticValues['updated_at']) {
+            finalPayload.staticValues['updated_at'] = 'NOW()';
+            console.log(
+              `[WriteEnrichment] Auto-added updated_at = NOW() for UPDATE on ${tableName}` 
+            );
+          }
+        }
+      }
+
       return finalPayload;
     } catch {
       // Fallback to basic configuration with original fields

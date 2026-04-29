@@ -70,6 +70,7 @@ export function classifyColumn(
     result.resolvedValue = session.anchorIds[raw.sessionAnchorTable];
   } else if (raw.trait === 'system_audited') {
     result.resolvedValue = session.userId;
+    console.log(`[ColumnClassifier] Resolved system_audited column ${column} to userId: ${session.userId}`);
   } else if (raw.resolvedValue !== undefined) {
     result.resolvedValue = raw.resolvedValue;
   }
@@ -130,8 +131,13 @@ export function getAutoResolvedValues(
     if (c.resolvedValue !== undefined && 
         !(typeof c.resolvedValue === 'number' && isNaN(c.resolvedValue))) {
       result[col] = c.resolvedValue;
+      // Debug: log lifecycle_stage
+      if (col === 'lifecycle_stage') {
+        console.log('[getAutoResolvedValues] lifecycle_stage:', c.resolvedValue, 'trait:', c.trait);
+      }
     }
   }
+  console.log('[getAutoResolvedValues] Final result:', result);
   return result;
 }
 

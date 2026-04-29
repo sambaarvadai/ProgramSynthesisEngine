@@ -471,15 +471,48 @@ export class QueryASTBuilder {
       return this.buildFilterExpr(filters[0]);
     }
 
-    // Combine multiple filters with AND
-    let result: ExprAST = this.buildFilterExpr(filters[0]);
+    // Group filters by (operator, value) to detect OR patterns
+    // When multiple filters on different fields have the same operator and value,
+    // they should be combined with OR (e.g., billing_city = 'X' OR shipping_city = 'X')
+    const filterGroups = new Map<string, QueryIntentFilter[]>();
     
-    for (let i = 1; i < filters.length; i++) {
+    for (const filter of filters) {
+      const key = `${filter.operator}:${JSON.stringify(filter.value)}`;
+      if (!filterGroups.has(key)) {
+        filterGroups.set(key, []);
+      }
+      filterGroups.get(key)!.push(filter);
+    }
+
+    // Build expressions for each group
+    const groupExprs: ExprAST[] = [];
+    for (const [key, groupFilters] of filterGroups.entries()) {
+      if (groupFilters.length === 1) {
+        // Single filter - use as-is
+        groupExprs.push(this.buildFilterExpr(groupFilters[0]));
+      } else {
+        // Multiple filters with same operator and value - combine with OR
+        let result: ExprAST = this.buildFilterExpr(groupFilters[0]);
+        for (let i = 1; i < groupFilters.length; i++) {
+          result = {
+            kind: 'BinaryOp',
+            op: 'OR',
+            left: result,
+            right: this.buildFilterExpr(groupFilters[i])
+          };
+        }
+        groupExprs.push(result);
+      }
+    }
+
+    // Combine all group expressions with AND
+    let result: ExprAST = groupExprs[0];
+    for (let i = 1; i < groupExprs.length; i++) {
       result = {
         kind: 'BinaryOp',
         op: 'AND',
         left: result,
-        right: this.buildFilterExpr(filters[i])
+        right: groupExprs[i]
       };
     }
 
@@ -617,7 +650,7 @@ export class QueryASTBuilder {
 
   private buildProjections(intent: QueryIntent, scanNode: ScanNode, joinNodes: JoinNode[]): ProjectionNode[] {
     return intent.columns
-      .filter(column => !column.agg && !column.expr) // Skip aggregated columns and computed expressions - they're handled by aggregations array
+      .filter(column => !column.agg && !column.expr && column.field !== '*') // Skip aggregated columns, computed expressions, and wildcard - they're handled by aggregations array or SQL backend
       .map(column => {
       let expr: ExprAST;
 

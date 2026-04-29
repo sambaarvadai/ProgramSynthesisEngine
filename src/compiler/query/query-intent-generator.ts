@@ -7,6 +7,8 @@ import { TablePreSelector, type TablePreSelectorConfig, type PreSelectionResult 
 import { z } from 'zod';
 import { MODELS } from '../../config/models.js';
 import { callLLM, LLMMessage } from '../../core/llm/llm-client.js';
+import { isTextColumn, normalizeStringParam } from '../../storage/column-type-helper.js';
+import { crmSchema } from '../../schema/crm-schema.js';
 
 function parseJsonResponse(raw: string): any {
   // Strip markdown fences — model sometimes wraps response despite instructions
@@ -16,6 +18,33 @@ function parseJsonResponse(raw: string): any {
     .replace(/```\s*$/i, '')
     .trim();
   return JSON.parse(clean);
+}
+
+function normalizeIntentFilters(
+  intent: QueryIntent,
+  schema: any
+): QueryIntent {
+  if (!intent.filters) return intent;
+
+  return {
+    ...intent,
+    filters: intent.filters.map(filter => {
+      const tableName = filter.table || intent.table;
+      if (!isTextColumn(tableName, filter.field)) {
+        return filter;
+      }
+
+      // Normalize string values to lowercase
+      // The DB comparison will also use LOWER() so this is redundant but explicit
+      return {
+        ...filter,
+        caseInsensitive: true,
+        value: filter.value !== undefined
+          ? normalizeStringParam(filter.value)
+          : filter.value
+      };
+    })
+  };
 }
 
 export interface QueryIntentGeneratorConfig {
@@ -75,7 +104,8 @@ export class QueryIntentGenerator {
     "table?": string,
     "operator": "=" | "!=" | "<" | ">" | "<=" | ">=" | "LIKE" | "IN" | "NOT IN" | "BETWEEN" | "IS NULL" | "IS NOT NULL",
     "value?": (primitive value or array for IN/BETWEEN),
-    "valueRef?": string (reference to pipeline variable)
+    "valueRef?": string (reference to pipeline variable),
+    "caseInsensitive?": boolean (enable case-insensitive matching for text columns)
   }>,
   "groupBy?": string[],
   "aggregations?": Array<{
@@ -104,6 +134,7 @@ Rules:
 - For IN and BETWEEN operators, use array values
 - For NOT IN with subqueries, use the value field for the subquery string
 - For IS NULL and IS NOT NULL, omit the value field
+- For text/string column filters (city names, names, categories, statuses, emails, descriptions), always set caseInsensitive: true. Do not use LOWER() in the expr field — set caseInsensitive: true instead and let the backend handle normalization.
 - ORDER BY rules:
   - Always include orderBy when the user asks for sorted or ranked results
   - Use exact column names from the schema
@@ -143,12 +174,15 @@ Rules:
 
     const validatedIntent = zodResult.data;
 
-    // 7. Run QueryASTBuilder.validateIntent for semantic validation
+    // 7. Normalize intent filters for case-insensitive matching
+    const normalizedIntent = normalizeIntentFilters(validatedIntent, crmSchema);
+
+    // 8. Run QueryASTBuilder.validateIntent for semantic validation
     // Note: We need to use the full schema for validation, not the reduced one
-    const semanticValidation = astBuilder.validateIntent(validatedIntent);
+    const semanticValidation = astBuilder.validateIntent(normalizedIntent);
 
     return {
-      intent: validatedIntent,
+      intent: normalizedIntent,
       validation: semanticValidation
     };
   }
@@ -232,7 +266,8 @@ Rules:
       operator: z.enum(['=', '!=', '<', '>', '<=', '>=', 'LIKE', 'IN', 'NOT IN', 'BETWEEN', 'IS NULL', 'IS NOT NULL']),
       value: z.union([z.string(), z.number(), z.boolean(), z.array(z.any())]).optional(),
       valueRef: z.string().optional(),
-      expr: z.string().optional()
+      expr: z.string().optional(),
+      caseInsensitive: z.boolean().optional()
     });
 
     const queryIntentJoinSchema = z.object({

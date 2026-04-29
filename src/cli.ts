@@ -17,6 +17,31 @@ import { coerceColumnValue } from './write/coerceColumnValue.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
+/**
+ * Check if write intent is complete (has both WHERE and WHAT to update)
+ */
+function isWriteIntentComplete(payload: WritePayload): boolean {
+  if (payload.mode !== 'update') return false;
+
+  // Must know WHERE (what rows to update)
+  const hasWhere =
+    Object.keys(payload.staticWhere ?? {}).length > 0 ||
+    payload.wherePredicate != null ||
+    (payload.whereColumns && payload.whereColumns.length > 0) ||
+    (payload.upstreamTables && payload.upstreamTables.length > 0);  // upstream query provides WHERE
+
+  if (!hasWhere) return false;
+
+  // Must know WHAT to update (non-system fields)
+  const systemFields = [
+    'workspace_id', 'created_at', 'updated_at', 'deleted_at'
+  ];
+  const intentFields = Object.keys(payload.staticValues ?? {})
+    .filter(k => !systemFields.includes(k));
+
+  return intentFields.length > 0;
+}
+
 async function main() {
   const dbConfig = getDatabaseConfig();
   const backend = new PostgresBackend(dbConfig.crmPostgresUrl!);
@@ -680,11 +705,27 @@ async function main() {
         if (writeIncompleteError && writeIncompleteError.missingColumns) {
           console.log('\n\u26A0\ufe0f  Write completeness check:');
           console.log(writeIncompleteError.message);
-          
+
           // Get the write payload to determine table and column types
           const writeNode = plan.graph.nodes.get(writeIncompleteError.stepId!);
           const writePayload = writeNode?.kind === 'write' ? writeNode.payload as WritePayload : null;
           const tableColumns = writePayload?.table ? (crmSchema as any).parsed?.tables.get(writePayload.table)?.columns : undefined;
+
+          // Check if write intent is complete (has both WHERE and WHAT to update)
+          if (writePayload && isWriteIntentComplete(writePayload)) {
+            console.log(
+              '[WriteCompleteness] Write intent is complete. ' +
+              'Adding updated_at and proceeding.'
+            );
+            // Just add updated_at
+            if (writePayload.staticValues) {
+              writePayload.staticValues['updated_at'] = 'NOW()';
+            }
+            // Clear compilationErrors since intent is complete
+            plan.compilationErrors = [];
+            // Skip form entirely - continue to execution
+          } else {
+            // Show form — genuinely missing intent
           
           // Detect single-row UPDATE
           const isSingleRowUpdate = 
@@ -766,6 +807,14 @@ async function main() {
               const changed = String(newVal) !== String(oldVal ?? '');
               if (changed) {
                 changedFields[col] = newVal;
+              } else {
+                // For required fields, include unchanged values to preserve them
+                const isRequired = writeIncompleteError.missingColumns.some(
+                  mc => 'description' in mc && mc.column === col && !mc.nullable
+                );
+                if (isRequired) {
+                  changedFields[col] = newVal;
+                }
               }
             }
             
@@ -794,7 +843,8 @@ async function main() {
           const enrichedPlan = engine.planWithMissingValues(
             plan,                                    // pass full plan
             writeIncompleteError.stepId!,
-            finalValues
+            finalValues,
+            currentUser!.id
           );
           
           plan.intent = enrichedPlan.intent;
@@ -816,6 +866,7 @@ async function main() {
           const confirmAfterFill = await ask('\nExecute this plan? (y/n) ');
           if (confirmAfterFill.trim() !== 'y') continue;
           // fall through to execution
+          }  // Close else block for form display
         } else if (writeFieldUnresolvableError && writeFieldUnresolvableError.missingColumns && 'table' in writeFieldUnresolvableError.missingColumns[0]) {
           console.log(`\n\u26A0\ufe0f  Write field resolution failed for step '${writeFieldUnresolvableError.stepId}':`);
           console.log(writeFieldUnresolvableError.message);
@@ -911,6 +962,14 @@ async function main() {
               const changed = String(newVal) !== String(oldVal ?? '');
               if (changed) {
                 changedFields[col] = newVal;
+              } else {
+                // For required fields, include unchanged values to preserve them
+                const isRequired = writeFieldUnresolvableError.missingColumns.some(
+                  mc => 'description' in mc && mc.column === col && !mc.nullable
+                );
+                if (isRequired) {
+                  changedFields[col] = newVal;
+                }
               }
             }
             
@@ -981,6 +1040,32 @@ async function main() {
           `⚠️  This will affect ~${cursor.rowCount} rows in ` +
           `'${cursor.table}' matching the prior query filter.`
         );
+      }
+
+      // Guard against no-WHERE update
+      const writeStep = plan.intent.steps.find(s => s.kind === 'write');
+      if (writeStep && writeStep.config) {
+        const writePayload = writeStep.config as WritePayload;
+        if (writePayload?.mode === 'update') {
+          const hasWhere =
+            Object.keys(writePayload.staticWhere ?? {}).length > 0 ||
+            writePayload.wherePredicate != null ||
+            (writePayload.whereColumns && writePayload.whereColumns.length > 0);
+
+          if (!hasWhere) {
+            console.warn(
+              '\n⚠️  WARNING: This UPDATE has no WHERE clause.\n' +
+              `   It will modify ALL rows in "${writePayload.table}".\n` +
+              '   Are you sure? (type "yes" to confirm, anything else cancels)\n'
+            );
+            const confirmAllRows = await ask('> ');
+            if (confirmAllRows.trim().toLowerCase() !== 'yes') {
+              console.log('Cancelled.');
+              sessionCursorStore.clear();
+              continue;
+            }
+          }
+        }
       }
 
       const confirm = await ask('\nExecute this plan? (y/n/refine) ');
