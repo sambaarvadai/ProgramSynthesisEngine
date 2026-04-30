@@ -512,7 +512,8 @@ export class PipelineEngine {
           const writePayload = node.payload as WritePayload;
           
           // ColumnClassifier integration: skip auto-resolved columns in completeness check
-          if (writePayload.table && (crmSchema as any).parsed.tables.has(writePayload.table)) {
+          // Skip DELETE mode - DELETE only needs WHERE clause, not column values
+          if (writePayload.table && (crmSchema as any).parsed.tables.has(writePayload.table) && writePayload.mode !== 'delete') {
             const mode = writePayload.mode === 'update' ? 'update' : 'insert';
             
             // Build session context

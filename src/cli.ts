@@ -6,7 +6,7 @@ import { PostgresBackend } from './storage/index.js';
 import { isTabular, isRecord, isScalar, isCollection, isVoid, toTabular } from './core/types/data-value.js';
 import type { DataValue } from './core/types/data-value.js';
 import { SessionManager } from './session/session-manager.js';
-import { SessionCursorStore, extractCursor } from './session/SessionCursor.js';
+import { SessionCursorStore, extractCursor, buildWhereFromCursor } from './session/SessionCursor.js';
 // Import error analyzer for detailed LLM-based error analysis
 import { ErrorAnalyzer } from './core/llm/error-analyzer.js';
 import { grantStore } from './auth/grant-store.js';
@@ -140,8 +140,10 @@ async function main() {
     
     // Default value — strip surrounding quotes from SQL literal
     if (field.defaultValue !== null) {
-      const displayDefault = field.defaultValue
-        .replace(/^'(.*)'$/, '$1');   // "'medium'" → "medium"
+      const rawDefault = field.defaultValue;
+      const displayDefault = typeof rawDefault === 'object' && rawDefault !== null
+        ? ((rawDefault as any).expr ?? String(rawDefault))
+        : String(rawDefault ?? '').replace(/^'(.*)'$/, '$1');
       parts.push(`default: ${displayDefault}`);
     }
     
@@ -724,12 +726,60 @@ async function main() {
           const writePayload = writeNode?.kind === 'write' ? writeNode.payload as WritePayload : null;
           const tableColumns = writePayload?.table ? (crmSchema as any).parsed?.tables.get(writePayload.table)?.columns : undefined;
 
+          // Detect full-table UPDATE (no WHERE clause specified)
+          // Show a confirmation gate instead of a field collection form
+          const isNoWhereUpdate =
+            writePayload?.mode === 'update' &&
+            Object.keys(writePayload.staticWhere ?? {}).length === 0 &&
+            !writePayload.wherePredicate &&
+            (writePayload.whereColumns ?? []).length === 0;
+
+          if (isNoWhereUpdate) {
+            const tableRowCount = await backend
+              .rawQuery(`SELECT COUNT(*) FROM "${writePayload!.table}"`)
+              .then((r: { rows: any[] }) => r.rows[0].count)
+              .catch(() => 'unknown');
+
+            console.warn(
+              `\n⚠️  WARNING: No filter specified.`
+            );
+            console.warn(
+              `   This will update ALL ${tableRowCount} rows ` +
+              `in '${writePayload!.table}'.`
+            );
+            console.warn(`   Type "yes" to confirm, anything else cancels.\n`);
+
+            const confirmAll = await ask('> ');
+            if (confirmAll.trim().toLowerCase() !== 'yes') {
+              console.log('Cancelled.');
+              sessionCursorStore.clear();
+              continue;
+            }
+
+            // User confirmed — inject updated_at and proceed to execution
+            // without showing any field form
+            if (writePayload!.staticValues) {
+              const hasUpdatedAt = (crmSchema as any).parsed.tables
+                .get(writePayload!.table)?.columns.has('updated_at');
+              if (hasUpdatedAt) {
+                writePayload!.staticValues['updated_at'] = 'NOW()';
+              }
+            }
+            // Clear compilationErrors and skip form logic
+            plan.compilationErrors = [];
+            // Fall through to "Execute this plan?" prompt
+          }
+
           // Check if write intent is complete (has both WHERE and WHAT to update)
           // Do this FIRST — before printing anything to avoid unnecessary warnings
           if (writePayload && isWriteIntentComplete(writePayload)) {
             // Silent — no warning shown to user at all
             if (writePayload.staticValues) {
-              writePayload.staticValues['updated_at'] = 'NOW()';
+              const hasUpdatedAt = (crmSchema as any).parsed.tables
+                .get(writePayload.table)?.columns.has('updated_at');
+              if (hasUpdatedAt) {
+                writePayload.staticValues['updated_at'] = 'NOW()';
+              }
             }
             // Clear compilationErrors since intent is complete
             plan.compilationErrors = [];
@@ -1053,11 +1103,35 @@ async function main() {
       const hasWriteNode = plan.intent.steps.some(s => s.kind === 'write');
       const cursor = sessionCursorStore.get();
 
-      if (hasWriteNode && cursor && cursor.rowCount > 50) {
-        console.warn(
-          `⚠️  This will affect ~${cursor.rowCount} rows in ` +
-          `'${cursor.table}' matching the prior query filter.`
-        );
+      if (hasWriteNode && cursor) {
+        // Build the where result to show accurate count and determine if bulk
+        let affectedDesc = `~${cursor.rowCount} rows`;
+        let isBulk = cursor.rowCount > 50;
+
+        try {
+          const whereResult = buildWhereFromCursor(cursor, 1);
+          isBulk = whereResult.isBulk;
+        } catch (e) {
+          // If buildWhereFromCursor fails, fall back to rowCount heuristic
+          isBulk = cursor.rowCount > 50;
+        }
+
+        if (isBulk) {
+          console.warn(
+            `\n⚠️  This will affect ${affectedDesc} in ` +
+            `'${cursor.table}' matching: ${cursor.description}`
+          );
+          console.warn(
+            `   This cannot be undone. Type "yes" to confirm.\n`
+          );
+
+          const confirmBulk = await ask('> ');
+          if (confirmBulk.trim().toLowerCase() !== 'yes') {
+            console.log('Cancelled.');
+            sessionCursorStore.clear();
+            continue;
+          }
+        }
       }
 
       // Guard against no-WHERE update
@@ -1229,6 +1303,19 @@ async function main() {
       console.log();
     } catch (error) {
       console.log();
+      
+      // Check for FK validation errors - display cleanly without AI analysis
+      if ((error as Error).message.startsWith('FK validation failed')) {
+        console.log('\n❌ Cannot complete this operation:\n');
+        console.log((error as Error).message);
+        console.log(
+          '\nCheck that all referenced records exist before retrying.'
+        );
+        // Do NOT show the AI error analysis for FK violations
+        // They are self-explanatory
+        continue;
+      }
+      
       console.log('\nError:', (error as Error).message);
       console.log('\nStack trace:');
       console.log((error as Error).stack);

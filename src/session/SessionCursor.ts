@@ -75,132 +75,135 @@ export function extractCursor(
   };
 }
 
-export function buildWhereFromCursor(cursor: SessionCursor): { clause: string; params: any[] } {
+export interface CursorWhereResult {
+  clause: string;    // SQL WHERE clause fragment
+  params: any[];     // parameterized values
+  isBulk: boolean;   // true if affects many rows — trigger confirm
+}
+
+export function buildWhereFromCursor(
+  cursor: SessionCursor,
+  startIndex: number = 1
+): CursorWhereResult {
   if (cursor.ids && cursor.ids.length > 0) {
-    const primaryKey = cursor.primaryKeys[0] || 'id';
+    // Small result path — use IN list
+    if (cursor.ids.length === 1) {
+      return {
+        clause: `"${cursor.primaryKeys[0]}" = $${startIndex}`,
+        params: [cursor.ids[0]],
+        isBulk: false
+      };
+    }
+    // Multiple IDs — use ANY()
     return {
-      clause: `"${primaryKey}" = ANY($1)`,
+      clause: `"${cursor.primaryKeys[0]}" = ANY($${startIndex})`,
       params: [cursor.ids],
+      isBulk: cursor.ids.length > 1
     };
   }
 
   if (cursor.sourceFilter) {
-    return serializeFilterToWhere(cursor.sourceFilter);
-  }
+    // Large result path — reconstruct WHERE from stored filter
+    // sourceFilter is the QueryIntent filters array:
+    // [{ field, operator, value, table?, caseInsensitive? }, ...]
 
-  throw new Error('Cursor has no resolvable WHERE target');
-}
+    const filters = Array.isArray(cursor.sourceFilter)
+      ? cursor.sourceFilter
+      : [cursor.sourceFilter];
 
-function serializeFilterToWhere(filter: object): { clause: string; params: any[] } {
-  const ast = filter as any;
-  const params: any[] = [];
+    const clauses: string[] = [];
+    const params: any[] = [];
+    let paramIndex = startIndex;
 
-  if (!ast || typeof ast !== 'object') {
-    throw new Error('Invalid filter AST');
-  }
+    for (const f of filters as any[]) {
+      const col = `"${f.field}"`;
 
-  const clause = serializeNode(ast, params);
-  return { clause, params };
-}
+      switch (f.operator) {
+        case '=':
+          if (f.caseInsensitive && typeof f.value === 'string') {
+            clauses.push(`LOWER(${col}) = LOWER($${paramIndex})`);
+          } else {
+            clauses.push(`${col} = $${paramIndex}`);
+          }
+          params.push(f.value);
+          paramIndex++;
+          break;
 
-function serializeNode(node: any, params: any[]): string {
-  if (!node || typeof node !== 'object') {
-    throw new Error('Invalid AST node');
-  }
+        case 'IN':
+          const placeholders = (f.value as any[])
+            .map((_, i) => `$${paramIndex + i}`)
+            .join(', ');
+          clauses.push(`${col} IN (${placeholders})`);
+          params.push(...f.value);
+          paramIndex += f.value.length;
+          break;
 
-  // Handle comparison operators
-  if (node.op) {
-    return serializeComparison(node, params);
-  }
+        case 'NOT IN':
+          const notInPlaceholders = (f.value as any[])
+            .map((_, i) => `$${paramIndex + i}`)
+            .join(', ');
+          clauses.push(`${col} NOT IN (${notInPlaceholders})`);
+          params.push(...f.value);
+          paramIndex += f.value.length;
+          break;
 
-  // Handle logical operators (AND, OR, NOT)
-  if (node.type === 'and' || node.type === 'or') {
-    return serializeLogical(node, params);
-  }
+        case '>':
+        case '<':
+        case '>=':
+        case '<=':
+        case '!=':
+          clauses.push(`${col} ${f.operator} $${paramIndex}`);
+          params.push(f.value);
+          paramIndex++;
+          break;
 
-  if (node.type === 'not') {
-    return serializeNot(node, params);
-  }
+        case 'IS NULL':
+          clauses.push(`${col} IS NULL`);
+          break;
 
-  // Handle simple field-value pairs (implicit equality)
-  if (node.field !== undefined && node.value !== undefined) {
-    params.push(node.value);
-    return `"${node.field}" = $${params.length}`;
-  }
+        case 'IS NOT NULL':
+          clauses.push(`${col} IS NOT NULL`);
+          break;
 
-  throw new Error(`Unsupported AST node structure: ${JSON.stringify(node)}`);
-}
+        case 'BETWEEN':
+          clauses.push(
+            `${col} BETWEEN $${paramIndex} AND $${paramIndex + 1}`
+          );
+          params.push(f.value[0], f.value[1]);
+          paramIndex += 2;
+          break;
 
-function serializeComparison(node: any, params: any[]): string {
-  const { op, field, value } = node;
-  const paramIndex = params.length + 1;
+        case 'LIKE':
+          clauses.push(`${col} ILIKE $${paramIndex}`);
+          params.push(f.value);
+          paramIndex++;
+          break;
 
-  switch (op) {
-    case '=':
-    case '==':
-      params.push(value);
-      return `"${field}" = $${paramIndex}`;
-    case '!=':
-    case '<>':
-      params.push(value);
-      return `"${field}" != $${paramIndex}`;
-    case '>':
-      params.push(value);
-      return `"${field}" > $${paramIndex}`;
-    case '>=':
-      params.push(value);
-      return `"${field}" >= $${paramIndex}`;
-    case '<':
-      params.push(value);
-      return `"${field}" < $${paramIndex}`;
-    case '<=':
-      params.push(value);
-      return `"${field}" <= $${paramIndex}`;
-    case 'like':
-    case 'ILIKE':
-      params.push(value);
-      return `"${field}" ${op.toUpperCase()} $${paramIndex}`;
-    case 'in':
-      if (!Array.isArray(value) || value.length === 0) {
-        throw new Error('IN operator requires a non-empty array');
+        default:
+          // Skip unknown operators — don't crash
+          console.warn(
+            `[SessionCursor] buildWhereFromCursor: ` +
+            `unknown operator "${f.operator}" for field "${f.field}" — skipped`
+          );
       }
-      params.push(value);
-      return `"${field}" = ANY($${paramIndex})`;
-    case 'not in':
-      if (!Array.isArray(value) || value.length === 0) {
-        throw new Error('NOT IN operator requires a non-empty array');
-      }
-      params.push(value);
-      return `"${field}" != ALL($${paramIndex})`;
-    case 'is null':
-      return `"${field}" IS NULL`;
-    case 'is not null':
-      return `"${field}" IS NOT NULL`;
-    default:
-      throw new Error(`Unsupported comparison operator: ${op}`);
-  }
-}
+    }
 
-function serializeLogical(node: any, params: any[]): string {
-  const { type, conditions } = node;
+    if (clauses.length === 0) {
+      throw new Error(
+        '[SessionCursor] buildWhereFromCursor: ' +
+        'sourceFilter produced no WHERE clauses'
+      );
+    }
 
-  if (!Array.isArray(conditions) || conditions.length === 0) {
-    throw new Error(`${type.toUpperCase()} operator requires an array of conditions`);
+    return {
+      clause: clauses.join(' AND '),
+      params,
+      isBulk: true   // large result → always bulk
+    };
   }
 
-  const serializedConditions = conditions.map((cond: any) => serializeNode(cond, params));
-  const operator = type === 'and' ? 'AND' : 'OR';
-
-  return `(${serializedConditions.join(` ${operator} `)})`;
-}
-
-function serializeNot(node: any, params: any[]): string {
-  const { condition } = node;
-
-  if (!condition) {
-    throw new Error('NOT operator requires a condition');
-  }
-
-  const serialized = serializeNode(condition, params);
-  return `NOT (${serialized})`;
+  throw new Error(
+    '[SessionCursor] buildWhereFromCursor: ' +
+    'cursor has neither ids nor sourceFilter'
+  );
 }

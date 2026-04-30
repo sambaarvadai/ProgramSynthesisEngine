@@ -190,10 +190,25 @@ export class CalciteClient {
     payload: WritePayload,
     schema: SchemaConfig
   ): Promise<CalciteCompileResult> {
+    // Build whereFilters from staticWhere
+    // staticWhere: { id: 5 } → [{ field: 'id', operator: '=', value: 5 }]
+    // staticWhere: { id: [1,2] } → [{ field: 'id', operator: 'IN', value: [1,2] }]
+    const whereFilters = Object.entries(payload.staticWhere ?? {})
+      .map(([field, val]) => {
+        if (Array.isArray(val)) {
+          return { field, operator: 'IN', value: val };
+        }
+        if (val === null) {
+          return { field, operator: 'IS NULL', value: null };
+        }
+        return { field, operator: '=', value: val };
+      });
+
     const body = {
       schema: schemaToCalcite(schema, null, payload.table),
       table: payload.table, // Keep original case
-      whereColumns: payload.whereColumns,
+      whereColumns: payload.whereColumns ?? [],
+      whereFilters,
       dialect: 'POSTGRESQL'
     }
     return this.post('/compile/delete', body)

@@ -76,6 +76,7 @@ export class PermissionChecker {
       }
       
       // Check column mentions - more restrictive to avoid false matches
+      const skippedColumns: string[] = [];
       for (const [tableName, tableConfig] of tables) {
         if (!tableConfig?.columns) continue;
         for (const column of tableConfig.columns) {
@@ -83,20 +84,30 @@ export class PermissionChecker {
           // Skip common words that could appear in normal text
           const commonWords = ['id', 'name', 'email', 'created', 'updated', 'status', 'type'];
           if (commonWords.includes(column.name.toLowerCase())) {
+            skippedColumns.push(`${tableName}.${column.name}`);
             continue;
           }
-          
+
           const escapedColumnName = column.name.toLowerCase().replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
           const columnPattern = new RegExp(`\\b${escapedColumnName}\\b`, 'i');
-          
+
           if (columnPattern.test(inputLower)) {
             foundMentions.push(`${tableName}.${column.name}`);
-            
+
             if (!grantStore.checkColumnAccess(userId, tableName, column.name, 'read')) {
               denied.push(`${tableName}.${column.name}`);
             }
           }
         }
+      }
+
+      // Single summary line for skipped common word columns
+      if (skippedColumns.length > 0) {
+        console.debug(
+          `[DEBUG] Skipped ${skippedColumns.length} common word columns ` +
+          `(${skippedColumns.slice(0, 5).join(', ')}` +
+          `${skippedColumns.length > 5 ? ', ...' : ''})`
+        );
       }
       
       if (denied.length > 0) {

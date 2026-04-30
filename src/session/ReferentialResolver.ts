@@ -50,15 +50,22 @@ export function isReferentialQuery(input: string): boolean {
  * that includes cursor context for resolving referential queries
  */
 export function buildCursorSystemPromptFragment(cursor: SessionCursor): string {
-  const contextDetails = cursor.ids
+  const whereDescription = cursor.ids
     ? `Resolved IDs: ${JSON.stringify(cursor.ids)}`
-    : `Source filter: ${JSON.stringify(cursor.sourceFilter)}`;
+    : `Source filter: ${JSON.stringify(cursor.sourceFilter)}` +
+      `\nNOTE: This is a large result set (${cursor.rowCount} rows). ` +
+      `The write operation will affect ALL matching rows.`;
 
-  return `PRIOR QUERY CONTEXT:
-The user's last query was: "${cursor.description}"
-Table: ${cursor.table}
-Rows returned: ${cursor.rowCount}
-${contextDetails}
-
-If the user's current input references this result using terms like "this", "these", "it", "them" or "the [entity]", resolve the target using the above context. Do NOT emit $ticket_id or similar unresolved parameters — use the actual IDs or filter directly in the plan.`;
+  return [
+    'PRIOR QUERY CONTEXT:',
+    `Last query: "${cursor.description}"`,
+    `Table: ${cursor.table}`,
+    `Rows returned: ${cursor.rowCount}`,
+    whereDescription,
+    '',
+    'If the user references this result with "this", "these", ' +
+    '"it", "them", or "the [entity]", use the above context to ' +
+    'resolve the target. Use actual IDs or filter directly in the ' +
+    'plan — do NOT emit unresolved $param references.',
+  ].join('\n');
 }

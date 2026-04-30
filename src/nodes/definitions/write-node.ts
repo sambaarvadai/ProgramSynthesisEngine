@@ -32,6 +32,7 @@ import {
 } from '../../schema/ColumnClassifier.js'
 import { crmSchema } from '../../schema/crm-schema.js'
 import { buildWritePredicate, predicateToSQL } from './write-predicate-builder.js'
+import { validateForeignKeys } from '../../write/FKValidator.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -123,9 +124,59 @@ export function createWriteNodeDefinition(
         }
       }
 
+      // Soft delete routing: rewrite DELETE as UPDATE if table has deleted_at column
+      if (payload.mode === 'delete' && payload.table && (crmSchema as any).parsed?.tables.has(payload.table)) {
+        const tableColumns = (crmSchema as any).parsed.tables.get(payload.table)?.columns;
+        const hasSoftDelete = tableColumns?.has('deleted_at');
+        
+        if (hasSoftDelete) {
+          console.log(
+            `[WriteNode] Soft delete: rewriting DELETE on ` +
+            `${payload.table} to UPDATE SET deleted_at = NOW()` 
+          );
+          
+          payload.mode = 'update';
+          payload.staticValues = payload.staticValues ?? {};
+          payload.staticValues['deleted_at'] = 'NOW()';
+          
+          // updated_at if the table has it
+          const hasUpdatedAt = tableColumns?.has('updated_at');
+          if (hasUpdatedAt) {
+            payload.staticValues['updated_at'] = 'NOW()';
+          }
+          
+          // Fall through to UPDATE path — Calcite handles it
+          // No further DELETE-specific code needed
+        }
+        // If no deleted_at column: proceed with hard DELETE below
+      }
+
       // Normalise input to a flat row array
       const inputRows = extractRows(input)
       console.log(`[WriteNode] Extracted ${inputRows.length} rows from input`);
+
+      // FK validation for INSERT and UPDATE modes
+      // Only validate FK existence for INSERT and UPDATE
+      // Skip for DELETE (deleting a non-existent row is a no-op)
+      if (payload.mode === 'insert' || payload.mode === 'update' || payload.mode === 'upsert') {
+        const pool = (backend as any).pool;
+        const fkViolations = await validateForeignKeys(
+          payload,
+          crmSchema,
+          pool
+        );
+        
+        if (fkViolations.length > 0) {
+          const messages = fkViolations
+            .map(v => `  • ${v.message}`)
+            .join('\n');
+          
+          throw new Error(
+            `FK validation failed:\n${messages}\n` +
+            `Fix the referenced values before retrying.` 
+          );
+        }
+      }
 
       // Check for empty input rows - try cursor-driven path for UPDATE/DELETE with whereColumns
       const isEmptyInput = inputRows.length === 0 || inputRows.every(r => Object.keys(r).length === 0);
@@ -134,16 +185,20 @@ export function createWriteNodeDefinition(
         if (cursor) {
           console.log(`[WriteNode] Using cursor-driven WHERE for ${payload.mode} on ${payload.table}`);
 
-          // Emit warning for large cursor-driven updates
-          if (cursor.rowCount > 50) {
-            console.warn(
-              `[WriteNode] Cursor-driven update will affect ~${cursor.rowCount} rows. ` +
-              `Table: ${cursor.table}. Proceeding.`
+          if (sessionCursorStore?.isExpired()) {
+            throw new Error(
+              '[WriteNode] Session cursor expired — ' +
+              'please re-run your query to refresh context'
             );
           }
 
-          const { clause, params } = buildWhereFromCursor(cursor);
-          console.log(`[WriteNode] Using cursor-driven WHERE: ${clause}`);
+          const whereResult = buildWhereFromCursor(cursor, 1);
+          console.log(
+            `[WriteNode] Cursor-driven ${payload.mode}: ` +
+            `table=${cursor.table}, ` +
+            `rows=${cursor.rowCount}, ` +
+            `clause=${whereResult.clause}`
+          );
 
           // Build SET clause for UPDATE mode
           if (payload.mode === 'update') {
@@ -159,8 +214,8 @@ export function createWriteNodeDefinition(
             const setClause = allSetColumns.map((col, i) => `"${col}" = $${i + 1}`).join(', ');
             const setParams = allSetColumns.map(col => staticValues[col] ?? null);
 
-            const sql = `UPDATE "${payload.table}" SET ${setClause} WHERE ${clause}`;
-            const allParams = [...setParams, ...params];
+            const sql = `UPDATE "${payload.table}" SET ${setClause} WHERE ${whereResult.clause}`;
+            const allParams = [...setParams, ...whereResult.params];
 
             console.log(`[WriteNode] Cursor-driven UPDATE SQL: ${sql}`);
             await backend.rawQuery(sql, allParams);
@@ -171,9 +226,9 @@ export function createWriteNodeDefinition(
 
             return createWriteSummaryResult(payload.table, payload.mode, cursor.rowCount, undefined, staticValues);
           } else if (payload.mode === 'delete') {
-            const sql = `DELETE FROM "${payload.table}" WHERE ${clause}`;
+            const sql = `DELETE FROM "${payload.table}" WHERE ${whereResult.clause}`;
             console.log(`[WriteNode] Cursor-driven DELETE SQL: ${sql}`);
-            await backend.rawQuery(sql, params);
+            await backend.rawQuery(sql, whereResult.params);
 
             // Clear cursor after successful execution
             sessionCursorStore?.clear();
@@ -397,7 +452,94 @@ export function createWriteNodeDefinition(
       // Validate and normalise columns present in actual rows
       const { dataRows, effectiveColumns, dynamicColumns } = prepareRows(inputRows, payload)
       console.log(`[WriteNode] Fallback - effectiveColumns: ${effectiveColumns.length}, dynamicColumns: ${dynamicColumns.length}, dataRows: ${dataRows.length}`);
-      
+
+      // Row-driven bulk UPDATE path
+      // Fires when whereColumns specifies which upstream field to use as WHERE
+      // and inputRows contains the actual values for that field
+
+      const whereCol = payload.whereColumns?.[0];
+      const hasRowDrivenWhere =
+        whereCol &&
+        inputRows.length > 0 &&
+        inputRows[0][whereCol] !== undefined &&
+        Object.keys(payload.staticWhere ?? {}).length === 0;
+
+      if (hasRowDrivenWhere) {
+        // Extract WHERE values from all upstream rows
+        const whereValues = inputRows
+          .map((row: any) => row[whereCol])
+          .filter((v: any) => v !== null && v !== undefined);
+
+        if (whereValues.length === 0) {
+          throw new Error(
+            `[WriteNode] Row-driven UPDATE: no values found ` +
+            `for whereColumn "${whereCol}" in input rows`
+          );
+        }
+
+        console.log(
+          `[WriteNode] Row-driven bulk UPDATE: ` +
+          `${whereValues.length} rows via "${whereCol}" = ANY(...)`
+        );
+
+        // Build SET clause from staticValues
+        const SQL_EXPRESSIONS = new Set([
+          'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE'
+        ]);
+        const setClauses: string[] = [];
+        const setParams: any[] = [];
+        let paramIndex = 1;
+
+        for (const [col, val] of Object.entries(payload.staticValues ?? {})) {
+          // Skip immutable columns (already stripped above)
+          if (typeof val === 'string' && SQL_EXPRESSIONS.has(val.trim())) {
+            setClauses.push(`"${col}" = ${val.trim()}`);
+          } else {
+            setClauses.push(`"${col}" = $${paramIndex}`);
+            setParams.push(val);
+            paramIndex++;
+          }
+        }
+
+        if (setClauses.length === 0) {
+          throw new Error(
+            `[WriteNode] Row-driven UPDATE: no SET values in staticValues`
+          );
+        }
+
+        // Single efficient query using ANY()
+        const sql =
+          `UPDATE "${payload.table}" ` +
+          `SET ${setClauses.join(', ')} ` +
+          `WHERE "${whereCol}" = ANY($${paramIndex})`;
+
+        const params = [...setParams, whereValues];
+
+        console.log(`[WriteNode] Row-driven UPDATE SQL: ${sql}`);
+        console.log(
+          `[WriteNode] Row-driven UPDATE params: ` +
+          `[${setParams.map(p => JSON.stringify(p)).join(', ')}, ` +
+          `[${whereValues.length} ids]]`
+        );
+
+        const result = await backend.rawQuery(sql, params);
+        console.log(`[WriteNode] ${result.rowCount} rows affected`);
+
+        // Return summary in same shape as other paths
+        const filteredStaticValues = Object.fromEntries(
+          Object.entries(payload.staticValues ?? {})
+            .filter(([k]) => k !== 'workspace_id')
+        );
+
+        return createWriteSummaryResult(
+          payload.table,
+          'update',
+          result.rowCount ?? 0,
+          { [whereCol]: `${whereValues.length} values` },
+          filteredStaticValues
+        );
+      }
+
       // Check for UPDATE-specific requirements
       if (payload.mode === 'update') {
         const hasStaticSets = Object.keys(payload.staticValues ?? {}).length > 0
