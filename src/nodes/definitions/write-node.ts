@@ -804,18 +804,18 @@ function prepareRows(
   inputRows: Row[],
   payload: WritePayload,
 ): { dataRows: Row[]; effectiveColumns: string[]; dynamicColumns: string[] } {
-  console.log(`[WriteNode] prepareRows called for table: ${payload.table}, mode: ${payload.mode}`);
-  console.log(`[WriteNode] prepareRows - input rows: ${inputRows.length}, payload columns: ${payload.columns?.length || 0}`);
+  console.debug(`[WriteNode] prepareRows called for table: ${payload.table}, mode: ${payload.mode}`);
+  console.debug(`[WriteNode] prepareRows - input rows: ${inputRows.length}, payload columns: ${payload.columns?.length || 0}`);
   
   if (payload.mode === 'delete') {
-    console.log(`[WriteNode] prepareRows - delete mode, returning input rows`);
+    console.debug(`[WriteNode] prepareRows - delete mode, returning input rows`);
     return { dataRows: inputRows, effectiveColumns: [], dynamicColumns: [] }
   }
 
   const firstRow = inputRows[0]
-  console.log(`[WriteNode] prepareRows - first row keys:`, Object.keys(firstRow));
-  console.log(`[WriteNode] prepareRows - staticValues:`, payload.staticValues);
-  console.log(`[WriteNode] prepareRows - columnAliases:`, payload.columnAliases);
+  console.debug(`[WriteNode] prepareRows - first row keys:`, Object.keys(firstRow));
+  console.debug(`[WriteNode] prepareRows - staticValues:`, payload.staticValues);
+  console.debug(`[WriteNode] prepareRows - columnAliases:`, payload.columnAliases);
   
   // Calculate effectiveColumns using the same resolution logic as row building
   const effectiveColumns = payload.columns.filter(col => {
@@ -826,7 +826,7 @@ function prepareRows(
     return false
   })
   
-  console.log(`[WriteNode] prepareRows - effectiveColumns: ${effectiveColumns.length}: [${effectiveColumns.join(', ')}]`);
+  console.debug(`[WriteNode] prepareRows - effectiveColumns: ${effectiveColumns.length}: [${effectiveColumns.join(', ')}]`);
 
   // Helper to resolve special values like NOW()
   const resolveValue = (val: unknown): unknown => {
@@ -847,9 +847,9 @@ function prepareRows(
     }
     
     if (index === 0) {
-      console.log(`[WriteNode] Input rows sample:`, JSON.stringify(inputRows.slice(0, 2), null, 2))
-      console.log(`[WriteNode] Payload whereColumns:`, JSON.stringify(payload.whereColumns, null, 2))
-      console.log(`[WriteNode] prepareRows - sample merged row:`, mergedRow);
+      console.debug(`[WriteNode] Input rows sample:`, JSON.stringify(inputRows.slice(0, 2), null, 2))
+      console.debug(`[WriteNode] Payload whereColumns:`, JSON.stringify(payload.whereColumns, null, 2))
+      console.debug(`[WriteNode] prepareRows - sample merged row:`, mergedRow);
     }
     return mergedRow;
   })
@@ -862,11 +862,11 @@ function prepareRows(
     return dataRows.some(row => row[col] !== undefined)
   })
 
-  console.log(`[WriteNode] prepareRows - staticValues:`, payload.staticValues);
-  console.log(`[WriteNode] prepareRows - staticKeys: [${Array.from(staticKeys).join(', ')}]`);
-  console.log(`[WriteNode] prepareRows - original columns: [${payload.columns.join(', ')}]`);
-  console.log(`[WriteNode] prepareRows - dynamicColumns: [${dynamicColumns.join(', ')}]`);
-  console.log(`[WriteNode] prepareRows - returning ${dataRows.length} dataRows`);
+  console.debug(`[WriteNode] prepareRows - staticValues:`, payload.staticValues);
+  console.debug(`[WriteNode] prepareRows - staticKeys: [${Array.from(staticKeys).join(', ')}]`);
+  console.debug(`[WriteNode] prepareRows - original columns: [${payload.columns.join(', ')}]`);
+  console.debug(`[WriteNode] prepareRows - dynamicColumns: [${dynamicColumns.join(', ')}]`);
+  console.debug(`[WriteNode] prepareRows - returning ${dataRows.length} dataRows`);
   return { dataRows, effectiveColumns, dynamicColumns }
 }
 

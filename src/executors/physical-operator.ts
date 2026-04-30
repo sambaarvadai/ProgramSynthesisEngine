@@ -1,8 +1,8 @@
 // Core batch iterator protocol for all physical operators
 
-import type { ExecutionContext } from '../core/context/execution-context.js';
+import type { ExecutionContext, ExecutionBudget } from '../core/context/execution-context.js';
 import type { RowBatch } from '../core/types/row.js';
-import type { ExecutionBudget } from '../core/context/execution-budget.js';
+import type { TraceEvent } from '../core/context/execution-trace.js';
 import { traceEvent } from '../core/context/execution-trace.js';
 
 export type PhysicalOperatorState = 'idle' | 'open' | 'exhausted' | 'closed' | 'error';

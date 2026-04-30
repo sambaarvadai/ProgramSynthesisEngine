@@ -69,9 +69,9 @@ export class QueryPlanner {
     }
 
     // 3. Where filter
-    console.log(`[QueryPlanner] Processing where clause:`, ast.where ? 'exists' : 'none');
+    console.debug(`[QueryPlanner] Processing where clause:`, ast.where ? 'exists' : 'none');
     if (ast.where) {
-      console.log(`[QueryPlanner] Where predicate:`, JSON.stringify(ast.where, null, 2));
+      console.debug(`[QueryPlanner] Where predicate:`, JSON.stringify(ast.where, null, 2));
       const filterNodeId = this.generateId();
       const filterNode: QueryDAGNode = {
         id: filterNodeId,
@@ -81,7 +81,7 @@ export class QueryPlanner {
       };
       nodes.set(filterNodeId, filterNode);
       currentRoot = filterNodeId;
-      console.log(`[QueryPlanner] Filter node created with id: ${filterNodeId}`);
+      console.debug(`[QueryPlanner] Filter node created with id: ${filterNodeId}`);
     }
 
     // 4. Aggregation
@@ -190,14 +190,6 @@ export class QueryPlanner {
       applied.push('projection_pushdown');
     }
 
-    // Optimization 3: Join Reorder - DISABLED for now due to issues with LEFT JOINs
-    // const joinResult = this.joinReorder(currentNodes, currentRoot);
-    // if (joinResult.applied) {
-    //   currentNodes = joinResult.nodes;
-    //   currentRoot = joinResult.root;
-    //   applied.push('join_reorder');
-    // }
-
     return {
       nodes: currentNodes,
       root: currentRoot,
@@ -273,7 +265,7 @@ export class QueryPlanner {
     }
 
     // Find Filter nodes above Join nodes
-    console.log(`[QueryPlanner] Starting predicate pushdown, checking ${newNodes.size} nodes`);
+    console.debug(`[QueryPlanner] Starting predicate pushdown, checking ${newNodes.size} nodes`);
     for (const [nodeId, node] of Array.from(newNodes.entries())) {
       if (node.kind === 'Filter') {
         console.log(`[QueryPlanner] Found Filter node ${nodeId}, checking for pushdown`);
@@ -358,40 +350,6 @@ export class QueryPlanner {
     // Future implementation should modify Scan node columns directly instead
     // of inserting new Project nodes.
     return { nodes, root, applied: false };
-  }
-
-  private joinReorder(
-    nodes: Map<QueryDAGNodeId, QueryDAGNode>,
-    root: QueryDAGNodeId
-  ): { nodes: Map<QueryDAGNodeId, QueryDAGNode>; root: QueryDAGNodeId; applied: boolean } {
-    const newNodes = new Map(nodes);
-    let applied = false;
-
-    // Simple heuristic: put smaller tables on build side
-    for (const [nodeId, node] of Array.from(newNodes.entries())) {
-      if (node.kind === 'Join') {
-        const leftScan = this.findScanNode(newNodes, node.left);
-        const rightScan = this.findScanNode(newNodes, node.right);
-
-        if (leftScan && rightScan) {
-          const leftSize = leftScan.payload.schema.columns.length;
-          const rightSize = rightScan.payload.schema.columns.length;
-
-          // If right table is smaller, swap sides
-          if (rightSize < leftSize) {
-            const swappedJoin: QueryDAGNode = {
-              ...node,
-              left: node.right,
-              right: node.left
-            };
-            newNodes.set(nodeId, swappedJoin);
-            applied = true;
-          }
-        }
-      }
-    }
-
-    return { nodes: newNodes, root, applied };
   }
 
   private generateId(): QueryDAGNodeId {

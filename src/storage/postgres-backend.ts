@@ -91,7 +91,7 @@ export class PostgresBackend implements StorageBackend {
       let params: Value[] = [];
 
       if (opts.predicate && this.isSimplePredicate(opts.predicate)) {
-        console.log(`[PostgresBackend] Processing predicate:`, JSON.stringify(opts.predicate, null, 2));
+        console.debug(`[PostgresBackend] Processing predicate:`, JSON.stringify(opts.predicate, null, 2));
         const { clause, params: sqlParams } = this.predicateToSQL(opts.predicate, [], opts.table);
         console.log(`[PostgresBackend] Generated WHERE clause:`, clause);
         console.log(`[PostgresBackend] WHERE params:`, sqlParams);

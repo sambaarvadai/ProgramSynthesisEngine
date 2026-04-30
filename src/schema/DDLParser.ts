@@ -343,11 +343,6 @@ function extractColumn(item: any): RawColumnDef {
   let defaultRaw: string | null = null;
   if (item.default_val) {
     defaultRaw = stringifyDefault(item.default_val);
-    // Debug: log lifecycle_stage default
-    if (name === 'lifecycle_stage') {
-      console.log('[DDLParser] lifecycle_stage defaultRaw:', defaultRaw);
-      console.log('[DDLParser] lifecycle_stage default_val:', JSON.stringify(item.default_val));
-    }
   }
 
   // Check constraint

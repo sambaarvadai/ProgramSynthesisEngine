@@ -186,12 +186,6 @@ export namespace substrait {
     extensionUri: string
   }
 
-  export interface Plan {
-    version: string
-    relations: RelRoot[]
-    extensions: Extension[]
-  }
-
   export const Plan = {
     decode: (binary: Uint8Array): Plan => {
       // Mock implementation - in real protobuf this would decode binary

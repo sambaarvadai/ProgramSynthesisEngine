@@ -23,34 +23,6 @@ export {
   BudgetExceededError
 } from './specific-errors.js';
 
-// Temporarily comment out complex exports to unblock CLI
-// Error capture and aggregation
-// export {
-//   ErrorCapture,
-//   ErrorSummary,
-//   ErrorPattern,
-//   type ErrorPattern as IErrorPattern
-// } from './error-capture.js';
-
-// Error response framing
-// export {
-//   ErrorFramer,
-//   Audience,
-//   ErrorResponse,
-//   FormattedErrorDisplay,
-//   type ErrorResponse as IErrorResponse,
-//   type FormattedErrorDisplay as IFormattedErrorDisplay
-// } from './error-response.js';
-
-// Error monitoring and analytics
-// export {
-//   ErrorMonitoring,
-//   ErrorMetrics,
-//   ErrorReport,
-//   type ErrorMetrics as IErrorMetrics,
-//   type ErrorReport as IErrorReport
-// } from './error-monitoring.js';
-
 // Import all types for use in ErrorUtils
 import {
   ErrorCategory,

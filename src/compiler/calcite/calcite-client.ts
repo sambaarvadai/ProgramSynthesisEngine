@@ -256,8 +256,8 @@ function schemaToCalcite(
 ): any[] {
   // Pass every table in the schema - Calcite needs to see any table that 
   // could appear in a subquery, even if it's not in the main FROM/JOIN list
-  console.log('[schemaToCalcite] Schema tables passed to Calcite:', Array.from(schema.tables.keys()));
-  console.log('[schemaToCalcite] Note: including all schema tables (not just query tables) to support subqueries');
+  console.debug('[schemaToCalcite] Schema tables passed to Calcite:', Array.from(schema.tables.keys()));
+  console.debug('[schemaToCalcite] Note: including all schema tables (not just query tables) to support subqueries');
   
   // Safety net: extract tables from subquery filter values
   const subqueryTables = intent ? extractSubqueryTables(intent.filters || []) : []

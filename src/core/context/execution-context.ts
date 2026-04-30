@@ -5,6 +5,8 @@ import type { Scope, ScopeKind } from '../scope/scope.js';
 import { createScope } from '../scope/scope.js';
 import type { ExecutionBudget } from './execution-budget.js';
 import { defaultBudget } from './execution-budget.js';
+
+export type { ExecutionBudget };
 import type { ExecutionTrace } from './execution-trace.js';
 
 export interface ExecutionContext {

@@ -379,15 +379,15 @@ export class Scheduler {
     }
 
     // First, try to collect from exit nodes (this should be the primary behavior)
-    console.log(`[Scheduler] Collecting outputs from exit nodes: ${JSON.stringify(graph.exitNodes)}`);
+    console.debug(`[Scheduler] Collecting outputs from exit nodes: ${JSON.stringify(graph.exitNodes)}`);
     let collectedFromExitNodes = false;
     for (const exitNodeId of graph.exitNodes) {
       const exitState = state.nodeStates.get(exitNodeId);
-      console.log(`[Scheduler] Exit node ${exitNodeId}: state=${exitState?.status}, hasOutput=${exitState?.output !== undefined}`);
+      console.debug(`[Scheduler] Exit node ${exitNodeId}: state=${exitState?.status}, hasOutput=${exitState?.output !== undefined}`);
       if (exitState?.output !== undefined) {
         outputs.set(exitNodeId, exitState.output);
         collectedFromExitNodes = true;
-        console.log(`[Scheduler] Collected output from exit node: ${exitNodeId}`);
+        console.debug(`[Scheduler] Collected output from exit node: ${exitNodeId}`);
       }
     }
     
@@ -401,9 +401,9 @@ export class Scheduler {
     
     // Only use the special fallback case if we still have no outputs
     if (outputs.size === 0 && outputNode && outputNode.kind === 'output') {
-      console.log(`[Scheduler] Using fallback case - collecting from _output inputs`);
+      console.debug(`[Scheduler] Using fallback case - collecting from _output inputs`);
       const incomingEdges = getIncomingDataEdges(graph, '_output');
-      console.log(`[Scheduler] _output incoming edges: ${JSON.stringify(incomingEdges.map(e => ({from: e.from, to: e.to})))}`);
+      console.debug(`[Scheduler] _output incoming edges: ${JSON.stringify(incomingEdges.map(e => ({from: e.from, to: e.to})))}`);
       for (const edge of incomingEdges) {
         const sourceState = state.nodeStates.get(edge.from);
         console.log(`[Scheduler] Checking edge from ${edge.from}: state=${sourceState?.status}, hasOutput=${sourceState?.output !== undefined}`);
@@ -602,7 +602,7 @@ export class Scheduler {
       const inputs = getNodeInputs(nodeId, graph, state);
       
       // Debug: Log node execution start
-      console.log(`[Scheduler] Executing node ${nodeId} (${node.kind}) with inputs:`, {
+      (nodeId.startsWith('_') ? console.debug : console.log)(`[Scheduler] Executing node ${nodeId} (${node.kind}) with inputs:`, {
         inputKeys: Object.keys(inputs),
         inputSample: inputs['input'] ? 
           (inputs['input'].kind === 'tabular' ? 
@@ -704,7 +704,7 @@ export class Scheduler {
       );
 
       // Debug: Log successful completion
-      console.log(`[Scheduler] Node ${nodeId} completed successfully, output type:`, output?.kind);
+      (nodeId.startsWith('_') ? console.debug : console.log)(`[Scheduler] Node ${nodeId} completed successfully, output type:`, output?.kind);
 
       // Increment LLM budget after successful LLM execution
       if (node.kind === 'llm') {

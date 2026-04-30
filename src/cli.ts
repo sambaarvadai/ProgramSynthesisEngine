@@ -1303,37 +1303,46 @@ async function main() {
       console.log();
     } catch (error) {
       console.log();
-      
-      // Check for FK validation errors - display cleanly without AI analysis
-      if ((error as Error).message.startsWith('FK validation failed')) {
-        console.log('\n❌ Cannot complete this operation:\n');
-        console.log((error as Error).message);
-        console.log(
-          '\nCheck that all referenced records exist before retrying.'
-        );
-        // Do NOT show the AI error analysis for FK violations
-        // They are self-explanatory
-        continue;
-      }
-      
+
+      // Define known error prefixes that don't need AI analysis
+      const SELF_EXPLANATORY_ERRORS = [
+        'FK validation failed',
+        'Schema validation failed',
+        'Schema validation (write)',
+        'UPDATE without WHERE clause',
+        'DELETE requires whereColumns',
+        'SKIP_CALCITE',
+        'Cursor has no resolvable WHERE',
+        'Session cursor expired',
+        'Column',   // schema column errors
+        'Table not found',
+      ];
+
+      const isSelfExplanatory = SELF_EXPLANATORY_ERRORS.some(
+        prefix => (error as Error).message.startsWith(prefix) ||
+                  (error as Error).message.includes(prefix)
+      );
+
       console.log('\nError:', (error as Error).message);
       console.log('\nStack trace:');
       console.log((error as Error).stack);
-      
-      // Get detailed error analysis from LLM
-      console.log('\nAnalyzing error with AI...');
-      try {
-        const analysis = await errorAnalyzer.analyzeError(error as Error, {
-          operation: 'pipeline_execution',
-          additionalInfo: 'Error occurred during pipeline execution in Program Synthesis Engine'
-        });
-        
-        console.log(errorAnalyzer.formatForDisplay(analysis));
-      } catch (analysisError) {
-        console.log('\nFailed to get AI analysis:', analysisError instanceof Error ? analysisError.message : String(analysisError));
-        console.log('\nBasic error information:');
+
+      // Get detailed error analysis from LLM - only for unexpected errors
+      if (!isSelfExplanatory) {
+        console.log('\nAnalyzing error with AI...');
+        try {
+          const analysis = await errorAnalyzer.analyzeError(error as Error, {
+            operation: 'pipeline_execution',
+            additionalInfo: 'Error occurred during pipeline execution in Program Synthesis Engine'
+          });
+
+          console.log(errorAnalyzer.formatForDisplay(analysis));
+        } catch (analysisError) {
+          console.log('\nFailed to get AI analysis:', analysisError instanceof Error ? analysisError.message : String(analysisError));
+          console.log('\nBasic error information:');
+        }
       }
-      
+
       console.log();
     }
   }

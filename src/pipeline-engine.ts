@@ -22,7 +22,6 @@ import { QueryIntentGenerator as QueryIntentGeneratorClass, TablePreSelector } f
 import { apiRegistryStore } from './config/api-registry-store.js';
 import { ApiPreSelector } from './compiler/http/api-pre-selector.js';
 import { registerBuiltinFunctions } from './functions/index.js';
-// import { ErrorMonitoring, ErrorUtils } from './core/errors/index.js';
 import { SchemaValidator } from './core/validation/schema-validator.js';
 import { PermissionChecker, type GrantedSchemaResult, type JoinCompletenessResult, type PostIntentValidationResult, type MissingColumnResult } from './auth/permission-checker.js';
 import { auditStore, AuditAction } from './auth/audit-store.js';
@@ -123,7 +122,6 @@ export class PipelineEngine {
   public calciteClient: CalciteClient;
   private schemaValidator: SchemaValidator;
   private permissionChecker: PermissionChecker;
-  // public errorMonitoring: ErrorMonitoring;
 
   constructor(private config: PipelineEngineConfig) {
     // Initialize Anthropic client for transform enrichment
@@ -200,17 +198,6 @@ export class PipelineEngine {
       batchSize: config.defaultBatchSize || 100,
       calciteClient: this.calciteClient,
     });
-
-    // Initialize error monitoring system
-    // this.errorMonitoring = new ErrorMonitoring({
-    //   alertThresholds: {
-    //     critical_error_rate: { value: 0.1, severity: 'critical' as any },
-    //     total_error_rate: { value: 1.0, severity: 'error' as any },
-    //     error_burst: { value: 5, severity: 'warning' as any }
-    //   },
-    //   maxHistorySize: 1000,
-    //   enableAutoRecovery: true
-    // });
 
     // Initialize schema validator for pre-flight checks
     this.schemaValidator = new SchemaValidator(config.schema || { 
@@ -752,11 +739,6 @@ export class PipelineEngine {
   ): Promise<RunResult> {
     if (plan.compilationErrors.length > 0) {
       const compilationError = new PipelineCompilationError(plan.compilationErrors);
-      // this.errorMonitoring.captureError(compilationError, {
-      //   pipelineId: plan.graph.id,
-      //   operation: 'pipeline_execution',
-      //   stage: 'validation'
-      // });
       throw compilationError;
     }
 
@@ -962,30 +944,6 @@ export class PipelineEngine {
 
     return lines.join('\n');
   }
-
-  /**
-   * Get comprehensive error report for monitoring and analytics
-   */
-  // getErrorReport(timeRange?: { start: number; end: number }) {
-  //   return this.errorMonitoring.generateReport(timeRange);
-  // }
-
-  /**
-   * Get formatted error report for user display
-   */
-  // getFormattedErrorReport(audience: 'user' | 'developer' = 'user', timeRange?: { start: number; end: number }) {
-  //   const report = this.getErrorReport(timeRange);
-  //   return audience === 'user' 
-  //     ? this.errorMonitoring.formatReportForUser(report)
-  //     : this.errorMonitoring.formatReportForDeveloper(report);
-  // }
-
-  /**
-   * Get active error alerts
-   */
-  // getActiveAlerts() {
-  //   return this.errorMonitoring.getActiveAlerts();
-  // }
 
   private async enrichNodes(
     graph: PipelineGraph,
@@ -1613,8 +1571,8 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
     
     // Extract existing fields from the original step configuration
     const originalFields = step.config?.fields as Record<string, any> || {};
-    console.log('[Write Enrichment] Raw step.config.fields:', step.config?.fields);
-    console.log('[Write Enrichment] originalFields type:', Array.isArray(originalFields) ? 'array' : 'object');
+    console.log('[WriteEnrichment] Raw step.config.fields:', step.config?.fields);
+    console.log('[WriteEnrichment] originalFields type:', Array.isArray(originalFields) ? 'array' : 'object');
     
     // ColumnClassifier integration: auto-inject session-scoped values
     const targetTable = step.config?.table as string;
@@ -1642,12 +1600,12 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
             );
             if (result.rows.length > 0) {
               crmUserId = result.rows[0].id;
-              console.log(`[Write Enrichment] Mapped auth user ${userId} to CRM user ID ${crmUserId}`);
+              console.log(`[WriteEnrichment] Mapped auth user ${userId} to CRM user ID ${crmUserId}`);
             } else {
-              console.warn(`[Write Enrichment] CRM user not found for email ${user.username}, using default ID 1`);
+              console.debug('[WriteEnrichment] CRM user not found, using default userId=1');
             }
           } catch (err) {
-            console.warn(`[Write Enrichment] Failed to lookup CRM user: ${(err as Error).message}, using default ID 1`);
+            console.warn(`[WriteEnrichment] Failed to lookup CRM user: ${(err as Error).message}, using default ID 1`);
           }
         }
       }
@@ -1663,10 +1621,6 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
         sessionCtx, 
         mode
       );
-      
-      // Debug: log lifecycle_stage trait
-      const lifecycleTrait = classifications.get('lifecycle_stage');
-      console.log('[ColumnClassifier] lifecycle_stage trait:', JSON.stringify(lifecycleTrait, null, 2));
       
       autoValues = getAutoResolvedValues(classifications);
       exclusions = buildIntentExclusionList(classifications);
@@ -1759,14 +1713,14 @@ Return ONLY raw JSON.`;
 
     try {
       const config = JSON.parse(clean);
-      console.log('[Write Enrichment] Parsed config:', JSON.stringify(config, null, 2));
+      console.debug('[WriteEnrichment] Parsed config:', JSON.stringify(config, null, 2));
       
       // Sanitize staticValues: remove entries where value === key (LLM hallucination)
       if (config.staticValues) {
         for (const [key, val] of Object.entries(config.staticValues)) {
           if (val === key) {
             console.warn(
-              `[Write Enrichment] Dropping staticValue '${key}': value equals key name ` +
+              `[WriteEnrichment] Dropping staticValue '${key}': value equals key name ` +
               `(likely LLM hallucination). Will be left for user to supply or default.` 
             )
             delete config.staticValues[key]
@@ -1787,7 +1741,7 @@ Return ONLY raw JSON.`;
           if (typeof val === 'number') {
             if (colType === 'TEXT' || colType === 'VARCHAR' || colType === 'CHARACTER VARYING') {
               obj[key] = String(val);
-              console.log(`[Write Enrichment] Converted ${key} from number to string for ${colType} column`);
+              console.log(`[WriteEnrichment] Converted ${key} from number to string for ${colType} column`);
             }
           }
         }
@@ -1814,29 +1768,29 @@ Return ONLY raw JSON.`;
       
       // Preserve original table name from step.config
       const tableName = step.config?.table as string ?? config.table ?? 'output';
-      console.log('[Write Enrichment] Table name:', tableName);
+      console.log('[WriteEnrichment] Table name:', tableName);
       
       // Merge original fields with LLM-generated configuration
       const mergedColumns: string[] = [];
       // Original static values take precedence over LLM-generated ones
       const mergedStaticValues: Record<string, any> = { ...config.staticValues };
-      console.log('[Write Enrichment] Original fields:', JSON.stringify(originalFields, null, 2));
-      console.log('[Write Enrichment] LLM config columns:', config.columns);
-      console.log('[Write Enrichment] LLM config staticValues:', config.staticValues);
+      console.log('[WriteEnrichment] Original fields:', JSON.stringify(originalFields, null, 2));
+      console.log('[WriteEnrichment] LLM config columns:', config.columns);
+      console.log('[WriteEnrichment] LLM config staticValues:', config.staticValues);
       
       // Process original fields
       if (Array.isArray(originalFields)) {
         // Handle array case - just use the field names directly as columns
-        console.log('[Write Enrichment] Processing originalFields as array');
+        console.log('[WriteEnrichment] Processing originalFields as array');
         for (const fieldName of originalFields) {
-          console.log(`[Write Enrichment] Processing array field: '${fieldName}'`);
+          console.log(`[WriteEnrichment] Processing array field: '${fieldName}'`);
           if (!mergedColumns.includes(fieldName)) {
             mergedColumns.push(fieldName);
           }
         }
       } else {
         // Handle object case - process field/value pairs
-        console.log('[Write Enrichment] Processing originalFields as object');
+        console.log('[WriteEnrichment] Processing originalFields as object');
         for (const [fieldName, fieldValue] of Object.entries(originalFields)) {
           const fieldValueStr = String(fieldValue);
           
@@ -1873,7 +1827,7 @@ Return ONLY raw JSON.`;
           } else if (fieldValue === fieldName) {
             // Field name used as its own value - LLM hallucination
             // Treat as a dynamic column reference, not a static value
-            console.warn(`[Write Enrichment] Dropping self-referential value: '${fieldName}' = '${fieldValue}' - treating as dynamic column`)
+            console.warn(`[WriteEnrichment] Dropping self-referential value: '${fieldName}' = '${fieldValue}' - treating as dynamic column`)
             if (!mergedColumns.includes(fieldName)) {
               mergedColumns.push(fieldName)
             }
@@ -1885,23 +1839,23 @@ Return ONLY raw JSON.`;
       }
       
       // Add any additional columns from LLM config
-      console.log('[Write Enrichment] Adding LLM config columns to merged columns');
+      console.log('[WriteEnrichment] Adding LLM config columns to merged columns');
       for (const column of config.columns || []) {
-        console.log(`[Write Enrichment] Processing LLM column: '${column}'`);
+        console.log(`[WriteEnrichment] Processing LLM column: '${column}'`);
         if (!mergedColumns.includes(column)) {
           mergedColumns.push(column);
-          console.log(`[Write Enrichment] Added column '${column}' to merged columns`);
+          console.log(`[WriteEnrichment] Added column '${column}' to merged columns`);
         } else {
-          console.log(`[Write Enrichment] Column '${column}' already exists in merged columns`);
+          console.log(`[WriteEnrichment] Column '${column}' already exists in merged columns`);
         }
       }
-      console.log('[Write Enrichment] Final merged columns:', mergedColumns);
+      console.log('[WriteEnrichment] Final merged columns:', mergedColumns);
       
       // Re-apply auto-injected values (session_scoped, etc.) to ensure they're always preserved
       // even if not in originalFields or LLM output
       for (const [col, val] of Object.entries(autoValues)) {
         mergedStaticValues[col] = val;
-        console.log(`[Write Enrichment] Re-applied auto-injected value: ${col} = ${val}`);
+        console.log(`[WriteEnrichment] Re-applied auto-injected value: ${col} = ${val}`);
       }
 
       // AUDIT_TABLES: auto-inject timestamp = NOW() for audit/history tables
@@ -1924,14 +1878,14 @@ Return ONLY raw JSON.`;
         if (timestampCol) {
           if (!mergedStaticValues[timestampCol]) {
             mergedStaticValues[timestampCol] = 'NOW()';
-            console.log(`[Write Enrichment] Auto-injected ${timestampCol} = NOW() for audit table: ${tableName}`);
+            console.log(`[WriteEnrichment] Auto-injected ${timestampCol} = NOW() for audit table: ${tableName}`);
           }
           
           // Remove timestamp column from dynamic columns (it's not coming from upstream, it's always NOW())
           const timestampIndex = mergedColumns.indexOf(timestampCol);
           if (timestampIndex !== -1) {
             mergedColumns.splice(timestampIndex, 1);
-            console.log(`[Write Enrichment] Removed ${timestampCol} from dynamic columns for audit table: ${tableName}`);
+            console.log(`[WriteEnrichment] Removed ${timestampCol} from dynamic columns for audit table: ${tableName}`);
           }
         }
 
@@ -1995,7 +1949,7 @@ Return ONLY raw JSON.`;
       // These are template variables that weren't resolved and should be left for user to supply
       for (const [key, val] of Object.entries(mergedStaticValues)) {
         if (typeof val === 'string' && /^\$/.test(val)) {
-          console.log(`[Write Enrichment] Stripping unresolved param reference: ${key} = ${val}`);
+          console.log(`[WriteEnrichment] Stripping unresolved param reference: ${key} = ${val}`);
           delete mergedStaticValues[key];
         }
       }
@@ -2020,7 +1974,7 @@ Return ONLY raw JSON.`;
           // Check if this column appears in upstreamTables — if so,
           // it should be resolved from upstream, not staticValues
           console.warn(
-            `[Write Enrichment] Removing invalid INT value for ${col}: ` +
+            `[WriteEnrichment] Removing invalid INT value for ${col}: ` +
             `"${val}" — will be resolved from upstream row`
           );
           delete mergedStaticValues[col];
@@ -2048,7 +2002,7 @@ Return ONLY raw JSON.`;
           if (match && match !== strVal) {
             // Correct casing silently
             console.log(
-              `[Write Enrichment] Corrected enum casing: ` +
+              `[WriteEnrichment] Corrected enum casing: ` +
               `${col} = "${strVal}" → "${match}"`
             );
             mergedStaticValues[col] = match;
@@ -2062,7 +2016,7 @@ Return ONLY raw JSON.`;
               const defaultVal = colDef.defaultRaw.replace(/^'(.*)'$/, '$1');
               
               console.warn(
-                `[Write Enrichment] Invalid enum value for ${col}: ` +
+                `[WriteEnrichment] Invalid enum value for ${col}: ` +
                 `"${strVal}" not in [${enumValues.join(', ')}]. ` +
                 `Using schema default: "${defaultVal}"`
               );
@@ -2111,7 +2065,7 @@ Return ONLY raw JSON.`;
         datasource: 'default'
       };
       
-      console.log('[Write Enrichment] Final payload:', JSON.stringify(finalPayload, null, 2));
+      console.log('[WriteEnrichment] Final payload:', JSON.stringify(finalPayload, null, 2));
 
       // Auto-refresh updated_at on every UPDATE
       if (finalPayload.mode === 'update') {
