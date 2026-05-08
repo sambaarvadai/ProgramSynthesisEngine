@@ -129,6 +129,109 @@ LimitOperator    → short-circuits after N rows
 
 ---
 
+## Additional Features
+
+### Authorization & Access Control
+
+The engine includes a comprehensive authorization system that enforces table and column-level access permissions:
+
+- **PermissionChecker** — Validates access to tables and columns at multiple gates:
+  - Pre-intent: Scans natural language input for explicit table/column mentions
+  - Post-intent: Validates generated PipelineIntent against granted schema
+  - Post-enrichment: Validates fully enriched PipelineGraph with actual payloads
+- **GrantStore** — Manages user grants with database-backed storage
+- **AuditStore** — Logs all access attempts for compliance and debugging
+
+Access control supports:
+- Table-level read/write permissions
+- Column-level permissions
+- Join completeness checking (ensures bridge tables are accessible)
+- Required column validation for write operations
+
+### Semantic Caching
+
+Semantic caching reduces LLM API costs and latency by reusing similar queries:
+
+- **SemanticCache** — Uses Voyage AI embeddings to find semantically similar queries
+- **PlanSerializer** — Serializes/deserializes pipeline graphs for storage
+- **SchemaStateManager** — Tracks schema changes to invalidate stale cache entries
+
+Features:
+- Configurable similarity threshold (default: 0.92)
+- Workspace and source-type isolation
+- Automatic invalidation when sources change
+- Hit tracking and statistics
+- pgvector-based similarity search in Postgres
+
+### Schema Parsing & Inference
+
+The engine can parse SQL DDL and infer schema metadata:
+
+- **DDLParser** — Parses CREATE TABLE and CREATE INDEX statements using node-sql-parser
+- **ColumnClassifier** — Classifies columns by type (numeric, text, date, etc.)
+- **TraitInferencer** — Infers column traits (PII, enum, boolean, etc.)
+- **SchemaBuilder** — Constructs SchemaConfig from parsed DDL
+
+Capabilities:
+- Extracts tables, columns, foreign keys, indexes, and constraints
+- Builds foreign key relationship graph
+- Classifies CHECK constraints (enum, range, boolean, raw)
+- Provides structural helpers for join path analysis
+
+### Session Management
+
+Conversation sessions maintain context across multiple interactions:
+
+- **SessionManager** — Manages conversation history with automatic summarization
+- **SessionCursor** — Session-scoped cursor management for multi-turn queries
+- **ReferentialResolver** — Resolves cross-turn references (e.g., "those customers")
+
+Features:
+- Turn-by-turn history tracking
+- Automatic summarization after 30 turns
+- Context preservation for follow-up queries
+- Session isolation per user
+
+### Write Operations
+
+The engine supports data modification with validation:
+
+- **FKValidator** — Validates foreign key constraints before writes
+- **coerceColumnValue** — Type coercion for column values
+
+Write modes supported:
+- `insert` — Insert new rows
+- `insert_ignore` — Insert ignoring conflicts
+- `upsert` — Insert or update on conflict
+- `update` — Update existing rows
+- `delete` — Delete rows
+
+### Apache Calcite Integration
+
+Optional SQL optimization via Apache Calcite:
+
+- **CalciteClient** — Java service client for SQL compilation and optimization
+- Supports advanced query optimization and rewriting
+- Can be used as an alternative to the built-in query planner
+
+### HTTP/API Integration
+
+External API call support:
+
+- **ApiPreSelector** — Pre-selects relevant APIs from a registry
+- Enables HttpNode for per-row or batch API calls
+- API registry with endpoint metadata
+
+### Substrait Support
+
+Cross-engine query compatibility via Substrait:
+
+- **SubstraitTranslator** — Converts QueryAST to/from Substrait plan format
+- **SubstraitGenerator** — Python-based Substrait plan generation
+- Enables query portability across different query engines
+
+---
+
 ## Project Structure
 
 ```
@@ -152,10 +255,17 @@ src/
 │   │   ├── operator-tree-builder.ts  # DAG → physical operators
 │   │   ├── query-intent-generator.ts # NL → QueryIntent (Sonnet)
 │   │   └── table-pre-selector.ts # Schema narrowing (Haiku)
-│   └── pipeline/
-│       ├── pipeline-intent.ts    # LLM-facing pipeline intent schema
-│       ├── pipeline-compiler.ts  # Intent → PipelineGraph (deterministic)
-│       └── pipeline-intent-generator.ts  # NL → PipelineIntent (Sonnet)
+│   ├── pipeline/
+│   │   ├── pipeline-intent.ts    # LLM-facing pipeline intent schema
+│   │   ├── pipeline-compiler.ts  # Intent → PipelineGraph (deterministic)
+│   │   └── pipeline-intent-generator.ts  # NL → PipelineIntent (Sonnet)
+│   ├── calcite/                  # Apache Calcite SQL compilation service
+│   │   └── calcite-client.ts     # Java service client for SQL optimization
+│   ├── http/                     # HTTP/API integration
+│   │   └── api-pre-selector.ts   # API registry pre-selection
+│   └── substrait/                # Substrait cross-engine compatibility
+│       ├── substrait-translator.ts  # QueryAST ↔ Substrait conversion
+│       └── substrait-generator.py   # Python Substrait generation
 │
 ├── executors/
 │   ├── expr-evaluator.ts         # ExprAST tree-walking interpreter
@@ -192,15 +302,50 @@ src/
 │   ├── postgres-backend.ts       # StorageBackend for Postgres
 │   └── sqlite-temp-store.ts      # TempStore for intermediates
 │
+├── auth/                         # Authorization and access control
+│   ├── permission-checker.ts     # Table/column access validation
+│   ├── grant-store.ts            # Grant storage and retrieval
+│   └── audit-store.ts            # Access audit logging
+│
+├── cache/                        # Caching layer
+│   ├── SemanticCache.ts          # Semantic similarity cache with embeddings
+│   ├── PlanSerializer.ts         # Pipeline graph serialization
+│   ├── SchemaStateManager.ts     # Schema change tracking
+│   └── VoyageClient.ts           # Voyage AI embedding client
+│
+├── schema/                       # Schema parsing and inference
+│   ├── DDLParser.ts              # SQL DDL parser (tables, FKs, constraints)
+│   ├── ColumnClassifier.ts       # Column type classification
+│   ├── TraitInferencer.ts         # Column trait inference
+│   └── SchemaBuilder.ts          # SchemaConfig construction
+│
+├── session/                      # Conversation session management
+│   ├── session-manager.ts        # Session history and summarization
+│   ├── SessionCursor.ts          # Session-scoped cursor management
+│   └── ReferentialResolver.ts    # Cross-turn reference resolution
+│
+├── write/                        # Write operation support
+│   ├── FKValidator.ts            # Foreign key validation for writes
+│   └── coerceColumnValue.ts      # Type coercion for column values
+│
 ├── functions/
 │   └── builtin.ts                # Math, string, date built-in functions
 │
 ├── config/
 │   ├── models.ts                 # Model name constants
-│   └── crm-schema.ts             # CRM SchemaConfig (demo schema)
+│   ├── crm-schema.ts             # CRM SchemaConfig (demo schema)
+│   └── app-config.ts             # Application configuration
 │
 ├── scripts/
-│   └── verify-db.ts              # DB setup verification
+│   ├── verify-db.ts              # DB setup verification
+│   ├── check-tables.ts           # Table existence checks
+│   ├── init-crm-schema.ts        # CRM schema initialization
+│   ├── seed-crm-data.ts          # CRM data seeding
+│   ├── reset-crm-db.ts           # CRM database reset
+│   ├── create-pee-store-db.ts    # Cache store DB creation
+│   ├── init-pee-store.ts         # Cache store initialization
+│   ├── reset-pee-store.ts        # Cache store reset
+│   └── mock-pipeline-data.ts     # Mock pipeline data for testing
 │
 ├── pipeline-engine.ts            # High-level engine entry point
 ├── cli.ts                        # Interactive CLI
@@ -294,7 +439,32 @@ npm run db:up       # start Postgres
 npm run db:down     # stop Postgres
 npm run db:reset    # wipe and recreate (re-runs seed data)
 npm run db:psql     # open psql shell
+npm run db:psql:store  # open psql shell for cache store
 npm run db:verify   # verify tables and row counts
+```
+
+### Cache store management
+
+```bash
+npm run db:migrate  # run migrations on cache store
+```
+
+### Development utilities
+
+```bash
+npm run auth:seed   # seed development auth grants
+npm run api:seed    # seed API registry
+npm run mock:pipelines  # generate mock pipeline data for testing
+npm run mock:api     # start mock API server for testing
+npm run test:http   # run HTTP node integration tests
+```
+
+### Calcite service (optional)
+
+```bash
+npm run calcite:build   # build Calcite Java service
+npm run calcite:start   # start Calcite service
+npm run calcite:dev     # build and start Calcite service
 ```
 
 ---
@@ -363,6 +533,18 @@ get all enterprise customers with their total completed order value, sorted by r
 fetch open high-priority support tickets joined with customer names, show the 10 oldest first
 
 fetch the top 3 enterprise customers by ARR, then for each write a one-sentence account summary
+```
+
+### Write operations
+
+```
+insert a new customer with name "Acme Corp", segment "enterprise", region "us-west", and arr 150000
+
+update all cancelled orders to set status to "cancelled_final"
+
+delete all support tickets older than 1 year
+
+upsert customer data: if customer exists update arr, otherwise insert new record
 ```
 
 ---
@@ -511,17 +693,21 @@ Current status: **34/34 tests passing**.
 
 The following are designed in the architecture but not yet implemented:
 
-- **HttpNode** — external API calls per row or batch
 - **FileNode** — read CSV/JSON/Parquet from disk
 - **WriteFileNode** — write results to files
 - **SubPipelineNode** — compose pipelines from other pipelines
 - **Pipeline persistence** — save/load named pipelines to SQLite
-- **EmbedNode** — vector embeddings via Voyage
 - **VectorSearchNode** — similarity search via ChromaDB
 - **SwitchNode** — multi-way conditional routing
 - **ValidateNode** — schema and constraint assertions
 - **ApprovalNode** — human-in-the-loop confirmation mid-pipeline
 - **Streaming output** — yield rows as they arrive
+
+**Note:** The following features have been implemented since the initial architecture:
+- HttpNode (external API calls) — partially implemented via api-pre-selector
+- Write operations (INSERT, UPDATE, DELETE, UPSERT) — fully implemented
+- Voyage embeddings — implemented for semantic caching
+- Substrait support — implemented for cross-engine compatibility
 
 ---
 
