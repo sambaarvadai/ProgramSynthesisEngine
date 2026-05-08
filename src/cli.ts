@@ -14,8 +14,32 @@ import { auditStore, AuditAction } from './auth/audit-store.js';
 import { apiRegistryStore } from './config/api-registry-store.js';
 import { getDatabaseConfig } from './config/database-config.js';
 import { coerceColumnValue } from './write/coerceColumnValue.js';
+import { connectPeeStore, getPeeStorePool } from './storage/PeeStoreBackend.js';
+import { initPeeStore } from './storage/initPeeStore.js';
+import { persistPipeline } from './storage/PipelinePersistence.js';
+import { VoyageClient } from './cache/VoyageClient.js';
+import { SemanticCache } from './cache/SemanticCache.js';
+import { SchemaStateManager } from './cache/SchemaStateManager.js';
 import * as dotenv from 'dotenv';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 dotenv.config();
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Format age helper for pipeline history
+ */
+function formatAge(date: Date): string {
+  const diffMs = Date.now() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1)   return 'just now';
+  if (diffMins < 60)  return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays}d ago`;
+}
 
 /**
  * Check if write intent is complete (has both WHERE and WHAT to update)
@@ -46,6 +70,62 @@ async function main() {
   const dbConfig = getDatabaseConfig();
   const backend = new PostgresBackend(dbConfig.crmPostgresUrl!);
   await backend.connect();
+
+  // Connect to pee_store for pipeline persistence
+  // Non-fatal — if unavailable, continue without persistence
+  let peeStoreAvailable = false;
+  try {
+    peeStoreAvailable = await connectPeeStore();
+    if (peeStoreAvailable) {
+      await initPeeStore();
+    }
+  } catch {
+    console.warn('[PeeStore] Persistence unavailable — continuing without it');
+  }
+
+  // Initialize semantic cache (non-fatal)
+  let semanticCache: SemanticCache | null = null;
+  if (peeStoreAvailable && process.env.VOYAGE_API_KEY) {
+    try {
+      const voyage = new VoyageClient(process.env.VOYAGE_API_KEY);
+
+      const cacheConfig = {
+        threshold: parseFloat(process.env.SEMANTIC_CACHE_THRESHOLD ?? '0.92'),
+        enabled: process.env.SEMANTIC_CACHE_ENABLED !== 'false',
+        workspaceId: 1,
+        sourceType: 'crm'
+      };
+
+      semanticCache = new SemanticCache(
+        voyage,
+        getPeeStorePool(),
+        cacheConfig
+      );
+
+      // Check for schema changes and invalidate if needed
+      const schemaManager = new SchemaStateManager(getPeeStorePool());
+      const ddlPath = join(__dirname, '../crm_postgres.sql');
+
+      const parsed = (crmSchema as any).parsed;
+      await schemaManager.checkAndHandleSchemaChange(
+        ddlPath,
+        semanticCache,
+        parsed.tables.size,
+        // count total columns across all tables
+        [...parsed.tables.values()].reduce(
+          (sum: number, t: any) => sum + t.columns.size, 0
+        )
+      );
+
+      console.log(
+        `[SemanticCache] Ready — threshold: ${cacheConfig.threshold}, ` +
+        `model: voyage-3, source_type: ${cacheConfig.sourceType}`
+      );
+    } catch (e) {
+      console.warn('[SemanticCache] Init failed — cache disabled:', e);
+      semanticCache = null;
+    }
+  }
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -702,10 +782,296 @@ async function main() {
         continue; // Skip NL pipeline for access commands
       }
 
+      // Check for replay command: "run pipeline <id>"
+      if (description.trim().startsWith('run pipeline ')) {
+        const pipelineId = description.trim()
+          .replace('run pipeline ', '').trim();
+        
+        if (!peeStoreAvailable) {
+          console.log('Pipeline persistence is not available.');
+          continue;
+        }
+        
+        try {
+          const pool = getPeeStorePool();
+          const result = await pool.query(
+            `SELECT * FROM pee_pipelines WHERE id = $1`,
+            [pipelineId]
+          );
+          
+          if (result.rows.length === 0) {
+            console.log(`Pipeline ${pipelineId} not found.`);
+            continue;
+          }
+          
+          const saved = result.rows[0];
+          console.log(`\n🔄 Replaying pipeline: ${saved.description}`);
+          console.log(`   Originally run: ${saved.created_at}`);
+          console.log(`   NL input: "${saved.nl_input}"\n`);
+          
+          // Re-plan from the original NL input
+          // This re-runs the full planning + execution flow
+          // giving the LLM a chance to adapt to current data
+          const replayPlan = await engine.plan(
+            saved.nl_input,
+            { sessionHistory: sessionManager.getHistory(), userId: currentUser!.id }
+          );
+          
+          console.log('\n' + engine.formatPlan(replayPlan));
+          const confirm = await ask('\nExecute replay? (y/n) ');
+          if (confirm.trim() !== 'y') continue;
+          
+          const startMs = Date.now();
+          const replayResult = await engine.execute(replayPlan);
+          const replayDuration = Date.now() - startMs;
+          
+          console.log(`\n✅ Replay completed in ${replayDuration}ms`);
+          
+        } catch (e) {
+          console.log('Replay failed:', (e as Error).message);
+        }
+        continue;
+      }
+
+      // "cache stats" — show cache statistics
+      if (description.trim() === 'cache stats') {
+        if (!semanticCache) {
+          console.log('Semantic cache is not available.');
+          continue;
+        }
+        const stats = await semanticCache.getStats();
+        console.log('\n📊 Semantic Cache Stats:');
+        console.log(`   Total entries: ${stats.total}`);
+        console.log(`   Valid entries: ${stats.valid}`);
+        console.log(`   Total hits:    ${stats.totalHits}`);
+        if (stats.topEntries.length > 0) {
+          console.log('\n   Top cached queries:');
+          for (const e of stats.topEntries) {
+            console.log(
+              `   ${e.hit_count.toString().padStart(3)} hits  ` +
+              `${e.nl_input.slice(0, 60)}`
+            );
+          }
+        }
+        console.log();
+        continue;
+      }
+
+      // "clear cache" — invalidate all entries
+      if (description.trim() === 'clear cache') {
+        if (!semanticCache) {
+          console.log('Semantic cache is not available.');
+          continue;
+        }
+        const count = await semanticCache.invalidateAll('manual clear');
+        console.log(`✅ Cleared ${count} cache entries.`);
+        continue;
+      }
+
+      // "clear cache <source>" — invalidate entries for specific source
+      if (description.trim().startsWith('clear cache ')) {
+        const source = description.trim().replace('clear cache ', '').trim();
+        if (!semanticCache) {
+          console.log('Semantic cache is not available.');
+          continue;
+        }
+        const count = await semanticCache.invalidateBySources(
+          [source],
+          `manual clear for source: ${source}`
+        );
+        console.log(`✅ Cleared ${count} cache entries touching '${source}'.`);
+        continue;
+      }
+
+      // Check for history command: "show pipeline history"
+      if (description.trim() === 'show pipeline history' ||
+          description.trim() === 'pipeline history') {
+        
+        if (!peeStoreAvailable) {
+          console.log('Pipeline persistence is not available.');
+          continue;
+        }
+        
+        try {
+          const pool = getPeeStorePool();
+          const result = await pool.query(
+            `SELECT id, nl_input, description, duration_ms, 
+                    total_rows_affected, sources_touched, created_at
+             FROM pee_pipelines
+             WHERE workspace_id = $1
+             ORDER BY created_at DESC
+             LIMIT 20`,
+            [currentUser!.workspaceId ?? 1]
+          );
+          
+          if (result.rows.length === 0) {
+            console.log('No pipeline history found.');
+            continue;
+          }
+          
+          console.log('\n📋 Recent pipelines:\n');
+          for (const row of result.rows) {
+            const tables = (row.sources_touched ?? []).join(', ');
+            const age = formatAge(new Date(row.created_at));
+            console.log(
+              `  ${row.id.slice(0, 8)}  ` +
+              `${row.nl_input.slice(0, 50).padEnd(50)}  ` +
+              `${row.duration_ms}ms  ` +
+              `${age}` 
+            );
+            console.log(`           Tables: ${tables}`);
+            console.log();
+          }
+        } catch (e) {
+          console.log('Could not fetch history:', (e as Error).message);
+        }
+        continue;
+      }
+
+      // ── Semantic cache lookup ──────────────────────────────────
+      if (semanticCache) {
+        const cacheHit = await semanticCache.lookup(description);
+
+        if (cacheHit) {
+          console.log(
+            `\n⚡ Cache hit! (similarity: ${cacheHit.similarity.toFixed(4)})\n` +
+            `   Replaying: "${cacheHit.intent.description}"\n`
+          );
+
+          // Show the cached plan directly — no recompilation needed
+          console.log(engine.formatPlan(cacheHit.plan));
+
+          const confirm = await ask('\nExecute cached plan? (y/n/fresh) ');
+
+          if (confirm.trim() === 'n') {
+            continue;
+          }
+
+          if (confirm.trim() === 'fresh') {
+            console.log('Running fresh plan...\n');
+            // Fall through to normal plan() flow below
+          } else {
+            // Execute the cached plan directly — same structure, fresh data
+            const startedAt = new Date();
+            const startMs = Date.now();
+
+            // The cached plan has fully enriched nodes — execute directly
+            const result = await engine.execute(cacheHit.plan);
+            const durationMs = Date.now() - startMs;
+
+            console.log(`\n✅ Completed in ${durationMs}ms (from cache)`);
+            console.log(`Status: ${result.execution.status}`);
+
+            // Display outputs — same code as normal execution path
+            if (result.execution.outputs.size > 0) {
+              console.log('\nOutputs:');
+              for (const [key, dv] of result.execution.outputs) {
+                if (isCollection(dv)) {
+                  // Display collection as a unified table
+                  console.log(`\n  ${key} (${dv.data.length} items):`);
+
+                  // Convert collection to tabular for display
+                  const rs = toTabular(dv);
+                  if (rs.rows.length === 0) {
+                    console.log('  (empty)');
+                  } else {
+                    console.table(rs.rows);
+                  }
+                } else if (isTabular(dv) || isRecord(dv)) {
+                  // Convert to tabular for display
+                  const rs = toTabular(dv);
+                  console.log(`\n  ${key} (${rs.rows.length} rows):`);
+                  if (rs.rows.length === 0) {
+                    console.log('  (empty)');
+                  } else {
+                    console.table(rs.rows);
+                  }
+                } else if (isScalar(dv)) {
+                  console.log(`\n  ${key}:`);
+                  console.log(dv.data);
+                } else if (isVoid(dv)) {
+                  console.log(`\n  ${key}: (no output)`);
+                }
+              }
+            }
+
+            console.log('\nNode summary:');
+            for (const [nodeId, nodeState] of result.execution.nodeStates) {
+              if (nodeId.startsWith('_')) continue;
+              const icon = nodeState.status === 'completed' ? '✔' : '✖';
+              const ms = nodeState.completedAt && nodeState.startedAt
+                ? `${nodeState.completedAt - nodeState.startedAt}ms`
+                : '';
+              console.log(`  ${icon} ${nodeId} (${ms})`);
+            }
+
+            // Persist this cache-hit execution too
+            if (peeStoreAvailable && result.execution.status === 'success') {
+              // Generate a new ID for this cache replay
+              // The cached plan's graph.id belongs to the original execution
+              const replayPlan = {
+                ...cacheHit.plan,
+                graph: {
+                  ...cacheHit.plan.graph,
+                  id: `pipeline_${Date.now()}`  // fresh ID for this replay
+                }
+              };
+
+              await persistPipeline(
+                replayPlan,     // ← new ID
+                result,
+                {
+                  nlInput: description,
+                  sessionId: sessionManager.getSessionId(),
+                  workspaceId: Number(currentUser!.workspaceId) || 1,
+                  userId: Number(currentUser!.id) || 1,
+                  startedAt
+                }
+              ).catch(() => {});
+            }
+
+            sessionManager.addTurn(
+              description,
+              cacheHit.intent,
+              cacheHit.plan,
+              false
+            );
+            console.log();
+            continue;  // back to REPL — skip normal plan() flow
+          }
+        }
+      }
+      // ── End cache lookup — fall through to normal plan() ──────
+
       // Plan phase
       console.log('\n\ud83d\udccb Planning...');
       const sessionHistory = sessionManager.getHistory();
       const plan = await engine.plan(description, { sessionHistory, userId: currentUser!.id });
+
+      // Store plan in semantic cache BEFORE execution (before Scheduler adds system nodes)
+      if (semanticCache && plan.compilationErrors.length === 0) {
+        const sourcesTouched = plan.intent.steps
+          .map((s: any) => s.config?.table)
+          .filter(Boolean);
+
+        // Also get sources from query nodes
+        for (const [_, node] of plan.graph.nodes) {
+          if ((node as any).kind === 'query') {
+            const table = (node as any).payload?.intent?.table;
+            if (table && !sourcesTouched.includes(table)) {
+              sourcesTouched.push(table);
+            }
+          }
+        }
+
+        await semanticCache.store(
+          description,
+          plan.intent,
+          plan,
+          [...new Set(sourcesTouched)],
+          plan.graph.id
+        ).catch(() => {});
+      }
 
       // Check if this is conversational (no execution steps)
       const isConversational = plan.intent.steps.length === 0;
@@ -1184,6 +1550,7 @@ async function main() {
 
       // Execute phase
       console.log('\n⚡ Executing...');
+      const startedAt = new Date();
       const startMs = Date.now();
       const result = await engine.execute(plan);
       const durationMs = Date.now() - startMs;
@@ -1299,6 +1666,42 @@ async function main() {
 
       // Add turn to session history for workflow execution
       sessionManager.addTurn(description, plan.intent, plan, false);
+
+      // Persist successful pipeline to pee_store
+      if (peeStoreAvailable && result.execution.status === 'success') {
+        await persistPipeline(plan, result, {
+          nlInput:     description,
+          sessionId:   sessionManager.getSessionId(),
+          workspaceId: Number(currentUser!.workspaceId) || 1,
+          userId:      Number(currentUser!.id) || 1,
+          startedAt:   startedAt,
+        }).catch(() => {});
+      }
+
+      // Store in semantic cache for future lookups
+      if (semanticCache && result.execution.status === 'success') {
+        const sourcesTouched = plan.intent.steps
+          .map((s: any) => s.config?.table)
+          .filter(Boolean);
+
+        // Also get sources from query nodes
+        for (const [_, node] of plan.graph.nodes) {
+          if ((node as any).kind === 'query') {
+            const table = (node as any).payload?.intent?.table;
+            if (table && !sourcesTouched.includes(table)) {
+              sourcesTouched.push(table);
+            }
+          }
+        }
+
+        await semanticCache.store(
+          description,
+          plan.intent,
+          plan,
+          [...new Set(sourcesTouched)],
+          plan.graph.id
+        ).catch(() => {});
+      }
 
       console.log();
     } catch (error) {
