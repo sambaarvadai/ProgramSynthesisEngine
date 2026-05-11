@@ -1347,7 +1347,7 @@ export class PipelineEngine {
         }
 
         case 'write': {
-          const writeConfig = await this.enrichWriteNode(step, fieldMap, intent, graph, userId, 1); // Default workspaceId to 1 for demo
+          const writeConfig = await this.enrichWriteNode(step, fieldMap, intent, graph, userId, 1, multiSchema); // Default workspaceId to 1 for demo
           
           // Datasource routing: set datasource based on table
           const table = writeConfig.table;
@@ -1878,7 +1878,8 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
     intent: PipelineIntent,
     graph: PipelineGraph,
     userId?: string,
-    workspaceId?: number
+    workspaceId?: number,
+    multiSchema?: MultiSourceSchema
   ): Promise<WritePayload> {
     const availableFields = this.getAvailableFields(step.id, { description: '', steps: [step], budget: {} }, fieldMap);
     
@@ -1947,6 +1948,34 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
       console.log('[ColumnClassifier] Excluded from LLM:', exclusions);
     }
     
+    // Datasource-agnostic session column injection (always runs, outside schema check)
+    // These columns should always resolve from session context regardless of datasource
+    const SESSION_COLUMNS: Record<string, 'workspaceId' | 'userId'> = {
+      workspace_id: 'workspaceId',
+      owner_user_id: 'userId',
+      created_by_user_id: 'userId',
+      updated_by_user_id: 'userId'
+    };
+    
+    if (targetTable) {
+      // Inject session columns regardless of datasource
+      for (const [col, sessionKey] of Object.entries(SESSION_COLUMNS)) {
+        // Check if the table has this column
+        const tableDef = (schemaToUse as any).parsed.tables.get(targetTable);
+        if (tableDef && tableDef.columns.has(col)) {
+          const sessionValue = sessionKey === 'workspaceId' ? workspaceId ?? 1 : 1; // Default userId to 1 if not resolved
+          autoValues[col] = sessionValue;
+          if (!exclusions.includes(col)) {
+            exclusions.push(col);
+          }
+          console.log(
+            `[SessionColumnInjection] Injected ${col} = ${sessionValue} ` +
+            `(from ${sessionKey}) for ${targetTable} (${datasource})`
+          );
+        }
+      }
+    }
+    
     const prompt = `Extract database write configuration from this step description:
 "${step.description}"
 
@@ -2002,8 +2031,8 @@ ${exclusions.length > 0 ? `Do not include these columns — auto-resolved: ${exc
 ${(() => {
   // Layer 2: Add enum hints for columns the LLM can set
   const enumHints: string[] = [];
-  if (targetTable && (crmSchema as any).traits?.has(targetTable)) {
-    const tableTraits = (crmSchema as any).traits.get(targetTable);
+  if (targetTable && (schemaToUse as any).traits?.has(targetTable)) {
+    const tableTraits = (schemaToUse as any).traits.get(targetTable);
     for (const [col, traits] of tableTraits.entries()) {
       if (exclusions.includes(col)) continue;  // already excluded
       if (!traits.enumValues?.length) continue;
@@ -2046,13 +2075,13 @@ Return ONLY raw JSON.`;
         }
       }
       
-      // Convert values based on DDLParser's accurate type info from crmSchema.parsed.tables
+      // Convert values based on DDLParser's accurate type info from schemaToUse.parsed.tables
       // (not from this.config.schema which has TEXT fallback types)
       const convertIfNeeded = (obj: Record<string, any>) => {
         for (const [key, val] of Object.entries(obj)) {
-          // Always use crmSchema.parsed.tables for type info
+          // Always use schemaToUse.parsed.tables for type info
           // this.config.schema has TEXT fallback types, not accurate INT types
-          const colDef = (crmSchema as any).parsed.tables
+          const colDef = (schemaToUse as any).parsed.tables
             .get(config.table)?.columns.get(key);
           const colType = colDef?.type?.toUpperCase() ?? 'TEXT';
           
@@ -2175,6 +2204,10 @@ Return ONLY raw JSON.`;
         mergedStaticValues[col] = val;
         console.log(`[WriteEnrichment] Re-applied auto-injected value: ${col} = ${val}`);
       }
+      
+      // Apply type conversion to auto-injected values based on DDLParser type info
+      // (needed for pm schema where columns are TEXT but we insert numbers)
+      convertIfNeeded(mergedStaticValues);
 
       // AUDIT_TABLES: auto-inject timestamp = NOW() for audit/history tables
       const AUDIT_TABLES = new Set([
@@ -2184,7 +2217,7 @@ Return ONLY raw JSON.`;
 
       if (AUDIT_TABLES.has(tableName)) {
         // Find the correct timestamp column for this audit table
-        const tableColumns = (crmSchema as any).parsed.tables
+        const tableColumns = (schemaToUse as any).parsed.tables
           .get(tableName)?.columns;
         
         // Use changed_at if it exists, else fall back to null
@@ -2246,19 +2279,66 @@ Return ONLY raw JSON.`;
       // Build columnAliases from FK relationships
       // This maps write column names to upstream row field names
       const columnAliases: Record<string, string> = {};
+      
+      // Get datasource for target table
+      const targetDatasource = multiSchema
+        ? (multiSchema.tableRouting.get(tableName) as string | undefined ?? 'default')
+        : 'default';
+      
       for (const col of mergedColumns) {
         // Find FK for this column in the target table
-        const fkEdges = (crmSchema as any).parsed.fkGraph
+        const fkEdges = (schemaToUse as any).parsed.fkGraph
           .getOutbound(tableName);
 
         if (fkEdges) {
           const fk = fkEdges.find((e: any) => e.fromColumn === col);
+          
           if (fk && extractedUpstreamTables.includes(fk.toTable)) {
-            // This column's value comes from upstream table's PK
-            columnAliases[col] = fk.toColumn;  // e.g. owner_user_id → id
-            console.log(
-              `[WriteEnrichment] FK alias: ${col} ← ${fk.toTable}.${fk.toColumn}`
-            );
+            // Check if this is a cross-datasource FK
+            const referencedDatasource = multiSchema
+              ? (multiSchema.tableRouting.get(fk.toTable) as string | undefined ?? 'default')
+              : 'default';
+            
+            const isCrossDatasourceFK = targetDatasource !== referencedDatasource;
+            
+            if (isCrossDatasourceFK) {
+              // Only inject aliases for cross-datasource FKs
+              // Same-datasource FKs are handled by the existing join path
+              columnAliases[col] = fk.toColumn;  // e.g. crm_account_id → id
+              console.log(
+                `[WriteEnrichment] Cross-datasource FK alias: ${col} ← ${fk.toTable}.${fk.toColumn} ` +
+                `(target DS: ${targetDatasource}, ref DS: ${referencedDatasource})`
+              );
+              
+              // Ensure the upstream QueryNode selects the referenced column
+              // Find the upstream QueryNode that fetches from the referenced table
+              for (const [nodeId, node] of graph.nodes) {
+                if (node.kind === 'query') {
+                  const qp = node.payload as any;
+                  const qpTable = qp.intent?.table;
+                  if (qpTable === fk.toTable) {
+                    // Check if the referenced column is already selected
+                    const hasReferencedColumn = qp.intent?.columns?.some(
+                      (c: any) => (c.alias || c.field) === fk.toColumn
+                    );
+                    
+                    if (!hasReferencedColumn) {
+                      // Add the referenced column to the upstream query
+                      qp.intent.columns = qp.intent.columns || [];
+                      qp.intent.columns.push({
+                        field: fk.toColumn,
+                        alias: fk.toColumn
+                      });
+                      console.log(
+                        `[WriteEnrichment] Auto-added referenced column ${fk.toColumn} ` +
+                        `to upstream QueryNode ${nodeId} for cross-datasource FK resolution`
+                      );
+                    }
+                    break; // Use the first matching upstream node
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -2277,7 +2357,7 @@ Return ONLY raw JSON.`;
       for (const [col, val] of Object.entries(mergedStaticValues)) {
         if (val === null || val === undefined) continue;
 
-        const colDef = (crmSchema as any).parsed.tables
+        const colDef = (schemaToUse as any).parsed.tables
           .get(tableName)?.columns.get(col);
 
         if (!colDef) continue;
@@ -2300,7 +2380,7 @@ Return ONLY raw JSON.`;
       }
 
       // Layer 1: Validate staticValues against enum constraints
-      const tableTraits = (crmSchema as any).traits?.get(tableName);
+      const tableTraits = (schemaToUse as any).traits?.get(tableName);
       if (tableTraits) {
         for (const [col, val] of Object.entries(mergedStaticValues)) {
           if (val === null || val === undefined) continue;
@@ -2326,7 +2406,7 @@ Return ONLY raw JSON.`;
             mergedStaticValues[col] = match;
           } else if (!match) {
             // Invalid enum value — check if column has a default
-            const colDef = (crmSchema as any).parsed.tables
+            const colDef = (schemaToUse as any).parsed.tables
               .get(tableName)?.columns.get(col);
             
             if (colDef?.defaultRaw) {
@@ -2340,7 +2420,7 @@ Return ONLY raw JSON.`;
               );
               mergedStaticValues[col] = defaultVal;
             } else if (!match) {
-              const colDef = (crmSchema as any).parsed.tables
+              const colDef = (schemaToUse as any).parsed.tables
                 .get(tableName)?.columns.get(col);
               
               if (colDef?.defaultRaw) {
@@ -2387,7 +2467,7 @@ Return ONLY raw JSON.`;
 
       // Auto-refresh updated_at on every UPDATE
       if (finalPayload.mode === 'update') {
-        const hasUpdatedAt = (crmSchema as any).parsed.tables
+        const hasUpdatedAt = (schemaToUse as any).parsed.tables
           .get(tableName)?.columns.has('updated_at');
         
         if (hasUpdatedAt) {

@@ -136,5 +136,14 @@ export function inferTraits(
 
 // Helper — is this default a SQL expression (not a literal)?
 function isSqlExpression(raw: string): boolean {
-  return /^(NOW\(\)|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_USER|gen_random_uuid\(\))/i.test(raw.trim());
+  const trimmed = raw.trim();
+  // Standard SQL functions
+  if (/^(NOW\(\)|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_USER|gen_random_uuid\(\))/i.test(trimmed)) {
+    return true;
+  }
+  // Sequence-based defaults (e.g., nextval('seq') or expressions using nextval)
+  if (/nextval\(/i.test(trimmed)) {
+    return true;
+  }
+  return false;
 }

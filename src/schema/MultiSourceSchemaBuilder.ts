@@ -90,6 +90,45 @@ export function buildCombinedSchemaConfig(
     }
   }
 
+  // Add cross-datasource FKs that can't be expressed as DDL constraints
+  // These are FKs that reference tables in different datasources
+  const crossDatasourceFKs: any[] = [
+    // projects table FKs to default datasource
+    {
+      fromTable: 'projects',
+      fromColumn: 'crm_account_id',
+      toTable: 'accounts',
+      toColumn: 'id',
+      onDelete: 'SET NULL'
+    },
+    {
+      fromTable: 'projects',
+      fromColumn: 'crm_opportunity_id',
+      toTable: 'opportunities',
+      toColumn: 'id',
+      onDelete: 'SET NULL'
+    },
+    {
+      fromTable: 'projects',
+      fromColumn: 'crm_contact_id',
+      toTable: 'contacts',
+      toColumn: 'id',
+      onDelete: 'SET NULL'
+    },
+    // Other cross-datasource FKs can be added here as needed
+  ];
+
+  // Only add FKs where both tables exist in the combined schema
+  for (const fk of crossDatasourceFKs) {
+    if (combinedTables.has(fk.fromTable) && combinedTables.has(fk.toTable)) {
+      combinedFKs.push(fk);
+      console.log(
+        `[MultiSourceSchema] Added cross-datasource FK: ` +
+        `${fk.fromTable}.${fk.fromColumn} → ${fk.toTable}.${fk.toColumn}`
+      );
+    }
+  }
+
   return {
     tables:      combinedTables,
     foreignKeys: combinedFKs,

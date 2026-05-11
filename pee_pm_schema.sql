@@ -7,6 +7,11 @@
 -- ============================================================
 
 -- ────────────────────────────────────────────────────────────
+-- SEQUENCES
+-- ────────────────────────────────────────────────────────────
+CREATE SEQUENCE projects_code_seq START 1;
+
+-- ────────────────────────────────────────────────────────────
 -- WORKSPACES
 -- Mirrors CRM workspaces — same workspace_id
 -- ────────────────────────────────────────────────────────────
@@ -82,7 +87,7 @@ CREATE TABLE projects (
   -- Project identity
   name                  TEXT            NOT NULL,
   description           TEXT,
-  code                  TEXT            UNIQUE,  -- e.g. "PROJ-001"
+  code                  TEXT            UNIQUE DEFAULT 'PROJ-' || LPAD(nextval('projects_code_seq')::text, 3, '0'),  -- e.g. "PROJ-001"
 
   -- Ownership (shared user IDs from CRM)
   owner_user_id         INT             NOT NULL, -- pee_dev.users.id
