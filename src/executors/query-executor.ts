@@ -252,6 +252,19 @@ export class QueryExecutor {
               .map((r: any) => r[fieldName])
               .filter((v: any) => v != null);
             
+            // Validate lookup results for cross-datasource FK resolution
+            if (values.length === 0) {
+              throw new Error(
+                `Could not resolve FK reference "${ref}": no matching rows returned from lookup node "${nodeRef}"`
+              );
+            }
+            
+            if (values.length > 1) {
+              throw new Error(
+                `Ambiguous FK resolution "${ref}": ${values.length} rows returned from lookup node "${nodeRef}"`
+              );
+            }
+            
             // Replace valueRef with actual IN values
             filter.operator = 'IN';
             (filter as any).value = values;

@@ -112,6 +112,13 @@ async function main() {
       console.log('[PM Schema] Tables after preprocessing:', 
         [...pmSchema.parsed.tables.keys()]);
       
+      // Debug: Check if workspace_id is marked as session_scoped
+      const projectsTraits = pmSchema.traits.get('projects');
+      if (projectsTraits) {
+        const workspaceIdTrait = projectsTraits.get('workspace_id');
+        console.log('[PM Schema] projects.workspace_id trait:', workspaceIdTrait);
+      }
+      
       dataSourceRegistry.register({
         name:        'pm',
         displayName: 'Project Management',

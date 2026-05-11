@@ -1,5 +1,8 @@
 import type { QueryIntent } from '../query-ast/query-intent.js';
 import type { MultiSourceSchema } from '../../schema/MultiSourceSchemaBuilder.js';
+import type { WritePayload } from '../../nodes/payloads.js';
+import type { FKEdge } from '../../schema/DDLParser.js';
+import type { BuiltSchema } from '../../schema/SchemaBuilder.js';
 
 export interface DecomposedQuery {
   isCrossDB: boolean;
@@ -11,6 +14,21 @@ export interface DecomposedStep {
   datasource: string;  // 'default' or 'pm'
   intent: QueryIntent;
   dependsOn: string[];  // upstream step nodeIds
+}
+
+export interface CrossDBFKReference {
+  column: string;      // FK column in target table (e.g., 'crm_account_id')
+  refTable: string;    // Referenced table (e.g., 'accounts')
+  refColumn: string;   // Referenced column (e.g., 'id')
+  refDatasource: string; // Datasource of referenced table (e.g., 'default')
+  targetDatasource: string; // Datasource of target table (e.g., 'pm')
+}
+
+export interface DecomposedWrite {
+  isCrossDB: boolean;
+  lookupSteps: DecomposedStep[];
+  fkReferences: CrossDBFKReference[];
+  modifiedPayload: WritePayload;
 }
 
 export function detectCrossDBJoins(
@@ -130,4 +148,136 @@ export function decomposeCrossDBQuery(
   });
 
   return { isCrossDB: true, steps };
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Cross-Datasource Write Decomposition
+// ───────────────────────────────────────────────────────────────────
+
+export function detectCrossDBFK(
+  payload: WritePayload,
+  multiSchema: MultiSourceSchema,
+  schema: BuiltSchema
+): CrossDBFKReference[] {
+  const targetDS = multiSchema.tableRouting.get(payload.table) ?? 'default';
+  const references: CrossDBFKReference[] = [];
+  
+  // Get FK graph from the target table's schema
+  const tableTraits = schema.traits.get(payload.table);
+  if (!tableTraits) return references;
+  
+  // Check each column for FK traits
+  for (const [col, traits] of tableTraits) {
+    if (!traits.foreignKey) continue;
+    
+    const { references: refTable, column: refCol } = traits.foreignKey;
+    const refDS = multiSchema.tableRouting.get(refTable) ?? 'default';
+    
+    // Check if this FK crosses datasource boundaries
+    if (refDS !== targetDS) {
+      references.push({
+        column: col,
+        refTable,
+        refColumn: refCol,
+        refDatasource: refDS,
+        targetDatasource: targetDS
+      });
+    }
+  }
+  
+  return references;
+}
+
+export function decomposeCrossDBWrite(
+  nodeId: string,
+  payload: WritePayload,
+  fkReferences: CrossDBFKReference[],
+  schema: BuiltSchema
+): DecomposedWrite {
+  if (fkReferences.length === 0) {
+    return { isCrossDB: false, lookupSteps: [], fkReferences: [], modifiedPayload: payload };
+  }
+  
+  console.log(
+    `[CrossDBDecomposer] Decomposing write "${nodeId}": ` +
+    `cross-datasource FKs=[${fkReferences.map(fk => `${fk.column}->${fk.refTable}`).join(', ')}]`
+  );
+  
+  const lookupSteps: DecomposedStep[] = [];
+  const modifiedPayload = { ...payload, staticValues: { ...payload.staticValues } };
+  const lookupNodeIds: string[] = [];
+  
+  // For each cross-datasource FK, create a lookup step
+  for (const fk of fkReferences) {
+    const fkValue = payload.staticValues?.[fk.column];
+    
+    // Skip if FK column value is not provided (will be resolved from input rows)
+    if (fkValue === undefined || fkValue === null) {
+      console.log(`[CrossDBDecomposer] Skipping FK ${fk.column}: value not provided (will resolve from input)`);
+      continue;
+    }
+    
+    // Skip if value is already an explicit ID (numeric)
+    if (typeof fkValue === 'number' && fkValue > 0) {
+      console.log(`[CrossDBDecomposer] Skipping FK ${fk.column}: explicit ID provided (${fkValue})`);
+      continue;
+    }
+    
+    // If value is a string (e.g., "TechNova Solutions"), create lookup
+    if (typeof fkValue === 'string') {
+      const lookupId = `lookup_${fk.refTable}_${fk.column}`;
+      
+      // Determine which field to filter on
+      // Try to find a 'name' field in the referenced table, otherwise use the first text field
+      const refTableTraits = schema.traits.get(fk.refTable);
+      let filterField = 'name'; // default to 'name'
+      
+      if (refTableTraits) {
+        for (const [col, traits] of refTableTraits) {
+          if (traits.type === 'TEXT' && (col === 'name' || col.includes('name'))) {
+            filterField = col;
+            break;
+          }
+        }
+      }
+      
+      // Build lookup intent: SELECT refColumn FROM refTable WHERE filterField = fkValue
+      const lookupIntent: QueryIntent = {
+        table: fk.refTable,
+        columns: [{ field: fk.refColumn, table: fk.refTable }],
+        filters: [
+          {
+            field: filterField,
+            table: fk.refTable,
+            operator: '=',
+            value: fkValue
+          }
+        ],
+        joins: []
+      };
+      
+      lookupSteps.push({
+        nodeId: lookupId,
+        datasource: fk.refDatasource,
+        intent: lookupIntent,
+        dependsOn: []
+      });
+      
+      lookupNodeIds.push(lookupId);
+      
+      // Replace FK column value with valueRef
+      modifiedPayload.staticValues![fk.column] = `$${lookupId}.${fk.refColumn}` as any;
+      
+      console.log(
+        `[CrossDBDecomposer] Added lookup node: ${lookupId} (${fk.refDatasource}) → ${nodeId}`
+      );
+    }
+  }
+  
+  return {
+    isCrossDB: lookupSteps.length > 0,
+    lookupSteps,
+    fkReferences,
+    modifiedPayload
+  };
 }

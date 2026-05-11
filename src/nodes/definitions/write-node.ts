@@ -106,6 +106,45 @@ export function createWriteNodeDefinition(
     async execute(payload: WritePayload, input: DataValue, _ctx): Promise<DataValue> {
       console.log(`[WriteNode] Starting execution for table: ${payload.table}, mode: ${payload.mode}, datasource: ${payload.datasource}`);
 
+      // Resolve valueRef in staticValues from upstream outputs
+      if (payload.staticValues) {
+        for (const [key, value] of Object.entries(payload.staticValues)) {
+          if (typeof value === 'string' && value.startsWith('$')) {
+            // valueRef format: "$nodeId.fieldName"
+            const ref = value as string;
+            const [nodeRef, fieldName] = ref.replace('$', '').split('.');
+            
+            // Get upstream rows from execution context
+            const upstreamRows = (_ctx as any).nodeOutputs?.get(nodeRef);
+            if (upstreamRows && Array.isArray(upstreamRows)) {
+              const values = upstreamRows
+                .map((r: any) => r[fieldName])
+                .filter((v: any) => v != null);
+              
+              // Validate lookup results for cross-datasource FK resolution
+              if (values.length === 0) {
+                throw new Error(
+                  `Could not resolve FK reference "${ref}": no matching rows returned from lookup node "${nodeRef}"`
+                );
+              }
+              
+              if (values.length > 1) {
+                throw new Error(
+                  `Ambiguous FK resolution "${ref}": ${values.length} rows returned from lookup node "${nodeRef}"`
+                );
+              }
+              
+              // Replace valueRef with actual value
+              payload.staticValues[key] = values[0];
+              
+              console.log(
+                `[WriteNode] Resolved valueRef "${ref}": ${values[0]}`
+              );
+            }
+          }
+        }
+      }
+
       // Get the correct backend based on datasource
       const resolvedBackend = payload.datasource ? dataSourceRegistry.getBackend(payload.datasource) : backend;
       if (!resolvedBackend) {
