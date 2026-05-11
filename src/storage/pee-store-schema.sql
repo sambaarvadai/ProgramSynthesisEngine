@@ -73,11 +73,15 @@ CREATE INDEX IF NOT EXISTS idx_pee_pipeline_nodes_pipeline
 -- DDL state tracking for cache invalidation
 CREATE TABLE IF NOT EXISTS pee_schema_state (
   id              SERIAL PRIMARY KEY,
-  ddl_hash        TEXT        NOT NULL,   -- SHA256 of crm_postgres.sql
+  datasource      TEXT        NOT NULL DEFAULT 'default',
+  ddl_hash        TEXT        NOT NULL,   -- SHA256 of DDL file
   table_count     INT         NOT NULL,
   column_count    INT         NOT NULL,
   recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pee_schema_state_datasource
+  ON pee_schema_state(datasource);
 
 -- Semantic cache entries
 CREATE TABLE IF NOT EXISTS pee_semantic_cache (

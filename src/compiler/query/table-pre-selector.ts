@@ -1,9 +1,9 @@
 import type { SchemaConfig } from '../schema/schema-config.js';
 import { MODELS } from '../../config/models.js';
 import { callLLM, LLMMessage } from '../../core/llm/llm-client.js';
+import type { MultiSourceSchema } from '../../schema/MultiSourceSchemaBuilder.js';
 
 function parseJsonResponse(raw: string): any {
-  // Strip markdown fences — model sometimes wraps response despite instructions
   const clean = raw
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
@@ -14,187 +14,242 @@ function parseJsonResponse(raw: string): any {
 
 export interface TablePreSelectorConfig {
   anthropicApiKey: string;
-  maxTables?: number; // default 5
-  model?: string; // default from MODELS.TABLE_PRE_SELECTOR
+  maxTables?:  number;
+  model?:      string;
+  multiSchema?: MultiSourceSchema;
 }
 
 export interface PreSelectionResult {
   selectedTables: string[];
-  reasoning: string;
-  reducedSchema: SchemaConfig; // SchemaConfig containing only selected tables + their directly related tables
+  reasoning:      string;
+  reducedSchema:  SchemaConfig;
+  tableDataSources: Record<string, string>;
 }
 
 export class TablePreSelector {
   constructor(private config: TablePreSelectorConfig) {
     this.config.maxTables = config.maxTables || 5;
-    this.config.model = config.model || MODELS.TABLE_PRE_SELECTOR;
+    this.config.model     = config.model || MODELS.TABLE_PRE_SELECTOR;
   }
 
   async select(
     naturalLanguageQuery: string,
-    fullSchema: SchemaConfig
+    fullSchema:           SchemaConfig
   ): Promise<PreSelectionResult> {
-    // 1. Build compact schema summary
-    const schemaSummary = this.buildSchemaSummary(fullSchema);
 
-    // 2. Call Haiku with system prompt
-    const systemPrompt = `You are a database schema analyzer. Given a natural language query and a database schema, identify which tables are needed to answer the query. Return ONLY a JSON object with:
-{ "selectedTables": string[], "reasoning": string }
-Select the minimum tables needed. Include tables required for joins. Be conservative - it's better to include an extra table than miss a required one.
-Return ONLY raw JSON with no markdown formatting, no backticks, no explanation.`;
+    // 1. Build schema summary with dynamic datasource labels
+    const schemaSummary = this.buildSchemaSummary(
+      fullSchema,
+      this.config.multiSchema
+    );
 
-    const userPrompt = `Respond with raw JSON only. No markdown. No backticks. No explanation.\n\nQuery: ${naturalLanguageQuery}\n\nSchema:\n${schemaSummary}`;
+    // 2. Build datasource context block dynamically from schema annotations
+    const datasourceContext = this.buildDatasourceContext(fullSchema);
 
-    // 3. Call Anthropic API
+    // 3. System prompt — generic, no datasource names hardcoded
+    const systemPrompt = [
+      'You are a database schema analyzer.',
+      'Given a natural language query and a multi-system database schema,',
+      'identify which tables are needed to answer the query.',
+      '',
+      'Return ONLY a JSON object with:',
+      '{ "selectedTables": string[], "reasoning": string }',
+      '',
+      'Rules:',
+      '- Select the minimum tables needed to answer the query',
+      '- Include tables required for joins',
+      '- For cross-system queries, include tables from multiple systems',
+      '- Be conservative — include an extra related table rather than miss one',
+      '- selectedTables must be exact table names from the schema',
+      '- Return ONLY raw JSON — no markdown, no backticks, no explanation',
+      '',
+      datasourceContext
+    ].filter(Boolean).join('\n');
+
+    // 4. User prompt
+    const userPrompt = [
+      'Respond with raw JSON only. No markdown. No backticks.',
+      '',
+      `Query: ${naturalLanguageQuery}`,
+      '',
+      'Schema:',
+      schemaSummary
+    ].join('\n');
+
+    // 5. Call LLM
     const messages: LLMMessage[] = [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
+      { role: 'user',   content: userPrompt }
     ];
+
     const response = await callLLM('anthropic', {
-      apiKey: this.config.anthropicApiKey,
-      model: this.config.model,
-      maxTokens: 4096
+      apiKey:    this.config.anthropicApiKey,
+      model:     this.config.model,
+      maxTokens: 512
     }, messages);
 
-    // 4. Parse response JSON
+    // 6. Parse response
     let selectedTables: string[];
     let reasoning: string;
 
     try {
-      const parsed = parseJsonResponse(response);
+      const parsed  = parseJsonResponse(response);
       selectedTables = parsed.selectedTables || [];
-      reasoning = parsed.reasoning || 'No reasoning provided';
+      reasoning      = parsed.reasoning || 'No reasoning provided';
     } catch (error) {
-      console.error('Failed to parse Haiku response:', error);
-      // Fall back to all tables if parsing fails
+      console.warn('[TablePreSelector] Failed to parse response:', error);
       selectedTables = Array.from(fullSchema.tables.keys());
-      reasoning = 'Failed to parse AI response, using full schema';
+      reasoning      = 'Parse failed — using full schema';
     }
 
-    // 5. Validate selected tables are real table names
-    selectedTables = selectedTables.filter(tableName => fullSchema.tables.has(tableName));
+    // 7. Validate — only keep real table names
+    selectedTables = selectedTables.filter(t => fullSchema.tables.has(t));
 
     if (selectedTables.length === 0) {
-      // Fall back to full schema if no valid tables selected
       selectedTables = Array.from(fullSchema.tables.keys());
-      reasoning = 'No valid tables selected, using full schema';
+      reasoning      = 'No valid tables selected — using full schema';
     }
 
-    // 6. Expand selection to include directly related tables
+    // 8. Expand to include directly related tables
     const expandedTables = new Set<string>(selectedTables);
     for (const table of selectedTables) {
-      const related = this.getRelatedTables(fullSchema, table);
-      for (const t of related) {
-        expandedTables.add(t);
+      for (const related of this.getRelatedTables(fullSchema, table)) {
+        expandedTables.add(related);
       }
     }
 
-    // Deduplicate and cap at maxTables * 2
     const finalTables = Array.from(expandedTables)
       .slice(0, this.config.maxTables! * 2);
 
-    // 7. Build reduced schema
+    // 9. Build tableDataSources map — which DB each table belongs to
+    const tableDataSources: Record<string, string> = {};
+    if (this.config.multiSchema) {
+      for (const table of finalTables) {
+        tableDataSources[table] =
+          this.config.multiSchema.tableRouting.get(table) ?? 'default';
+      }
+    }
+
+    // 10. Build reduced schema
     const reducedSchema = this.buildReducedSchema(fullSchema, finalTables);
 
     return {
       selectedTables: finalTables,
       reasoning,
-      reducedSchema
+      reducedSchema,
+      tableDataSources
     };
   }
 
-  
-  private buildSchemaSummary(schema: SchemaConfig): string {
-    const lines: string[] = [];
+  // ── PRIVATE ────────────────────────────────────────────────
 
-    lines.push('Database Schema:');
-    lines.push('');
-
-    // Tables with their columns
+  private buildDatasourceContext(schema: SchemaConfig): string {
+    // Build context block from schema annotations — fully dynamic
+    // Works for any number of datasources without code changes
+    
+    const datasources = new Map<string, { displayName: string; description: string }>();
+    
+    // Collect unique datasources from schema annotations
     for (const [tableName, tableConfig] of schema.tables.entries()) {
-      lines.push(`Table: ${tableName}`);
+      if (tableConfig._datasource && tableConfig._displayName) {
+        if (!datasources.has(tableConfig._datasource)) {
+          // Get description from first table of this datasource
+          datasources.set(tableConfig._datasource, {
+            displayName: tableConfig._displayName,
+            description: tableConfig.description || ''
+          });
+        }
+      }
+    }
+    
+    if (datasources.size <= 1) return '';  // single DB — no context needed
+
+    const lines: string[] = [
+      'Connected systems and their data:',
+    ];
+
+    for (const [dsName, dsInfo] of datasources.entries()) {
+      lines.push(`- ${dsInfo.displayName} (tables labeled "${dsInfo.displayName}"): ${dsInfo.description}`);
+    }
+
+    lines.push('');
+    lines.push('Use the system labels in the schema to route your table selection.');
+    lines.push('For queries spanning multiple systems, select tables from each relevant system.');
+
+    return lines.join('\n');
+  }
+
+  private buildSchemaSummary(
+    schema:      SchemaConfig,
+    multiSchema?: MultiSourceSchema
+  ): string {
+    
+    const lines: string[] = ['Database Schema:', ''];
+
+    for (const [tableName, tableConfig] of schema.tables.entries()) {
+      // Use _displayName annotation from combined schema
+      let label = '';
+      if (tableConfig._displayName) {
+        label = ` [${tableConfig._displayName}]`;
+      }
+
+      lines.push(`Table: ${tableName}${label}`);
+
       if (tableConfig.description) {
         lines.push(`  Description: ${tableConfig.description}`);
       }
-      if (tableConfig.alias) {
-        lines.push(`  Alias: ${tableConfig.alias}`);
-      }
-      
-      // Column names only (not types) to keep it compact
-      const columnNames = tableConfig.columns.map(col => col.name).join(', ');
+
+      const columnNames = tableConfig.columns.map(c => c.name).join(', ');
       lines.push(`  Columns: ${columnNames}`);
-      
-      if (tableConfig.primaryKey && tableConfig.primaryKey.length > 0) {
-        lines.push(`  Primary Key: ${tableConfig.primaryKey.join(', ')}`);
+
+      if (tableConfig.primaryKey?.length) {
+        lines.push(`  PK: ${tableConfig.primaryKey.join(', ')}`);
       }
+
       lines.push('');
     }
 
-    // Foreign key relationships
     if (schema.foreignKeys.length > 0) {
       lines.push('Foreign Keys:');
       for (const fk of schema.foreignKeys) {
         lines.push(`  ${fk.fromTable}.${fk.fromColumn} → ${fk.toTable}.${fk.toColumn}`);
-        if (fk.description) {
-          lines.push(`    (${fk.description})`);
-        }
       }
       lines.push('');
     }
 
-    // Schema metadata
-    lines.push(`Schema Version: ${schema.version}`);
-    if (schema.description) {
-      lines.push(`Description: ${schema.description}`);
-    }
-
     const summary = lines.join('\n');
-
-    // Ensure summary is under 2000 tokens (roughly 8000 characters)
-    if (summary.length > 8000) {
-      // Truncate if too long, keeping the structure
-      return summary.substring(0, 8000) + '\n... (truncated)';
-    }
-
-    return summary;
+    return summary.length > 8000
+      ? summary.substring(0, 8000) + '\n... (truncated)'
+      : summary;
   }
 
   private getRelatedTables(schema: SchemaConfig, tableName: string): string[] {
     const related = new Set<string>();
-    
-    // Find tables related through foreign keys
     for (const fk of schema.foreignKeys) {
-      if (fk.fromTable === tableName) {
-        related.add(fk.toTable);
-      } else if (fk.toTable === tableName) {
-        related.add(fk.fromTable);
-      }
+      if (fk.fromTable === tableName) related.add(fk.toTable);
+      if (fk.toTable   === tableName) related.add(fk.fromTable);
     }
-    
-    return Array.from(related);
+    return [...related];
   }
 
-  private buildReducedSchema(fullSchema: SchemaConfig, tables: string[]): SchemaConfig {
+  private buildReducedSchema(
+    fullSchema: SchemaConfig,
+    tables:     string[]
+  ): SchemaConfig {
+    
     const reducedTables = new Map<string, any>();
-
-    // Copy selected tables
-    for (const tableName of tables) {
-      const tableConfig = fullSchema.tables.get(tableName);
-      if (tableConfig) {
-        reducedTables.set(tableName, tableConfig);
-      }
+    for (const t of tables) {
+      const config = fullSchema.tables.get(t);
+      if (config) reducedTables.set(t, config);
     }
 
-    // Filter foreign keys to only those between selected tables
-    const reducedForeignKeys = fullSchema.foreignKeys.filter(fk =>
-      tables.includes(fk.fromTable) && tables.includes(fk.toTable)
-    );
-
     return {
-      tables: reducedTables,
-      foreignKeys: reducedForeignKeys,
-      version: fullSchema.version,
-      description: `Reduced schema for tables: ${tables.join(', ')}`
+      tables:      reducedTables,
+      foreignKeys: fullSchema.foreignKeys.filter(
+        fk => tables.includes(fk.fromTable) && tables.includes(fk.toTable)
+      ),
+      version:     fullSchema.version,
+      description: `Reduced schema for: ${tables.join(', ')}` 
     };
   }
 }

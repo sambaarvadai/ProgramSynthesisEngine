@@ -8,6 +8,7 @@ import type { DataValue, DataValueKind } from '../core/types/data-value.js';
 import { tabular, record, scalar, collection, void_, isCollection, isVoid } from '../core/types/data-value.js';
 import type { RowSet, Row } from '../core/types/value.js';
 import type { NodeDefinition } from '../core/registry/node-registry.js';
+import type { QueryPayload } from '../nodes/payloads.js';
 import { validateGraph, topologicalSort, getNodeInputs, getOutgoingDataEdges, getOutgoingControlEdges, getIncomingDataEdges, isControlPathActive, shouldSkipNode, activateEdge, deactivateEdge, getNodesOnInactiveBranches } from './graph-utils.js';
 import { forkStateForIteration, toIterableArray, updateAccumulator, initAccumulator, getSubgraphOutput } from './loop-helpers.js';
 import { validationOk, validationFail, ValidationError } from '../core/types/validation.js';
@@ -69,6 +70,25 @@ function markNodeCompleted(state: ExecutionState, nodeId: NodeId, output: DataVa
     nodeState.completedAt = Date.now();
     nodeState.output = output;
   }
+
+  // Store node outputs in execution context for cross-DB query decomposition
+  if (!(state.ctx as any).nodeOutputs) {
+    (state.ctx as any).nodeOutputs = new Map<string, any[]>();
+  }
+  
+  // Extract rows from node output based on kind
+  let rows: any[] = [];
+  if (output?.kind === 'tabular') {
+    rows = output.data.rows ?? [];
+  } else if (output?.kind === 'record') {
+    rows = [output.data];
+  } else if (output?.kind === 'collection') {
+    rows = output.data ?? [];
+  } else if (Array.isArray(output)) {
+    rows = output;
+  }
+  
+  (state.ctx as any).nodeOutputs.set(nodeId, rows);
 }
 
 function markNodeFailed(state: ExecutionState, nodeId: NodeId, error: Error): void {
@@ -559,11 +579,8 @@ export class Scheduler {
 
     // Special case: QueryNode uses QueryExecutor directly
     if (node.kind === 'query') {
-      const inputs = getNodeInputs(nodeId, graph, state);
-      const payload = node.payload as any;
-      
-      // Collect additional fields from previous transform steps
-      const additionalFields = this.collectAdditionalFields(nodeId, graph, state);
+      const payload = node.payload as QueryPayload;
+      const result = await this.config.queryExecutor.execute(payload.intent, state.ctx, undefined, payload.datasource);
       
       // Create execution context
       const ctx: ExecutionContext = {
@@ -579,7 +596,7 @@ export class Scheduler {
       
       // QueryNode doesn't use input, but we pass it for consistency
       const queryResult = await executeWithTimeout(
-        this.config.queryExecutor.execute(payload.intent, state.ctx, additionalFields),
+        this.config.queryExecutor.execute(payload.intent, state.ctx, undefined, payload.datasource),
         30000, // 30 second timeout
         nodeId
       );

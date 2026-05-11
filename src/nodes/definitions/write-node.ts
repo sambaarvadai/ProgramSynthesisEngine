@@ -33,6 +33,7 @@ import {
 import { crmSchema } from '../../schema/crm-schema.js'
 import { buildWritePredicate, predicateToSQL } from './write-predicate-builder.js'
 import { validateForeignKeys } from '../../write/FKValidator.js'
+import { dataSourceRegistry } from '../../storage/DataSourceRegistry.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -103,15 +104,25 @@ export function createWriteNodeDefinition(
 
     // ── Execution ─────────────────────────────────────────────────────────────
     async execute(payload: WritePayload, input: DataValue, _ctx): Promise<DataValue> {
-      console.log(`[WriteNode] Starting execution for table: ${payload.table}, mode: ${payload.mode}`);
+      console.log(`[WriteNode] Starting execution for table: ${payload.table}, mode: ${payload.mode}, datasource: ${payload.datasource}`);
+
+      // Get the correct backend based on datasource
+      const resolvedBackend = payload.datasource ? dataSourceRegistry.getBackend(payload.datasource) : backend;
+      if (!resolvedBackend) {
+        throw new Error(`[WriteNode] No backend found for datasource: ${payload.datasource}`);
+      }
+
+      // Get the correct schema based on datasource
+      const dsConfig = dataSourceRegistry.get(payload.datasource ?? 'default');
+      const targetSchema = dsConfig?.schema ?? crmSchema;
 
       // ColumnClassifier: strip immutable columns from UPDATE
-      if (payload.mode === 'update' && payload.table && (crmSchema as any).parsed?.tables.has(payload.table)) {
+      if (payload.mode === 'update' && payload.table && (targetSchema as any).parsed?.tables.has(payload.table)) {
         const sessionCtx: SessionContext = {
           userId: _ctx.userId ? parseInt(_ctx.userId, 10) : 1,  // Use userId from execution context
           anchorIds: { workspaces: Number(1) }
         };
-        const classifications = classifyAllColumns(payload.table, crmSchema, sessionCtx, 'update');
+        const classifications = classifyAllColumns(payload.table, targetSchema, sessionCtx, 'update');
         const blocked = getBlockedOnUpdate(classifications);
         
         if (blocked.length > 0) {
@@ -125,8 +136,8 @@ export function createWriteNodeDefinition(
       }
 
       // Soft delete routing: rewrite DELETE as UPDATE if table has deleted_at column
-      if (payload.mode === 'delete' && payload.table && (crmSchema as any).parsed?.tables.has(payload.table)) {
-        const tableColumns = (crmSchema as any).parsed.tables.get(payload.table)?.columns;
+      if (payload.mode === 'delete' && payload.table && (targetSchema as any).parsed?.tables.has(payload.table)) {
+        const tableColumns = (targetSchema as any).parsed.tables.get(payload.table)?.columns;
         const hasSoftDelete = tableColumns?.has('deleted_at');
         
         if (hasSoftDelete) {
@@ -159,11 +170,12 @@ export function createWriteNodeDefinition(
       // Only validate FK existence for INSERT and UPDATE
       // Skip for DELETE (deleting a non-existent row is a no-op)
       if (payload.mode === 'insert' || payload.mode === 'update' || payload.mode === 'upsert') {
-        const pool = (backend as any).pool;
+        const pool = (resolvedBackend as any).pool;
         const fkViolations = await validateForeignKeys(
           payload,
-          crmSchema,
-          pool
+          targetSchema,
+          pool,
+          payload.datasource
         );
         
         if (fkViolations.length > 0) {
@@ -218,7 +230,7 @@ export function createWriteNodeDefinition(
             const allParams = [...setParams, ...whereResult.params];
 
             console.log(`[WriteNode] Cursor-driven UPDATE SQL: ${sql}`);
-            await backend.rawQuery(sql, allParams);
+            await resolvedBackend.rawQuery(sql, allParams);
 
             // Clear cursor after successful execution
             sessionCursorStore?.clear();
@@ -228,7 +240,7 @@ export function createWriteNodeDefinition(
           } else if (payload.mode === 'delete') {
             const sql = `DELETE FROM "${payload.table}" WHERE ${whereResult.clause}`;
             console.log(`[WriteNode] Cursor-driven DELETE SQL: ${sql}`);
-            await backend.rawQuery(sql, whereResult.params);
+            await resolvedBackend.rawQuery(sql, whereResult.params);
 
             // Clear cursor after successful execution
             sessionCursorStore?.clear();
@@ -391,23 +403,23 @@ export function createWriteNodeDefinition(
           switch (payload.mode) {
             case 'insert':
               console.log(`[WriteNode] Running INSERT on ${payload.table}`);
-              await runInsert(backend, payload.table, effectiveColumns, dataRows, false, batchSize, payload.returning, payload.staticValues)
+              await runInsert(resolvedBackend, payload.table, effectiveColumns, dataRows, false, batchSize, payload.returning, payload.staticValues)
               console.log(`[WriteNode] INSERT completed successfully`);
               break
             case 'insert_ignore':
               console.log(`[WriteNode] Running INSERT IGNORE on ${payload.table}`);
-              await runInsert(backend, payload.table, effectiveColumns, dataRows, true, batchSize, payload.returning, payload.staticValues)
+              await runInsert(resolvedBackend, payload.table, effectiveColumns, dataRows, true, batchSize, payload.returning, payload.staticValues)
               console.log(`[WriteNode] INSERT IGNORE completed successfully`);
               break
             case 'update':
               console.log(`[WriteNode] Running UPDATE on ${payload.table}`);
-              await runUpdate(backend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning, payload)
+              await runUpdate(resolvedBackend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning, payload)
               console.log(`[WriteNode] UPDATE completed successfully`);
               break
             case 'upsert':
               console.log(`[WriteNode] Running UPSERT on ${payload.table}`);
               await runUpsert(
-                backend,
+                resolvedBackend,
                 payload.table,
                 effectiveColumns,
                 dataRows,
@@ -419,7 +431,7 @@ export function createWriteNodeDefinition(
               break
             case 'delete':
               console.log(`[WriteNode] Running DELETE on ${payload.table}`);
-              await runDelete(backend, payload.table, dataRows, payload.whereColumns!, payload.returning)
+              await runDelete(resolvedBackend, payload.table, dataRows, payload.whereColumns!, payload.returning)
               console.log(`[WriteNode] DELETE completed successfully`);
               break
             default:
@@ -522,7 +534,7 @@ export function createWriteNodeDefinition(
           `[${whereValues.length} ids]]`
         );
 
-        const result = await backend.rawQuery(sql, params);
+        const result = await resolvedBackend.rawQuery(sql, params);
         console.log(`[WriteNode] ${result.rowCount} rows affected`);
 
         // Return summary in same shape as other paths
@@ -571,12 +583,12 @@ export function createWriteNodeDefinition(
         switch (payload.mode) {
           case 'insert':
             console.log(`[WriteNode] Fallback running INSERT on ${payload.table}`);
-            await runInsert(backend, payload.table, dynamicColumns, dataRows, false, batchSize, payload.returning, payload.staticValues)
+            await runInsert(resolvedBackend, payload.table, dynamicColumns, dataRows, false, batchSize, payload.returning, payload.staticValues)
             break
 
           case 'insert_ignore':
             console.log(`[WriteNode] Fallback running INSERT IGNORE on ${payload.table}`);
-            await runInsert(backend, payload.table, dynamicColumns, dataRows, true, batchSize, payload.returning, payload.staticValues)
+            await runInsert(resolvedBackend, payload.table, dynamicColumns, dataRows, true, batchSize, payload.returning, payload.staticValues)
             break
 
           case 'update':
@@ -653,19 +665,19 @@ export function createWriteNodeDefinition(
               console.log(`[WriteNode] Bulk UPDATE SQL: ${sql}`);
               console.log(`[WriteNode] Bulk UPDATE params: ${JSON.stringify(params)}`);
 
-              const result = await backend.rawQuery(sql, params);
+              const result = await resolvedBackend.rawQuery(sql, params);
               rowsAffected = result.rowCount ?? 0;
               console.log(`[WriteNode] ${result.rowCount} rows affected`);
             } else {
               // Standard UPDATE with dynamic columns
-              await runUpdate(backend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning, payload)
+              await runUpdate(resolvedBackend, payload.table, effectiveColumns, dataRows, payload.whereColumns!, payload.returning, payload)
             }
             break
 
           case 'upsert':
             console.log(`[WriteNode] Fallback running UPSERT on ${payload.table}`);
             await runUpsert(
-              backend,
+              resolvedBackend,
               payload.table,
               effectiveColumns,
               dataRows,
@@ -677,7 +689,7 @@ export function createWriteNodeDefinition(
 
           case 'delete':
             console.log(`[WriteNode] Fallback running DELETE on ${payload.table}`);
-            await runDelete(backend, payload.table, dataRows, payload.whereColumns!, payload.returning)
+            await runDelete(resolvedBackend, payload.table, dataRows, payload.whereColumns!, payload.returning)
             break
 
           default:

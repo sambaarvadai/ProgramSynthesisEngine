@@ -15,6 +15,7 @@ import { OperatorTreeBuilder } from '../compiler/query/operator-tree-builder.js'
 import { collectAll } from './physical-operator.js';
 import { traceEvent, traceError } from '../core/context/execution-trace.js';
 import { QueryExecutionError, ValidationError, DatabaseConnectionError, ErrorUtils } from '../core/errors/index.js';
+import { dataSourceRegistry } from '../storage/DataSourceRegistry.js';
 
 export interface QueryExecutorConfig {
   schema: SchemaConfig;
@@ -87,11 +88,11 @@ export class QueryExecutor {
     // Build SELECT columns
     const columns = intent.columns.map(col => {
       let field: string;
-      if (col.table) {
+      if (col.field === '*') {
+        field = col.table ? `"${col.table}".*` : '*';
+      } else if (col.table) {
         const tableRef = tableAliases.get(col.table) || col.table;
         field = `"${tableRef}"."${col.field}"`;
-      } else if (col.field === '*') {
-        field = '*';
       } else {
         field = `"${col.field}"`;
       }
@@ -186,6 +187,10 @@ export class QueryExecutor {
             }
           } else {
             const value = typeof f.value === 'string' ? `'${f.value}'` : f.value;
+            // Apply LOWER() for case-insensitive string comparisons
+            if (f.caseInsensitive && typeof f.value === 'string') {
+              return `LOWER(${field}) = LOWER(${value})`;
+            }
             return `${field} ${f.operator} ${value}`;
           }
         }
@@ -230,7 +235,67 @@ export class QueryExecutor {
     return { sql, params };
   }
 
-  async execute(intent: QueryIntent, ctx: ExecutionContext, additionalFields?: Map<string, { name: string; type: any }[]>): Promise<QueryResult> {
+  async execute(intent: QueryIntent, ctx: ExecutionContext, additionalFields?: Map<string, { name: string; type: any }[]>, datasource?: string): Promise<QueryResult> {
+    
+    // Resolve valueRef filters from upstream outputs
+    if (intent.filters) {
+      for (const filter of intent.filters) {
+        if ((filter as any).valueRef) {
+          const ref = (filter as any).valueRef as string;
+          // ref format: "$nodeId.fieldName"
+          const [nodeRef, fieldName] = ref.replace('$', '').split('.');
+          
+          // Get upstream rows from execution context
+          const upstreamRows = (ctx as any).nodeOutputs?.get(nodeRef);
+          if (upstreamRows && Array.isArray(upstreamRows)) {
+            const values = upstreamRows
+              .map((r: any) => r[fieldName])
+              .filter((v: any) => v != null);
+            
+            // Replace valueRef with actual IN values
+            filter.operator = 'IN';
+            (filter as any).value = values;
+            delete (filter as any).valueRef;
+            
+            console.log(
+              `[CrossDBDecomposer] Resolved valueRef "${ref}": ` +
+              `[${values.join(', ')}]`
+            );
+          }
+        }
+      }
+    }
+    
+    // Get the correct backend based on datasource
+    const backend = datasource ? dataSourceRegistry.getBackend(datasource) : this.config.backend;
+    
+    // For non-default datasource, always use raw SQL
+    // Physical operators don't support datasource routing yet
+    if (datasource && datasource !== 'default') {
+      const { sql, params } = this.buildRawSQL(intent);
+      console.log('[QueryExecutor] Cross-DB query, using raw SQL:', sql);
+      
+      if (!backend) {
+        throw new Error(
+          `[QueryExecutor] No backend for datasource: ${datasource}`
+        );
+      }
+      const result = await (backend as any).rawQuery(sql, params);
+      const schema = {
+        columns: result.rows.length > 0
+          ? Object.keys(result.rows[0]).map(name => ({
+              name, type: { kind: 'any' } as any, nullable: true
+            }))
+          : []
+      };
+      return {
+        rows: result.rows,
+        schema,
+        rowCount: result.rows.length,
+        trace: ctx.trace,
+        optimizationsApplied: ['datasource_raw_sql']
+      };
+    }
     
     if (this.needsCalcite(intent)) {
       // Try Calcite first
@@ -242,7 +307,7 @@ export class QueryExecutor {
           );
           console.log('[QueryExecutor] Calcite SQL:', compiled.sql);
           
-          const pool = (this.config.backend as any).pool;
+          const pool = (backend as any).pool;
           const result = await pool.query(compiled.sql, compiled.staticParams);
           
           const schema: RowSchema = {
@@ -297,7 +362,10 @@ export class QueryExecutor {
       // Physical operators can't handle joins correctly
       const { sql, params } = this.buildRawSQL(intent);
       console.log('[QueryExecutor] Raw SQL fallback:', sql);
-      const result = await this.config.backend.rawQuery(sql, params);
+      if (!backend) {
+        throw new Error('[QueryExecutor] No backend available for query execution');
+      }
+      const result = await backend.rawQuery(sql, params);
       const schema = {
         columns: result.rows.length > 0 ? Object.keys(result.rows[0]).map(name => ({
           name,
@@ -343,7 +411,7 @@ export class QueryExecutor {
       meta: { optimizations: plan.optimizations }
     });
 
-    // 6. Return result
+    // 6. Return result - prevent fallthrough to other paths
     return {
       rows: result.rows,
       schema: result.schema,

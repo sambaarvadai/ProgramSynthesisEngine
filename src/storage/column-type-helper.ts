@@ -6,7 +6,7 @@ export function isTextColumn(
 ): boolean {
   const colDef = (crmSchema as any).parsed.tables
     .get(tableName)?.columns.get(fieldName);
-  if (!colDef) return true;  // default conservative: treat as text
+  if (!colDef) return false;  // default conservative: treat as non-text if unknown (e.g., PM tables)
   const t = (colDef.type ?? 'TEXT').toUpperCase();
   return (
     t === 'TEXT' ||

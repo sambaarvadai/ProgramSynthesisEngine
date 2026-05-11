@@ -1,6 +1,7 @@
 import type { BuiltSchema } from '../schema/SchemaBuilder.js';
 import type { WritePayload } from '../nodes/payloads.js';
 import type { Pool } from 'pg';
+import { dataSourceRegistry } from '../storage/DataSourceRegistry.js';
 
 export interface FKViolation {
   column:    string
@@ -13,7 +14,8 @@ export interface FKViolation {
 export async function validateForeignKeys(
   payload:  WritePayload,
   schema:   BuiltSchema,
-  pool:     Pool
+  pool:     Pool,
+  datasource?: string
 ): Promise<FKViolation[]> {
   
   const violations: FKViolation[] = [];
@@ -21,6 +23,12 @@ export async function validateForeignKeys(
   // Skip FK validation for DELETE mode
   // Deleting a non-existent row is a no-op, no need to validate references
   if (payload.mode === 'delete') return violations;
+  
+  // Use datasource-specific pool if provided
+  const poolToUse = datasource ? dataSourceRegistry.getPool(datasource) : pool;
+  if (!poolToUse) {
+    throw new Error(`[FKValidator] No pool found for datasource: ${datasource}`);
+  }
   
   const tableTraits = schema.traits.get(payload.table);
   if (!tableTraits) return violations;
@@ -73,7 +81,7 @@ export async function validateForeignKeys(
     if (sameRefCol && refs.length > 1) {
       const vals = refs.map(r => r.val);
       try {
-        const result = await pool.query(
+        const result = await poolToUse.query(
           `SELECT "${refs[0].refCol}" FROM "${refTable}" 
            WHERE "${refs[0].refCol}" = ANY($1)`,
           [vals]
@@ -104,7 +112,7 @@ export async function validateForeignKeys(
       // Different refCols or single ref — check individually
       for (const ref of refs) {
         try {
-          const result = await pool.query(
+          const result = await poolToUse.query(
             `SELECT 1 FROM "${refTable}" WHERE "${ref.refCol}" = $1 LIMIT 1`,
             [ref.val]
           );

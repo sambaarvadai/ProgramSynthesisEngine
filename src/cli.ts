@@ -1,7 +1,6 @@
 import readline from 'node:readline';
 import { PipelineEngine, type PipelineEngineConfig } from './pipeline-engine.js';
 import type { WritePayload } from './nodes/payloads.js';
-import { crmSchema } from './schema/crm-schema.js';
 import { PostgresBackend } from './storage/index.js';
 import { isTabular, isRecord, isScalar, isCollection, isVoid, toTabular } from './core/types/data-value.js';
 import type { DataValue } from './core/types/data-value.js';
@@ -20,9 +19,13 @@ import { persistPipeline } from './storage/PipelinePersistence.js';
 import { VoyageClient } from './cache/VoyageClient.js';
 import { SemanticCache } from './cache/SemanticCache.js';
 import { SchemaStateManager } from './cache/SchemaStateManager.js';
+import { dataSourceRegistry } from './storage/DataSourceRegistry.js';
+import { buildMultiSourceSchema, type MultiSourceSchema, buildCombinedSchemaConfig, stripCreateTypes } from './schema/MultiSourceSchemaBuilder.js';
+import { buildSchemaFromSQL } from './schema/SchemaBuilder.js';
 import * as dotenv from 'dotenv';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { readFileSync } from 'fs';
 dotenv.config();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -71,6 +74,70 @@ async function main() {
   const backend = new PostgresBackend(dbConfig.crmPostgresUrl!);
   await backend.connect();
 
+  // Build schema per datasource
+  const crmSchema = buildSchemaFromSQL(
+    readFileSync(join(__dirname, '../crm_postgres.sql'), 'utf-8'),
+    { sessionAnchorTables: ['workspaces'] }
+  );
+
+  // Register default CRM datasource with built schema
+  dataSourceRegistry.register({
+    name:        'default',
+    displayName: 'CRM',
+    kind:        'postgres',
+    pool:        (backend as any).pool,
+    backend:     backend,
+    schema:      crmSchema,
+    ddlPath:     join(__dirname, '../crm_postgres.sql'),
+    description: 'Customer relationship management — accounts, contacts, leads, opportunities, tickets, activities, pipelines'
+  });
+
+  // Register PM datasource (non-fatal if unavailable)
+  const pmUrl = process.env.PM_DATABASE_URL;
+  if (pmUrl) {
+    try {
+      const { Pool } = await import('pg');
+      const pmPool    = new Pool({ connectionString: pmUrl, max: 10 });
+      const pmBackend = new PostgresBackend(pmUrl);
+      await pmBackend.connect();
+      
+      // Build PM schema
+      const pmDDLRaw = readFileSync(join(__dirname, '../pee_pm_schema.sql'), 'utf-8');
+      const pmDDL = stripCreateTypes(pmDDLRaw);
+      const pmSchema = buildSchemaFromSQL(
+        pmDDL,
+        { sessionAnchorTables: ['workspaces'] }
+      );
+      
+      console.log('[PM Schema] Tables after preprocessing:', 
+        [...pmSchema.parsed.tables.keys()]);
+      
+      dataSourceRegistry.register({
+        name:        'pm',
+        displayName: 'Project Management',
+        kind:        'postgres',
+        pool:        pmPool,
+        backend:     pmBackend,
+        schema:      pmSchema,
+        ddlPath:     join(__dirname, '../pee_pm_schema.sql'),
+        description: 'Project execution and delivery — projects, milestones, tasks, time logs, team members, project comments'
+      });
+      
+      console.log('[DataSourceRegistry] PM database connected: pee_pm');
+    } catch (e) {
+      console.warn('[DataSourceRegistry] PM database unavailable — continuing without it:', e);
+    }
+  }
+
+  // Build combined schema for pre-selector
+  // Merges all registered schemas into one flat table map
+  const multiSchema  = buildMultiSourceSchema(dataSourceRegistry.all());
+  
+  console.log('[MultiSourceSchema] All routed tables:', 
+    [...multiSchema.tableRouting.keys()].join(', '));
+  console.log('[MultiSourceSchema] Table routing entries:', multiSchema.tableRouting.size);
+  const combinedSchema = buildCombinedSchemaConfig(multiSchema, dataSourceRegistry);
+
   // Connect to pee_store for pipeline persistence
   // Non-fatal — if unavailable, continue without persistence
   let peeStoreAvailable = false;
@@ -104,18 +171,7 @@ async function main() {
 
       // Check for schema changes and invalidate if needed
       const schemaManager = new SchemaStateManager(getPeeStorePool());
-      const ddlPath = join(__dirname, '../crm_postgres.sql');
-
-      const parsed = (crmSchema as any).parsed;
-      await schemaManager.checkAndHandleSchemaChange(
-        ddlPath,
-        semanticCache,
-        parsed.tables.size,
-        // count total columns across all tables
-        [...parsed.tables.values()].reduce(
-          (sum: number, t: any) => sum + t.columns.size, 0
-        )
-      );
+      await schemaManager.checkAndHandleSchemaChange(semanticCache);
 
       console.log(
         `[SemanticCache] Ready — threshold: ${cacheConfig.threshold}, ` +
@@ -414,65 +470,12 @@ async function main() {
     anthropicApiKey: process.env.ANTHROPIC_API_KEY!
   });
 
-  // Build SchemaConfig from BuiltSchema for the engine
-  // Convert DDLParser RawTableMap → SchemaConfig tables Map
-  // SchemaConfig table shape: { columns: Array, primaryKey: string[], ... }
-  // DDLParser table shape:    { columns: Map, foreignKeys: [], ... }
-  
-  const schemaConfigTables = new Map<string, any>();
-  
-  for (const [tableName, rawTable] of crmSchema.parsed.tables) {
-    // Convert columns Map → Array in SchemaConfig format
-    const columns = Array.from(rawTable.columns.entries()).map(
-      ([colName, colDef]) => ({
-        name:        colName,
-        type:        { kind: colDef.type },   // SchemaConfig wraps type in { kind }
-        nullable:    colDef.nullable,
-        primaryKey:  colDef.primaryKey,
-        unique:      colDef.unique,
-        description: undefined,
-        examples:    undefined,
-      })
-    );
-    
-    // Extract primary key column names
-    const primaryKey = columns
-      .filter(c => c.primaryKey)
-      .map(c => c.name);
-    
-    schemaConfigTables.set(tableName, {
-      columns,
-      primaryKey,
-      description: undefined,
-      alias:       undefined,
-    });
-  }
-
-  // Convert FKGraph edges → flat FK array
-  const foreignKeys: any[] = [];
-  for (const edges of crmSchema.parsed.fkGraph.outbound.values()) {
-    for (const edge of edges) {
-      foreignKeys.push({
-        fromTable:  edge.fromTable,
-        fromColumn: edge.fromColumn,
-        toTable:    edge.toTable,
-        toColumn:   edge.toColumn,
-        onDelete:   edge.onDelete,
-      });
-    }
-  }
-
-  const engineSchema = {
-    tables:      schemaConfigTables,
-    foreignKeys,
-    version:     '1',
-  };
-
   const engine = new PipelineEngine({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
-    schema: engineSchema as any,
+    schema: combinedSchema,
     storageBackend: backend,
     sessionCursorStore,
+    multiSchema,
     budget: {
       maxLLMCalls: 20,
       maxIterations: 100,
@@ -742,7 +745,7 @@ async function main() {
   console.log('Type "exit" to quit.\n');
 
   console.log('\ud83d\udd52 Connected to Postgres:', process.env.DATABASE_URL?.replace(/:\/\/.*@/, '://***@'));
-  console.log('\ud83d\udcca Schema:', [...crmSchema.parsed.tables.keys()].join(', '));
+  console.log('\ud83d\udcca Schema:', [...combinedSchema.tables.keys()].join(', '));
   console.log(`\ud83d\udd11 Session ID: ${sessionManager.getSessionId()}`);
   console.log('\ud83d\udce7 Email: Resend API', process.env.RESEND_API_KEY ? '??' : '?? (set RESEND_API_KEY)');
   console.log();

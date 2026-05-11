@@ -28,6 +28,9 @@ export interface TableConfig {
   description?: string;
   columns: ColumnConfig[];
   primaryKey: string[];
+  // Datasource annotations for multi-source schemas
+  _datasource?: string;
+  _displayName?: string;
 }
 
 export interface SchemaConfig {

@@ -53,7 +53,14 @@ const crmTables = [
   'imports',
   'dedup_rules',
   'merge_history',
-  'audit_logs'
+  'audit_logs',
+  // PM tables
+  'projects',
+  'project_members',
+  'milestones',
+  'time_logs',
+  'comments',
+  'project_activity'
 ];
 
 function seedUsers() {

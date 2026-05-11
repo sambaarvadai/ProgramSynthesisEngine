@@ -50,6 +50,12 @@ import {
   type SessionContext
 } from './schema/ColumnClassifier.js';
 import { crmSchema } from './schema/crm-schema.js';
+import type { MultiSourceSchema } from './schema/MultiSourceSchemaBuilder.js';
+import { dataSourceRegistry } from './storage/DataSourceRegistry.js';
+import { 
+  detectCrossDBJoins, 
+  decomposeCrossDBQuery 
+} from './compiler/query/cross-db-decomposer.js';
 
 export type PipelineEngineConfig = {
   anthropicApiKey: string;
@@ -60,6 +66,7 @@ export type PipelineEngineConfig = {
   maxParallelBranches?: number;
   defaultBatchSize?: number;
   sessionCursorStore?: SessionCursorStore;
+  multiSchema?: MultiSourceSchema;
 };
 
 export type PlanResult = {
@@ -349,6 +356,7 @@ export class PipelineEngine {
     const preSelector = new TablePreSelector({
       anthropicApiKey: this.config.anthropicApiKey,
       maxTables: 5,
+      multiSchema: this.config.multiSchema,
     });
     
     let preSelectionResult;
@@ -433,15 +441,61 @@ export class PipelineEngine {
       },
     );
 
+    // Validate intent columns against full combined schema (not reduced schema)
+    // Note: This validation is skipped for PipelineIntent (no columns field)
+    // Actual QueryIntent validation happens in enrichNodes() where QueryIntents are generated
+    const columnErrors = this.validateQueryIntentColumns(intent, schemaToUse);
+    if (columnErrors.length > 0) {
+      console.error('[PipelineEngine] Column validation errors:');
+      for (const error of columnErrors) {
+        console.error(`  - ${error}`);
+      }
+      return {
+        intent,
+        graph: {
+          id: 'error-graph',
+          version: 1,
+          nodes: new Map(),
+          edges: new Map(),
+          entryNode: '',
+          exitNodes: [],
+          metadata: {
+            createdAt: Date.now(),
+            description: 'Column validation error',
+            tags: [],
+            budget: { maxLLMCalls: 0, maxIterations: 0, timeoutMs: 0 },
+          },
+        },
+        compilationErrors: columnErrors.map(err => ({
+          message: err,
+          code: 'INVALID_COLUMN',
+        })),
+        intentRaw,
+      };
+    }
+
+    // Datasource routing: annotate each step with its datasource based on table references
+    if (this.config.multiSchema) {
+      for (const step of intent.steps) {
+        const stepConfig = step.config as any;
+        if (stepConfig?.table && !stepConfig?.datasource) {
+          stepConfig.datasource =
+            preSelectionResult.tableDataSources[stepConfig.table] ?? 'default';
+        }
+      }
+    }
+
     const { graph, errors: compilationErrors } = this.compiler.compile(intent);
 
     let fieldMap: Map<string, string[]> = new Map();
     if (compilationErrors.length === 0) {
+      const multiSchema = this.config.multiSchema;
       fieldMap = await this.enrichNodes(
         graph,
         intent,
-        schemaForIntentGeneration,
-        userId
+        schemaToUse,  // Use full combined schema for validation, not reduced schema
+        userId,
+        multiSchema
       );
     }
 
@@ -886,8 +940,24 @@ export class PipelineEngine {
     for (let i = 0; i < plan.intent.steps.length; i++) {
       const step = plan.intent.steps[i];
       const deps = step.dependsOn?.join(', ') || 'none';
+      
+      // Get datasource from graph node if available
+      const node = plan.graph.nodes.get(step.id);
+      let datasource = '';
+      if (node) {
+        if ((node as any).kind === 'query') {
+          datasource = (node as any).payload?.datasource || '';
+        } else if ((node as any).kind === 'write') {
+          datasource = (node as any).payload?.datasource || '';
+        }
+      }
+      
+      const stepInfo = datasource 
+        ? `${step.id} (datasource: ${datasource})` 
+        : step.id;
+      
       lines.push(
-        `  ${i + 1}. [${step.kind}] ${step.id}: ${step.description}`,
+        `  ${i + 1}. [${step.kind}] ${stepInfo}: ${step.description}`,
       );
       lines.push(`     Depends on: ${deps}`);
 
@@ -945,11 +1015,118 @@ export class PipelineEngine {
     return lines.join('\n');
   }
 
+  private validateQueryIntentColumns(intent: any, schema: SchemaConfig): string[] {
+    const errors: string[] = [];
+
+    // Skip validation if intent doesn't have columns (e.g., PipelineIntent vs QueryIntent)
+    if (!intent.columns || !Array.isArray(intent.columns)) {
+      return errors;
+    }
+
+    console.log('[validateQueryIntentColumns] Validating', intent.columns.length, 'columns');
+    console.log('[validateQueryIntentColumns] Schema has', schema.tables.size, 'tables');
+
+    // Validate columns in SELECT clause
+    for (const col of intent.columns) {
+      // Skip wildcard columns - they are valid SQL
+      if (col.field === '*') {
+        continue;
+      }
+
+      const tableName = col.table || intent.table;
+      const tableConfig = schema.tables.get(tableName);
+      
+      console.log(`[validateQueryIntentColumns] Checking column "${col.field}" in table "${tableName}":`, !!tableConfig);
+      
+      if (!tableConfig) {
+        errors.push(`Column "${col.field}" references unknown table "${tableName}"`);
+        continue;
+      }
+
+      const columnExists = tableConfig.columns.some((c: any) => c.name === col.field);
+      console.log(`[validateQueryIntentColumns] Column "${col.field}" exists in "${tableName}":`, columnExists);
+      
+      if (!columnExists) {
+        const availableColumns = tableConfig.columns.map((c: any) => c.name).join(', ');
+        errors.push(
+          `Column "${col.field}" does not exist in table "${tableName}". ` +
+          `Available columns: ${availableColumns}`
+        );
+      }
+    }
+
+    // Validate columns in filters
+    if (intent.filters) {
+      for (const filter of intent.filters) {
+        const tableName = filter.table || intent.table;
+        const tableConfig = schema.tables.get(tableName);
+        if (!tableConfig) {
+          errors.push(`Filter column "${filter.field}" references unknown table "${tableName}"`);
+          continue;
+        }
+
+        const columnExists = tableConfig.columns.some((c: any) => c.name === filter.field);
+        if (!columnExists) {
+          const availableColumns = tableConfig.columns.map((c: any) => c.name).join(', ');
+          errors.push(
+            `Filter column "${filter.field}" does not exist in table "${tableName}". ` +
+            `Available columns: ${availableColumns}`
+          );
+        }
+      }
+    }
+
+    // Validate columns in orderBy
+    if (intent.orderBy) {
+      for (const order of intent.orderBy) {
+        const tableName = order.table || intent.table;
+        const tableConfig = schema.tables.get(tableName);
+        if (!tableConfig) {
+          errors.push(`OrderBy column "${order.field}" references unknown table "${tableName}"`);
+          continue;
+        }
+
+        const columnExists = tableConfig.columns.some((c: any) => c.name === order.field);
+        if (!columnExists) {
+          const availableColumns = tableConfig.columns.map((c: any) => c.name).join(', ');
+          errors.push(
+            `OrderBy column "${order.field}" does not exist in table "${tableName}". ` +
+            `Available columns: ${availableColumns}`
+          );
+        }
+      }
+    }
+
+    // Validate columns in groupBy
+    if (intent.groupBy) {
+      for (const field of intent.groupBy) {
+        const tableName = intent.table;
+        const tableConfig = schema.tables.get(tableName);
+        if (!tableConfig) {
+          errors.push(`GroupBy column "${field}" references unknown table "${tableName}"`);
+          continue;
+        }
+
+        const columnExists = tableConfig.columns.some((c: any) => c.name === field);
+        if (!columnExists) {
+          const availableColumns = tableConfig.columns.map((c: any) => c.name).join(', ');
+          errors.push(
+            `GroupBy column "${field}" does not exist in table "${tableName}". ` +
+            `Available columns: ${availableColumns}`
+          );
+        }
+      }
+    }
+
+    return errors;
+  }
+
   private async enrichNodes(
     graph: PipelineGraph,
     intent: PipelineIntent,
     schema: SchemaConfig,
-    userId?: string
+    userId?: string,
+    multiSchema?: MultiSourceSchema
   ): Promise<Map<string, string[]>> {
     // Track available fields for each step to prevent hallucination
     const fieldMap = new Map<string, string[]>(); // stepId -> field names
@@ -964,12 +1141,132 @@ export class PipelineEngine {
           const { intent: queryIntent } =
             await this.queryIntentGenerator.generate(step.description, schema);
 
-          // Update the node payload in-place
-          (node.payload as QueryPayload).intent = queryIntent;
-          (node.payload as QueryPayload).datasource = 'default';
+          // Validate columns exist in schema
+          const columnErrors = this.validateQueryIntentColumns(queryIntent, schema);
+          if (columnErrors.length > 0) {
+            console.error('[PipelineEngine] Column validation errors:');
+            for (const error of columnErrors) {
+              console.error(`  - ${error}`);
+            }
+            throw new Error(
+              `Query intent contains invalid columns:\n${columnErrors.join('\n')}`
+            );
+          }
 
-          // Track field names from query output
-          const fieldNames = queryIntent.columns.map((c: any) => c.alias || c.field);
+          // Determine datasource from primary table
+          const primaryTable = queryIntent.table;
+          const datasource = multiSchema
+            ? (multiSchema.tableRouting.get(primaryTable) as string | undefined ?? 'default')
+            : 'default';
+
+          // Check for cross-DB joins
+          if (multiSchema && detectCrossDBJoins(queryIntent, multiSchema)) {
+            
+            const decomposed = decomposeCrossDBQuery(
+              nodeId,
+              queryIntent,
+              multiSchema
+            );
+
+            if (decomposed.isCrossDB) {
+              // Add lookup nodes to the graph
+              for (const dStep of decomposed.steps) {
+                if (dStep.nodeId === nodeId) {
+                  // This is the primary step — update existing node
+                  (node.payload as QueryPayload).intent = dStep.intent;
+                  (node.payload as QueryPayload).datasource = dStep.datasource;
+                  
+                  // Track fields from primary step
+                  const fieldNames = dStep.intent.columns.map(
+                    (c: any) => c.alias || c.field
+                  );
+                  fieldMap.set(nodeId, fieldNames);
+                  
+                } else {
+                  // This is a lookup step — add new node to graph
+                  const lookupNode: PipelineNode = {
+                    id: dStep.nodeId,
+                    kind: 'query',
+                    errorPolicy: { onError: 'fail' },
+                    payload: {
+                      intent: dStep.intent,
+                      datasource: dStep.datasource
+                    } as QueryPayload
+                  };
+                  
+                  graph.nodes.set(dStep.nodeId, lookupNode);
+                  
+                  // Add edge: _input → lookup node
+                  const inputEdgeId = `e__input_${dStep.nodeId}`;
+                  if (graph.edges instanceof Map) {
+                    graph.edges.set(inputEdgeId, {
+                      id: inputEdgeId,
+                      from: '_input',
+                      to: dStep.nodeId,
+                      kind: 'data'
+                    });
+                  } else if (Array.isArray(graph.edges)) {
+                    (graph.edges as any[]).push({
+                      id: inputEdgeId,
+                      from: '_input',
+                      to: dStep.nodeId,
+                      kind: 'data'
+                    });
+                  }
+                  
+                  console.log(
+                    `[CrossDBDecomposer] Added edge: _input → ${dStep.nodeId}`
+                  );
+                  
+                  // Add edge: lookup → primary node
+                  const edgeId = `e_${dStep.nodeId}_${nodeId}`;
+                  if (graph.edges instanceof Map) {
+                    graph.edges.set(edgeId, {
+                      id: edgeId,
+                      from: dStep.nodeId,
+                      to: nodeId,
+                      kind: 'data'
+                    });
+                  } else if (Array.isArray(graph.edges)) {
+                    (graph.edges as any[]).push({
+                      id: edgeId,
+                      from: dStep.nodeId,
+                      to: nodeId,
+                      kind: 'data'
+                    });
+                  }
+                  
+                  // Track lookup fields
+                  const lookupFields = dStep.intent.columns.map(
+                    (c: any) => c.alias || c.field
+                  );
+                  fieldMap.set(dStep.nodeId, lookupFields);
+                  
+                  console.log(
+                    `[CrossDBDecomposer] Added lookup node: ${dStep.nodeId} ` +
+                    `(${dStep.datasource}) → ${nodeId}`
+                  );
+                }
+              }
+              
+              break;  // done with this node
+            }
+          }
+
+          // No cross-DB joins — normal single-datasource path
+          (node.payload as QueryPayload).intent = queryIntent;
+          (node.payload as QueryPayload).datasource = datasource;
+
+          if (datasource !== 'default') {
+            console.log(
+              `[DataSourceRouter] Node "${nodeId}": ` +
+              `table="${primaryTable}" → datasource="${datasource}"`
+            );
+          }
+
+          const fieldNames = queryIntent.columns.map(
+            (c: any) => c.alias || c.field
+          );
           fieldMap.set(step.id, fieldNames);
           break;
         }
@@ -1050,8 +1347,24 @@ export class PipelineEngine {
         }
 
         case 'write': {
-          const writeConfig = await this.enrichWriteNode(step, fieldMap, intent, graph, userId, 1) // Default workspaceId to 1 for demo
-          node.payload = writeConfig
+          const writeConfig = await this.enrichWriteNode(step, fieldMap, intent, graph, userId, 1); // Default workspaceId to 1 for demo
+          
+          // Datasource routing: set datasource based on table
+          const table = writeConfig.table;
+          const datasource = multiSchema
+            ? (multiSchema.tableRouting.get(table) as string | undefined ?? 'default')
+            : 'default';
+          
+          writeConfig.datasource = datasource;
+          
+          if (datasource !== 'default') {
+            console.log(
+              `[DataSourceRouter] Write node "${step.id}": ` +
+              `table="${table}" → datasource="${datasource}"`
+            );
+          }
+          
+          node.payload = writeConfig;
           
           // WriteNodes pass through the fields they received from upstream.
           // This allows downstream nodes (e.g. another WriteNode) to see 
@@ -1573,13 +1886,18 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
     const originalFields = step.config?.fields as Record<string, any> || {};
     console.log('[WriteEnrichment] Raw step.config.fields:', step.config?.fields);
     console.log('[WriteEnrichment] originalFields type:', Array.isArray(originalFields) ? 'array' : 'object');
+
+    // Get the correct schema based on datasource
+    const datasource = step.config?.datasource as string || 'default';
+    const dsConfig = dataSourceRegistry.get(datasource);
+    const schemaToUse = dsConfig?.schema || crmSchema;
     
     // ColumnClassifier integration: auto-inject session-scoped values
     const targetTable = step.config?.table as string;
     let autoValues: Record<string, any> = {};
     let exclusions: string[] = [];
     
-    if (targetTable && (crmSchema as any).parsed.tables.has(targetTable)) {
+    if (targetTable && (schemaToUse as any).parsed.tables.has(targetTable)) {
       const operation = step.config?.operation as string | undefined;
       const mode = operation?.toLowerCase() === 'update' ? 'update' : 'insert';
       
@@ -1617,7 +1935,7 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
       
       const classifications = classifyAllColumns(
         targetTable, 
-        crmSchema as any, 
+        schemaToUse as any, 
         sessionCtx, 
         mode
       );
