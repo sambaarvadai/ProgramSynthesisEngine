@@ -62,5 +62,5 @@ export interface PipelineIntentValidationError {
     table: string;
     availableFields: string[];
     suggestion: string;
-  }>;
+  }> | Array<{ name: string; required: boolean }>;
 }

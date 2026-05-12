@@ -2,6 +2,8 @@
  * Schema Validation System - Pre-flight validation for pipeline operations
  */
 
+const DEBUG = process.env.PEE_DEBUG === 'true';
+
 import type { SchemaConfig } from '../../compiler/schema/schema-config.js';
 import type { PipelineGraph, PipelineNode } from '../graph/index.js';
 import type { WritePayload } from '../../nodes/payloads.js';
@@ -30,6 +32,7 @@ export interface SchemaValidationError {
   error: string;
   severity: 'error' | 'warning';
   suggestion: string;
+  missingColumns?: { name: string; required: boolean }[];
 }
 
 export interface SchemaValidationResult {
@@ -66,16 +69,16 @@ export class SchemaValidator {
 
     // Get live database schema
     const liveSchema = await this.getLiveSchema();
-    
+
     // Validate each node in the pipeline
     const INTERNAL_NODE_KINDS = new Set(['input', 'output', '_input', '_output']);
-    
+
     for (const [nodeId, node] of graph.nodes) {
       // Skip internal scheduler nodes
       if (INTERNAL_NODE_KINDS.has(node.kind) || INTERNAL_NODE_KINDS.has(nodeId)) {
         continue;
       }
-      
+
       const nodeValidation = await this.validateNode(nodeId, node, liveSchema);
       errors.push(...nodeValidation.errors);
       warnings.push(...nodeValidation.warnings);
@@ -197,20 +200,38 @@ export class SchemaValidator {
       }
     }
 
-    // Check for missing required columns only for INSERT and UPSERT modes
+    // Check for missing required and optional columns for INSERT and UPSERT modes
     const isInsertMode = ['insert', 'insert_ignore', 'upsert'].includes(payload.mode);
     
     if (isInsertMode) {
       const missingRequired = this.findMissingRequiredColumns(payload, tableSchema, payload.table);
-      for (const missing of missingRequired) {
+      const missingOptional = this.findMissingOptionalColumns(payload, tableSchema, payload.table);
+
+      // Required columns are errors (block execution)
+      if (missingRequired.length > 0) {
         errors.push({
           nodeId,
           operation: 'write',
           table: payload.table,
-          column: missing,
-          error: `Required column '${missing}' is missing from write operation`,
+          column: missingRequired.join(', '),
+          error: `The ${payload.mode} into ${payload.table} is missing required values:\n  ${missingRequired.map(c => `${c} (required)`).join('\n  ')}`,
           severity: 'error',
-          suggestion: `Add '${missing}' to columns or provide a default value`
+          suggestion: `Provide values for required columns`,
+          missingColumns: missingRequired.map(name => ({ name, required: true }))
+        });
+      }
+
+      // Optional columns are warnings (prompt user but don't block)
+      if (missingOptional.length > 0) {
+        warnings.push({
+          nodeId,
+          operation: 'write',
+          table: payload.table,
+          column: missingOptional.join(', '),
+          error: `The ${payload.mode} into ${payload.table} is missing optional values:\n  ${missingOptional.map(c => `${c} (optional)`).join('\n  ')}`,
+          severity: 'warning',
+          suggestion: `Optional columns can be skipped or provided later`,
+          missingColumns: missingOptional.map(name => ({ name, required: false }))
         });
       }
     }
@@ -224,7 +245,7 @@ export class SchemaValidator {
         // Skip type checking for columns that are also in dynamic columns array
         // (will be resolved from upstream data at runtime)
         if (dynamicColumns.has(column)) {
-          console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
+          if (DEBUG) console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
             `column is dynamic (will be resolved from upstream)`)
           continue
         }
@@ -232,7 +253,7 @@ export class SchemaValidator {
         // Skip type checking for values that look like field references
         if (typeof value === 'string' && tableColumnNames.has(value)) {
           // Value looks like a field reference, not a literal - skip type check
-          console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
+          if (DEBUG) console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
             `value '${value}' looks like a field reference`)
           continue
         }
@@ -240,7 +261,7 @@ export class SchemaValidator {
         // Skip type checking for SQL subqueries
         if (typeof value === 'string' && value.trim().toUpperCase().startsWith('SELECT')) {
           // Value is a SQL subquery - will be executed at runtime, skip type check
-          console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
+          if (DEBUG) console.warn(`[Schema Validator] Skipping type check for '${column}': ` +
             `value is a SQL subquery`)
           continue
         }
@@ -444,6 +465,60 @@ export class SchemaValidator {
   }
 
   /**
+   * Find missing optional columns for write operation (for prompting)
+   */
+  private findMissingOptionalColumns(payload: WritePayload, tableSchema: TableSchema, tableName: string): string[] {
+    const missing: string[] = [];
+    const providedColumns = new Set([
+      ...(payload.columns || []),
+      ...(Object.keys(payload.staticValues || {})),
+      ...(payload.staticWhere ? Object.keys(payload.staticWhere) : []),
+      ...(payload.whereColumns || [])
+    ]);
+
+    if (DEBUG) {
+      console.log(`[findMissingOptionalColumns] Table: ${tableName}`);
+      console.log(`[findMissingOptionalColumns] Provided columns:`, Array.from(providedColumns));
+      console.log(`[findMissingOptionalColumns] Table columns:`, Object.keys(tableSchema.columns));
+    }
+
+    // Skip auto-managed columns
+    const autoManagedColumns = new Set(['id', 'code', 'created_at', 'updated_at', 'deleted_at', 'converted_at']);
+
+    for (const [columnName, columnSchema] of Object.entries(tableSchema.columns)) {
+      // Skip auto-managed columns
+      if (autoManagedColumns.has(columnName)) {
+        if (DEBUG) console.log(`[findMissingOptionalColumns] Skipping auto-managed: ${columnName}`);
+        continue;
+      }
+
+      // Skip columns that are required (already handled by findMissingRequiredColumns)
+      const colDef = (crmSchema as any).parsed.tables
+        .get(tableName)?.columns.get(columnName);
+      const hasDefault = columnSchema.hasDefault || 
+                        columnSchema.primaryKey ||
+                        (columnSchema as any).defaultRaw !== null ||
+                        (colDef?.defaultRaw !== null);
+      
+      const isRequired = columnSchema.nullable === false && !hasDefault;
+      if (DEBUG) console.log(`[findMissingOptionalColumns] Column: ${columnName}, nullable: ${columnSchema.nullable}, hasDefault: ${hasDefault}, isRequired: ${isRequired}`);
+      
+      if (isRequired) {
+        continue; // Required column, skip
+      }
+
+      // Optional column that's not provided
+      if (!providedColumns.has(columnName)) {
+        if (DEBUG) console.log(`[findMissingOptionalColumns] Adding to missing: ${columnName}`);
+        missing.push(columnName);
+      }
+    }
+
+    console.log(`[findMissingOptionalColumns] Final missing optional:`, missing);
+    return missing;
+  }
+
+  /**
    * Validate column type compatibility
    */
   private validateColumnType(
@@ -473,7 +548,13 @@ export class SchemaValidator {
     const expectedJsType = this.sqlTypeToJsType(sqlType);
     const actualJsType = typeof value;
     
+    // Allow numbers for TEXT/VARCHAR columns (will be converted to string later)
     if (actualJsType !== expectedJsType) {
+      if (expectedJsType === 'string' && actualJsType === 'number' &&
+          (sqlType === 'TEXT' || sqlType === 'VARCHAR' || sqlType === 'CHARACTER VARYING')) {
+        // Number can be converted to string, allow it
+        return { isValid: true, error: '', suggestion: '' };
+      }
       return {
         isValid: false,
         error: `Column '${columnName}' expects ${expectedJsType}, got ${actualJsType}`,

@@ -222,13 +222,7 @@ External API call support:
 - Enables HttpNode for per-row or batch API calls
 - API registry with endpoint metadata
 
-### Substrait Support
 
-Cross-engine query compatibility via Substrait:
-
-- **SubstraitTranslator** — Converts QueryAST to/from Substrait plan format
-- **SubstraitGenerator** — Python-based Substrait plan generation
-- Enables query portability across different query engines
 
 ---
 

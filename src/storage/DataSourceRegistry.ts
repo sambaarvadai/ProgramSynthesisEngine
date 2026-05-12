@@ -21,8 +21,18 @@ export interface DataSourceConfig {
   openApiUrl?: string;
 }
 
+export type CrossDatasourceFK = {
+  fromDatasource: string   // datasource where the FK column lives
+  fromTable:      string
+  fromColumn:     string
+  toDatasource:   string   // datasource being referenced
+  toTable:        string
+  toColumn:       string
+}
+
 export class DataSourceRegistry {
   private datasources: Map<string, DataSourceConfig> = new Map();
+  private crossDatasourceFKs: Map<string, CrossDatasourceFK> = new Map();
 
   register(config: DataSourceConfig): void {
     if (this.datasources.has(config.name)) {
@@ -57,6 +67,35 @@ export class DataSourceRegistry {
 
   has(name: string): boolean {
     return this.datasources.has(name);
+  }
+
+  // Declare one or more cross-datasource FK relationships
+  declareCrossDatasourceFKs(fks: CrossDatasourceFK[]): void {
+    for (const fk of fks) {
+      const key = `${fk.fromTable}.${fk.fromColumn}`;
+      this.crossDatasourceFKs.set(key, fk);
+      console.log(
+        `[DataSourceRegistry] Declared cross-datasource FK: ${key} ` +
+        `→ ${fk.toDatasource}.${fk.toTable}.${fk.toColumn}`
+      );
+    }
+  }
+
+  // Resolve: given a table+column, return the FK definition if one exists
+  resolveCrossDatasourceFK(fromTable: string, fromColumn: string): CrossDatasourceFK | undefined {
+    const key = `${fromTable}.${fromColumn}`;
+    return this.crossDatasourceFKs.get(key);
+  }
+
+  // Get all declared FKs for a given table
+  getCrossDatasourceFKsForTable(fromTable: string): CrossDatasourceFK[] {
+    const results: CrossDatasourceFK[] = [];
+    for (const [key, fk] of this.crossDatasourceFKs.entries()) {
+      if (fk.fromTable === fromTable) {
+        results.push(fk);
+      }
+    }
+    return results;
   }
 }
 

@@ -5,8 +5,10 @@ import type { SchemaConfig } from '../compiler/schema/schema-config.js';
 // Helper function to strip CREATE TYPE ... AS ENUM (...) statements
 // These cause DDLParser issues, so we remove them before parsing
 export function stripCreateTypes(ddl: string): string {
+  // Only remove CREATE TYPE ... AS ENUM (...) blocks
+  // Must not touch REFERENCES, FOREIGN KEY, or any column definition content
   return ddl.replace(
-    /CREATE TYPE\s+\w+\s+AS ENUM\s*\([^)]+\)\s*;/gis,
+    /CREATE\s+TYPE\s+\w+\s+AS\s+ENUM\s*\([\s\S]*?\)\s*;/gi,
     ''
   );
 }

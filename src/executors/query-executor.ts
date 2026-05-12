@@ -1,3 +1,5 @@
+const DEBUG = process.env.PEE_DEBUG === 'true';
+
 import type { SchemaConfig } from '../compiler/schema/schema-config.js';
 import type { StorageBackend } from '../core/storage/storage-backend.js';
 import type { TempStore } from '../core/storage/temp-store.js';
@@ -187,8 +189,13 @@ export class QueryExecutor {
             }
           } else {
             const value = typeof f.value === 'string' ? `'${f.value}'` : f.value;
-            // Apply LOWER() for case-insensitive string comparisons
+            // Apply case-insensitive matching
             if (f.caseInsensitive && typeof f.value === 'string') {
+              // For LIKE operator, use ILIKE for case-insensitive pattern matching
+              if (f.operator === 'LIKE') {
+                return `${field} ILIKE ${value}`;
+              }
+              // For other operators, use LOWER() on both sides
               return `LOWER(${field}) = LOWER(${value})`;
             }
             return `${field} ${f.operator} ${value}`;
@@ -242,14 +249,15 @@ export class QueryExecutor {
       for (const filter of intent.filters) {
         if ((filter as any).valueRef) {
           const ref = (filter as any).valueRef as string;
-          // ref format: "$nodeId.fieldName"
+          // ref format: "$nodeId.fieldName" or just "nodeId" (defaults to 'id')
           const [nodeRef, fieldName] = ref.replace('$', '').split('.');
+          const targetField = fieldName || 'id';
           
           // Get upstream rows from execution context
           const upstreamRows = (ctx as any).nodeOutputs?.get(nodeRef);
           if (upstreamRows && Array.isArray(upstreamRows)) {
             const values = upstreamRows
-              .map((r: any) => r[fieldName])
+              .map((r: any) => r[targetField])
               .filter((v: any) => v != null);
             
             // Validate lookup results for cross-datasource FK resolution
@@ -416,15 +424,7 @@ export class QueryExecutor {
     const result = await collectAll(root, ctx, ctx.budget.maxRowsPerNode);
     console.log(`[QueryExecutor] Query executed, returned ${result.rows.length} rows`);
 
-    // 5. Record to trace
-    traceEvent(ctx.trace, {
-      nodeId: ctx.executionId,
-      kind: 'complete',
-      rowsOut: result.rows.length,
-      meta: { optimizations: plan.optimizations }
-    });
-
-    // 6. Return result - prevent fallthrough to other paths
+    // Explicit early return to prevent fall-through to raw SQL path
     return {
       rows: result.rows,
       schema: result.schema,

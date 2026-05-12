@@ -13,6 +13,7 @@ interface RawColumnDef {
   unique: boolean;
   defaultRaw: string | null;
   checkRaw: string | null;
+  reference?: RawFKDef | null;
 }
 
 interface RawFKDef {
@@ -129,6 +130,10 @@ export function parseSchema(ddl: string): ParsedSchema {
       if (item.resource === 'column') {
         const col = extractColumn(item);
         columns.set(col.name, col);
+        // Collect inline REFERENCES clause
+        if (col.reference) {
+          foreignKeys.push(col.reference);
+        }
       } else if (item.resource === 'constraint') {
         if (item.constraint_type === 'FOREIGN KEY') {
           const fk = extractForeignKey(item);
@@ -351,7 +356,50 @@ function extractColumn(item: any): RawColumnDef {
     checkRaw = stringifyCheck(item.check);
   }
 
-  return { name, type, nullable, primaryKey, unique, defaultRaw, checkRaw };
+  // Extract inline REFERENCES clause
+  let reference: RawFKDef | null = null;
+  if (item.reference_definition) {
+    const refTable = item.reference_definition.table?.[0]?.table || '';
+    
+    let refColumn = '';
+    if (item.reference_definition.definition && item.reference_definition.definition.length > 0) {
+      const def = item.reference_definition.definition[0];
+      if (def.column && def.column.expr && def.column.expr.value) {
+        refColumn = def.column.expr.value;
+      } else if (def.column) {
+        refColumn = def.column;
+      }
+    }
+    
+    let onDelete = 'NO ACTION';
+    if (item.reference_definition?.on_action) {
+      const deleteAction = item.reference_definition.on_action.find(
+        (a: any) => a.type === 'on delete'
+      );
+      if (deleteAction) {
+        const v = deleteAction.value;
+        if (Array.isArray(v)) {
+          onDelete = v.map((x: any) => x.value ?? x).join(' ').toUpperCase();
+        } else if (v?.type === 'origin') {
+          onDelete = String(v.value ?? '').toUpperCase();
+        } else if (typeof v === 'string') {
+          onDelete = v.toUpperCase();
+        } else if (v?.value) {
+          onDelete = String(v.value).toUpperCase();
+        }
+        onDelete = onDelete.replace(/\s+/g, ' ').replace('SET NULL', 'SET NULL').trim();
+      }
+    }
+    
+    reference = {
+      column: name,
+      refTable,
+      refColumn,
+      onDelete
+    };
+  }
+
+  return { name, type, nullable, primaryKey, unique, defaultRaw, checkRaw, reference };
 }
 
 function extractForeignKey(item: any): RawFKDef {

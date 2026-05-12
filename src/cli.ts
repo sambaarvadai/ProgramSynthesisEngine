@@ -112,13 +112,6 @@ async function main() {
       console.log('[PM Schema] Tables after preprocessing:', 
         [...pmSchema.parsed.tables.keys()]);
       
-      // Debug: Check if workspace_id is marked as session_scoped
-      const projectsTraits = pmSchema.traits.get('projects');
-      if (projectsTraits) {
-        const workspaceIdTrait = projectsTraits.get('workspace_id');
-        console.log('[PM Schema] projects.workspace_id trait:', workspaceIdTrait);
-      }
-      
       dataSourceRegistry.register({
         name:        'pm',
         displayName: 'Project Management',
@@ -135,6 +128,40 @@ async function main() {
       console.warn('[DataSourceRegistry] PM database unavailable — continuing without it:', e);
     }
   }
+
+  // Declare cross-datasource FK relationships
+  // These are FKs that reference tables in different datasources
+  dataSourceRegistry.declareCrossDatasourceFKs([
+    // projects → CRM
+    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'crm_account_id',
+      toDatasource: 'default', toTable: 'accounts', toColumn: 'id' },
+    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'crm_opportunity_id',
+      toDatasource: 'default', toTable: 'opportunities', toColumn: 'id' },
+    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'crm_contact_id',
+      toDatasource: 'default', toTable: 'contacts', toColumn: 'id' },
+    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'owner_user_id',
+      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
+
+    // project_members → CRM
+    { fromDatasource: 'pm', fromTable: 'project_members', fromColumn: 'user_id',
+      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
+
+    // tasks → CRM
+    { fromDatasource: 'pm', fromTable: 'tasks', fromColumn: 'assigned_to_user_id',
+      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
+
+    // time_logs → CRM
+    { fromDatasource: 'pm', fromTable: 'time_logs', fromColumn: 'user_id',
+      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
+
+    // comments → CRM
+    { fromDatasource: 'pm', fromTable: 'comments', fromColumn: 'user_id',
+      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
+
+    // project_activity → CRM
+    { fromDatasource: 'pm', fromTable: 'project_activity', fromColumn: 'user_id',
+      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
+  ]);
 
   // Build combined schema for pre-selector
   // Merges all registered schemas into one flat table map
@@ -965,6 +992,74 @@ async function main() {
             const startedAt = new Date();
             const startMs = Date.now();
 
+            // Run schema validation on cached plan before execution
+            console.log('Performing pre-flight schema validation on cached plan...');
+            const schemaValidation = await engine.schemaValidator.validatePipeline(cacheHit.plan.graph);
+            
+            if (!schemaValidation.isValid) {
+              console.log('\nSchema validation failed:');
+              console.log(engine.schemaValidator.formatForDisplay(schemaValidation));
+              console.log('Please run with fresh plan to resolve schema issues.');
+              continue;
+            }
+            
+            // Attach schema validation warnings to plan for optional field prompting
+            if (schemaValidation.warnings.length > 0) {
+              (cacheHit.plan as any).schemaValidationWarnings = schemaValidation.warnings;
+              console.log(`Schema validation passed with ${schemaValidation.warnings.length} warning(s)`);
+              
+              // Handle optional field prompting for cached plans
+              const optionalWarning = schemaValidation.warnings.find((w: any) => 
+                w.operation === 'write' && w.missingColumns && w.missingColumns.some((c: any) => !c.required)
+              );
+              
+              if (optionalWarning) {
+                const writeNode = cacheHit.plan.graph.nodes.get(optionalWarning.nodeId);
+                const writePayload = writeNode?.kind === 'write' ? writeNode.payload as WritePayload : null;
+                const tableColumns = writePayload?.table ? (crmSchema as any).parsed?.tables.get(writePayload.table)?.columns : undefined;
+                
+                if (writePayload && tableColumns) {
+                  console.log('\n⚠️  Optional fields available:');
+                  
+                  const optionalFields: FieldPrompt[] = [];
+                  for (const missing of optionalWarning.missingColumns as { name: string; required: boolean }[]) {
+                    if (!missing.required) {
+                      const colDef = (tableColumns as Map<string, any>).get(missing.name);
+                      if (!colDef) continue;
+
+                      const colTraits = writePayload?.table
+                        ? (crmSchema as any).traits.get(writePayload.table)?.get(missing.name)
+                        : undefined;
+
+                      const field: FieldPrompt = {
+                        column: missing.name,
+                        type: colDef.type ?? 'TEXT',
+                        required: false,
+                        defaultValue: colDef.defaultRaw ?? null,
+                        enumValues: colTraits?.enumValues ?? [],
+                        fkTarget: colTraits?.foreignKey
+                          ? { table: colTraits.foreignKey.references, 
+                              column: colTraits.foreignKey.column }
+                          : null,
+                      };
+                      optionalFields.push(field);
+                    }
+                  }
+                  
+                  if (optionalFields.length > 0) {
+                    const collectedOptional = await collectFieldsFromUser([], optionalFields, null);
+                    
+                    if (Object.keys(collectedOptional).length > 0) {
+                      writePayload.staticValues = { ...writePayload.staticValues, ...collectedOptional };
+                      console.log('\n✅ Optional values added to cached plan.');
+                    }
+                  }
+                }
+              }
+            } else {
+              console.log('Schema validation passed successfully');
+            }
+
             // The cached plan has fully enriched nodes — execute directly
             const result = await engine.execute(cacheHit.plan);
             const durationMs = Date.now() - startMs;
@@ -1194,39 +1289,104 @@ async function main() {
             );
           }
           
-          // Build field manifest
+          // Build field manifest from missingColumns in the error
           const requiredFields: FieldPrompt[] = [];
           const optionalFields: FieldPrompt[] = [];
 
-          for (const col of writeIncompleteError.missingColumns) {
-            // Skip auto-managed columns
-            if (['id', 'created_at', 'updated_at', 'deleted_at', 'converted_at'].includes(col.column)) {
-              continue;
+          // Use missingColumns from error if available, otherwise fall back to all columns
+          const missingColumns = writeIncompleteError.missingColumns;
+          
+          if (missingColumns && missingColumns.length > 0) {
+            // Use the missing columns from the error
+            // Handle both old format (column, nullable, description) and new format (name, required)
+            for (const missing of missingColumns) {
+              // Determine column name and required status based on format
+              let colName: string;
+              let isRequired: boolean;
+
+              if ('name' in missing) {
+                // New format from schema validator
+                colName = missing.name;
+                isRequired = missing.required;
+              } else if ('column' in missing && 'nullable' in missing) {
+                // Old format from pipeline-engine
+                colName = missing.column;
+                isRequired = !missing.nullable;
+              } else {
+                // Second old format (field resolution error)
+                continue;
+              }
+
+              if (tableColumns) {
+                const colDef = (tableColumns as Map<string, any>).get(colName);
+                if (!colDef) continue;
+
+                const colTraits = writePayload?.table
+                  ? (crmSchema as any).traits.get(writePayload.table)?.get(colName)
+                  : undefined;
+
+                const field: FieldPrompt = {
+                  column:       colName,
+                  type:         colDef.type ?? 'TEXT',
+                  required:     isRequired,
+                  defaultValue: colDef.defaultRaw ?? null,
+                  enumValues:   colTraits?.enumValues ?? [],
+                  fkTarget:     colTraits?.foreignKey
+                    ? { table: colTraits.foreignKey.references, 
+                        column: colTraits.foreignKey.column }
+                    : null,
+                };
+
+                if (field.required) {
+                  requiredFields.push(field);
+                } else {
+                  optionalFields.push(field);
+                }
+              }
             }
+          } else {
+            // Fallback: iterate over ALL columns in the table
+            const columnsWithValues = new Set([
+              ...(writePayload?.staticValues ? Object.keys(writePayload.staticValues) : []),
+              ...(writePayload?.columns ?? [])
+            ]);
 
-            const colDef = tableColumns?.get(col.column);
-            const colTraits = writePayload?.table
-              ? (crmSchema as any).traits.get(writePayload.table)?.get(col.column)
-              : undefined;
+            if (tableColumns) {
+              for (const [colName, colDef] of tableColumns.entries()) {
+                // Skip auto-managed columns
+                if (['id', 'created_at', 'updated_at', 'deleted_at', 'converted_at'].includes(colName)) {
+                  continue;
+                }
 
-            const field: FieldPrompt = {
-              column:       col.column,
-              type:         colDef?.type ?? 'TEXT',
-              required:     writePayload?.mode === 'insert' 
-                ? !('nullable' in col) || !col.nullable  // INSERT: required = NOT NULL
-                : false,  // UPDATE: no required fields (partial updates valid)
-              defaultValue: colDef?.defaultRaw ?? null,
-              enumValues:   colTraits?.enumValues ?? [],
-              fkTarget:     colTraits?.foreignKey
-                ? { table: colTraits.foreignKey.references, 
-                    column: colTraits.foreignKey.column }
-                : null,
-            };
+                // Skip columns that already have values
+                if (columnsWithValues.has(colName)) {
+                  continue;
+                }
 
-            if (field.required) {
-              requiredFields.push(field);
-            } else {
-              optionalFields.push(field);
+                const colTraits = writePayload?.table
+                  ? (crmSchema as any).traits.get(writePayload.table)?.get(colName)
+                  : undefined;
+
+                const field: FieldPrompt = {
+                  column:       colName,
+                  type:         colDef.type ?? 'TEXT',
+                  required:     writePayload?.mode === 'insert' 
+                    ? !colDef.nullable && colDef.defaultRaw === null
+                    : false,
+                  defaultValue: colDef.defaultRaw ?? null,
+                  enumValues:   colTraits?.enumValues ?? [],
+                  fkTarget:     colTraits?.foreignKey
+                    ? { table: colTraits.foreignKey.references, 
+                        column: colTraits.foreignKey.column }
+                    : null,
+                };
+
+                if (field.required) {
+                  requiredFields.push(field);
+                } else {
+                  optionalFields.push(field);
+                }
+              }
             }
           }
 
@@ -1349,41 +1509,52 @@ async function main() {
             );
           }
 
-          // Build field manifest from ALL missing columns
+          // Build field manifest from ALL table columns
           const requiredFields: FieldPrompt[] = [];
           const optionalFields: FieldPrompt[] = [];
 
-          for (const col of writeFieldUnresolvableError.missingColumns) {
-            if (!('table' in col)) continue;
+          // Get columns that already have values (from staticValues or upstream)
+          const columnsWithValues = new Set([
+            ...(_writePayload?.staticValues ? Object.keys(_writePayload.staticValues) : []),
+            ...(_writePayload?.columns ?? [])
+          ]);
 
-            // Skip auto-managed columns
-            if (['id', 'created_at', 'updated_at', 'deleted_at', 'converted_at'].includes(col.column)) {
-              continue;
-            }
+          // Iterate over ALL columns in the table, not just missingColumns
+          if (_tableColumns) {
+            for (const [colName, colDef] of _tableColumns.entries()) {
+              // Skip auto-managed columns
+              if (['id', 'created_at', 'updated_at', 'deleted_at', 'converted_at'].includes(colName)) {
+                continue;
+              }
 
-            const colDef = _tableColumns?.get(col.column);
-            const colTraits = _writePayload?.table
-              ? (crmSchema as any).traits?.get(_writePayload.table)?.get(col.column)
-              : undefined;
+              // Skip columns that already have values
+              if (columnsWithValues.has(colName)) {
+                continue;
+              }
 
-            const field: FieldPrompt = {
-              column:       col.column,
-              type:         colDef?.type ?? 'TEXT',
-              required:     _writePayload?.mode === 'insert' 
-                ? !!(colDef && !colDef.nullable && colDef.defaultRaw === null)  // INSERT: required = NOT NULL
-                : false,  // UPDATE: no required fields (partial updates valid)
-              defaultValue: colDef?.defaultRaw ?? null,
-              enumValues:   colTraits?.enumValues ?? [],
-              fkTarget:     colTraits?.foreignKey
-                ? { table: colTraits.foreignKey.references, 
-                    column: colTraits.foreignKey.column }
-                : null,
-            };
+              const colTraits = _writePayload?.table
+                ? (crmSchema as any).traits?.get(_writePayload.table)?.get(colName)
+                : undefined;
 
-            if (field.required) {
-              requiredFields.push(field);
-            } else {
-              optionalFields.push(field);
+              const field: FieldPrompt = {
+                column:       colName,
+                type:         colDef.type ?? 'TEXT',
+                required:     _writePayload?.mode === 'insert' 
+                  ? !colDef.nullable && colDef.defaultRaw === null  // INSERT: required = NOT NULL and no default
+                  : false,  // UPDATE: no required fields (partial updates valid)
+                defaultValue: colDef.defaultRaw ?? null,
+                enumValues:   colTraits?.enumValues ?? [],
+                fkTarget:     colTraits?.foreignKey
+                  ? { table: colTraits.foreignKey.references, 
+                      column: colTraits.foreignKey.column }
+                  : null,
+              };
+
+              if (field.required) {
+                requiredFields.push(field);
+              } else {
+                optionalFields.push(field);
+              }
             }
           }
 
@@ -1462,6 +1633,158 @@ async function main() {
           }
           console.log('Please refine your description.\n');
           continue;
+        }
+      }
+
+      // Prompt for optional nullable columns after plan compilation
+      // Only in interactive mode (no --yes flag)
+      const isInteractive = !process.argv.includes('--yes') && !process.argv.includes('-y');
+      if (isInteractive && plan.compilationErrors.length === 0) {
+        // Check if there are write nodes in the pipeline
+        const writeSteps = plan.intent.steps.filter(s => s.kind === 'write');
+        
+        if (writeSteps.length > 0) {
+          // Process each write node
+          for (const writeStep of writeSteps) {
+            const writeNode = plan.graph.nodes.get(writeStep.id);
+            if (!writeNode || writeNode.kind !== 'write') continue;
+            
+            const writePayload = writeNode.payload as WritePayload;
+            if (!writePayload.table) continue;
+            
+            // Get the correct schema based on datasource
+            const dsConfig = dataSourceRegistry.get(writePayload.datasource ?? 'default');
+            const schemaToUse = dsConfig?.schema || crmSchema;
+            const tableColumns = (schemaToUse as any).parsed?.tables.get(writePayload.table)?.columns;
+            
+            if (!tableColumns) continue;
+            
+            // Columns to exclude from prompt
+            const excludeColumns = new Set([
+              // Session-scoped columns
+              'workspace_id', 'owner_user_id', 'created_by_user_id', 'updated_by_user_id',
+              // Auto-generated columns
+              'id', 'code', 'created_at', 'updated_at', 'deleted_at'
+            ]);
+            
+            // Columns already specified in the write payload
+            const specifiedColumns = new Set([
+              ...(writePayload.staticValues ? Object.keys(writePayload.staticValues) : []),
+              ...(writePayload.columns || [])
+            ]);
+            
+            // Build optional fields list
+            const optionalFields: FieldPrompt[] = [];
+            for (const [colName, colDef] of tableColumns.entries()) {
+              // Skip excluded columns
+              if (excludeColumns.has(colName)) continue;
+              
+              // Skip columns already specified
+              if (specifiedColumns.has(colName)) continue;
+              
+              // Only include nullable columns (optional)
+              if (!colDef.nullable) continue;
+              
+              // Skip columns with defaults (they're not really optional if they have a default)
+              if (colDef.defaultRaw !== null) continue;
+              
+              // Get column traits for enum values and FK info
+              const colTraits = (schemaToUse as any).traits?.get(writePayload.table)?.get(colName);
+              
+              const field: FieldPrompt = {
+                column: colName,
+                type: colDef.type ?? 'TEXT',
+                required: false,
+                defaultValue: colDef.defaultRaw ?? null,
+                enumValues: colTraits?.enumValues ?? [],
+                fkTarget: colTraits?.foreignKey
+                  ? { table: colTraits.foreignKey.references, 
+                      column: colTraits.foreignKey.column }
+                  : null,
+              };
+              
+              optionalFields.push(field);
+            }
+            
+            // Prompt for optional fields if any exist
+            if (optionalFields.length > 0) {
+              console.log(`\n📋 Optional fields for '${writePayload.table}' (step: ${writeStep.id}) (press Enter to skip):`);
+              
+              const collectedOptional = await collectFieldsFromUser([], optionalFields, null);
+              
+              // Inject collected values into staticValues
+              if (Object.keys(collectedOptional).length > 0) {
+                writePayload.staticValues = { ...writePayload.staticValues, ...collectedOptional };
+                console.log(`\n✅ Optional values added to write step '${writeStep.id}'.`);
+              }
+            }
+          }
+        }
+      }
+
+      // Handle schema validation warnings for optional field prompting
+      const schemaValidationWarnings = (plan as any).schemaValidationWarnings;
+      if (schemaValidationWarnings && schemaValidationWarnings.length > 0) {
+        // Find the first write node with optional column warnings
+        const optionalWarning = schemaValidationWarnings.find((w: any) => 
+          w.operation === 'write' && w.missingColumns && w.missingColumns.some((c: any) => !c.required)
+        );
+        
+        if (optionalWarning) {
+          const writeNode = plan.graph.nodes.get(optionalWarning.nodeId);
+          const writePayload = writeNode?.kind === 'write' ? writeNode.payload as WritePayload : null;
+          const tableColumns = writePayload?.table ? (crmSchema as any).parsed?.tables.get(writePayload.table)?.columns : undefined;
+          
+          if (writePayload && tableColumns) {
+            console.log('\n⚠️  Optional fields available:');
+
+            // Get cross-datasource FK columns to exclude from prompt
+            const crossDsFKColumns = new Set(
+              dataSourceRegistry.getCrossDatasourceFKsForTable(writePayload.table)
+                .map(fk => fk.fromColumn)
+            );
+
+            // Build optional fields list from warning
+            const optionalFields: FieldPrompt[] = [];
+            for (const missing of optionalWarning.missingColumns as { name: string; required: boolean }[]) {
+              if (!missing.required) {
+                // Exclude cross-datasource FK columns from prompt
+                if (crossDsFKColumns.has(missing.name)) {
+                  continue;
+                }
+
+                const colDef = (tableColumns as Map<string, any>).get(missing.name);
+                if (!colDef) continue;
+
+                const colTraits = writePayload?.table
+                  ? (crmSchema as any).traits.get(writePayload.table)?.get(missing.name)
+                  : undefined;
+
+                const field: FieldPrompt = {
+                  column: missing.name,
+                  type: colDef.type ?? 'TEXT',
+                  required: false,
+                  defaultValue: colDef.defaultRaw ?? null,
+                  enumValues: colTraits?.enumValues ?? [],
+                  fkTarget: colTraits?.foreignKey
+                    ? { table: colTraits.foreignKey.references,
+                        column: colTraits.foreignKey.column }
+                    : null,
+                };
+                optionalFields.push(field);
+              }
+            }
+            
+            if (optionalFields.length > 0) {
+              const collectedOptional = await collectFieldsFromUser([], optionalFields, null);
+              
+              // Add collected optional values to staticValues
+              if (Object.keys(collectedOptional).length > 0) {
+                writePayload.staticValues = { ...writePayload.staticValues, ...collectedOptional };
+                console.log('\n✅ Optional values added to plan.');
+              }
+            }
+          }
         }
       }
 

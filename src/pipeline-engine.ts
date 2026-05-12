@@ -12,6 +12,8 @@ import {
   ExecutionResult,
   Value,
 } from './index.js';
+
+const DEBUG = process.env.PEE_DEBUG === 'true';
 import type { SessionCursorStore } from './session/SessionCursor.js';
 import { CalciteClient } from './compiler/calcite/index.js';
 import { PostgresBackend, SQLiteTempStore } from './storage/index.js';
@@ -51,6 +53,7 @@ import {
 } from './schema/ColumnClassifier.js';
 import { crmSchema } from './schema/crm-schema.js';
 import type { MultiSourceSchema } from './schema/MultiSourceSchemaBuilder.js';
+import type { BuiltSchema } from './schema/SchemaBuilder.js';
 import { dataSourceRegistry } from './storage/DataSourceRegistry.js';
 import { 
   detectCrossDBJoins, 
@@ -127,7 +130,7 @@ export class PipelineEngine {
   private storageBackend: StorageBackend;
   private tempStore: TempStore;
   public calciteClient: CalciteClient;
-  private schemaValidator: SchemaValidator;
+  public schemaValidator: SchemaValidator;
   private permissionChecker: PermissionChecker;
 
   constructor(private config: PipelineEngineConfig) {
@@ -797,7 +800,6 @@ export class PipelineEngine {
     }
 
     // Pre-flight schema validation
-    console.log('Performing pre-flight schema validation...');
     const schemaValidation = await this.schemaValidator.validatePipeline(plan.graph);
     
     if (!schemaValidation.isValid) {
@@ -809,7 +811,13 @@ export class PipelineEngine {
       throw validationError;
     }
     
-    console.log('Schema validation passed successfully');
+    // Attach schema validation warnings to plan for CLI to handle optional field prompting
+    if (schemaValidation.warnings.length > 0) {
+      (plan as any).schemaValidationWarnings = schemaValidation.warnings;
+      console.log(`Schema validation passed with ${schemaValidation.warnings.length} warning(s)`);
+    } else {
+      console.log('Schema validation passed successfully');
+    }
 
     // Merge budget with correct precedence: defaults < plan.intent.budget < config.budget (user always wins)
     // Get centralized configuration for defaults
@@ -1356,15 +1364,18 @@ export class PipelineEngine {
             : 'default';
           
           writeConfig.datasource = datasource;
-          
+
           if (datasource !== 'default') {
             console.log(
               `[DataSourceRouter] Write node "${step.id}": ` +
               `table="${table}" → datasource="${datasource}"`
             );
           }
-          
+
           node.payload = writeConfig;
+
+          // Log final payload after datasource is correctly set
+          console.log('[WriteEnrichment] Final payload:', JSON.stringify(node.payload, null, 2));
           
           // WriteNodes pass through the fields they received from upstream.
           // This allows downstream nodes (e.g. another WriteNode) to see 
@@ -1517,16 +1528,24 @@ export class PipelineEngine {
           payload.table, col, upstreamTables, foreignKeys, simulatedRow
         )
         if (sourceField !== col && sourceField in simulatedRow) {
-          // FK remapping found â auto-fix silently
+          // FK remapping found — auto-fix silently
           remapped.push({
             writeCol: col,
             sourceField,
-            via: `${payload.table}.${col} â FK â ${sourceField}` 
+            via: `${payload.table}.${col} → FK → ${sourceField}`
           })
           // Inject columnAliases into payload so WriteNode uses it at runtime
           if (!payload.columnAliases) payload.columnAliases = {}
           payload.columnAliases[col] = sourceField
           continue
+        }
+
+        // Case 3.5: check if resolvable via columnAliases (CrossDatasourceFKRegistry)
+        const aliasedField = payload.columnAliases?.[col];
+        const isAliasResolvable = aliasedField && upstreamFields.includes(aliasedField);
+        if (isAliasResolvable) {
+          // Column will be resolved at execution time via FK alias
+          continue;
         }
 
         // Case 4: unresolvable
@@ -1888,10 +1907,20 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
     console.log('[WriteEnrichment] Raw step.config.fields:', step.config?.fields);
     console.log('[WriteEnrichment] originalFields type:', Array.isArray(originalFields) ? 'array' : 'object');
 
-    // Get the correct schema based on datasource
-    const datasource = step.config?.datasource as string || 'default';
-    const dsConfig = dataSourceRegistry.get(datasource);
-    const schemaToUse = dsConfig?.schema || crmSchema;
+    // Get the correct schema based on table name (datasource not yet set at enrichment time)
+    const targetTableForSchema = step.config?.table as string;
+    let schemaToUse: BuiltSchema = crmSchema;
+    let resolvedDatasource = 'default';
+
+    if (targetTableForSchema) {
+      for (const ds of dataSourceRegistry.all()) {
+        if (ds.schema && (ds.schema as any).parsed?.tables?.has(targetTableForSchema)) {
+          schemaToUse = ds.schema;
+          resolvedDatasource = ds.name;
+          break;
+        }
+      }
+    }
     
     // ColumnClassifier integration: auto-inject session-scoped values
     const targetTable = step.config?.table as string;
@@ -1935,17 +1964,20 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
       };
       
       const classifications = classifyAllColumns(
-        targetTable, 
-        schemaToUse as any, 
-        sessionCtx, 
+        targetTable,
+        schemaToUse as any,
+        sessionCtx,
         mode
       );
-      
-      autoValues = getAutoResolvedValues(classifications);
+
+      // Note: getAutoResolvedValues removed to avoid duplication with SessionColumnInjection
+      // SessionColumnInjection (below) handles workspace_id, owner_user_id, created_by_user_id, updated_by_user_id
+      // for all datasources in a datasource-agnostic manner
       exclusions = buildIntentExclusionList(classifications);
-      
-      console.log(`[ColumnClassifier] Auto-injected for ${targetTable} (${mode}):`, autoValues);
-      console.log('[ColumnClassifier] Excluded from LLM:', exclusions);
+
+      if (DEBUG) {
+        console.log(`[ColumnClassifier] Excluded from LLM for ${targetTable} (${mode}):`, exclusions);
+      }
     }
     
     // Datasource-agnostic session column injection (always runs, outside schema check)
@@ -1959,9 +1991,12 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
     
     if (targetTable) {
       // Inject session columns regardless of datasource
+      console.log(`[SessionColumnInjection] Checking table ${targetTable} in schema, datasource=${resolvedDatasource}`);
+      const tableDef = (schemaToUse as any).parsed.tables.get(targetTable);
+      console.log(`[SessionColumnInjection] Table def found: ${!!tableDef}, columns: ${tableDef ? Array.from(tableDef.columns.keys()).join(', ') : 'N/A'}`);
+      
       for (const [col, sessionKey] of Object.entries(SESSION_COLUMNS)) {
         // Check if the table has this column
-        const tableDef = (schemaToUse as any).parsed.tables.get(targetTable);
         if (tableDef && tableDef.columns.has(col)) {
           const sessionValue = sessionKey === 'workspaceId' ? workspaceId ?? 1 : 1; // Default userId to 1 if not resolved
           autoValues[col] = sessionValue;
@@ -1970,8 +2005,10 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
           }
           console.log(
             `[SessionColumnInjection] Injected ${col} = ${sessionValue} ` +
-            `(from ${sessionKey}) for ${targetTable} (${datasource})`
+            `(from ${sessionKey}) for ${targetTable} (${resolvedDatasource})`
           );
+        } else {
+          if (DEBUG) console.log(`[SessionColumnInjection] Column ${col} not found in table ${targetTable}`);
         }
       }
     }
@@ -2001,6 +2038,8 @@ Description: "update the email"
 
 Available tables: ${Array.from((this.config.schema as any)?.tables?.keys() ?? []).join(', ')}
 Available input fields: ${availableFields.join(', ')}
+Target table: ${targetTable}
+Target table columns: ${Array.from((schemaToUse as any).parsed.tables.get(targetTable)?.columns?.keys() ?? []).join(', ')}
 
 Return JSON:
 {
@@ -2021,6 +2060,9 @@ IMPORTANT:
 - NEVER include 'id' in columns if the table has a SERIAL or auto-increment primary key
 - Postgres assigns auto-increment IDs automatically - omit them from INSERT
 - Only include 'id' if the user explicitly provides a specific ID value
+- CRITICAL: Use the ACTUAL column names from the target table schema
+- Do NOT invent or guess column names - use exact names from the schema
+- If mapping upstream fields to target columns, use the target table's column names
 - For email_log, use order_id (from orders table), not a computed max+1
 - FIELD MAPPING: When inserting into email_log from an orders query:
   * Map 'id' from orders query to 'order_id' column
@@ -2130,7 +2172,7 @@ Return ONLY raw JSON.`;
         // Handle array case - just use the field names directly as columns
         console.log('[WriteEnrichment] Processing originalFields as array');
         for (const fieldName of originalFields) {
-          console.log(`[WriteEnrichment] Processing array field: '${fieldName}'`);
+          if (DEBUG) console.log(`[WriteEnrichment] Processing array field: '${fieldName}'`);
           if (!mergedColumns.includes(fieldName)) {
             mergedColumns.push(fieldName);
           }
@@ -2188,7 +2230,7 @@ Return ONLY raw JSON.`;
       // Add any additional columns from LLM config
       console.log('[WriteEnrichment] Adding LLM config columns to merged columns');
       for (const column of config.columns || []) {
-        console.log(`[WriteEnrichment] Processing LLM column: '${column}'`);
+        if (DEBUG) console.log(`[WriteEnrichment] Processing LLM column: '${column}'`);
         if (!mergedColumns.includes(column)) {
           mergedColumns.push(column);
           console.log(`[WriteEnrichment] Added column '${column}' to merged columns`);
@@ -2202,7 +2244,7 @@ Return ONLY raw JSON.`;
       // even if not in originalFields or LLM output
       for (const [col, val] of Object.entries(autoValues)) {
         mergedStaticValues[col] = val;
-        console.log(`[WriteEnrichment] Re-applied auto-injected value: ${col} = ${val}`);
+        if (DEBUG) console.log(`[WriteEnrichment] Re-applied auto-injected value: ${col} = ${val}`);
       }
       
       // Apply type conversion to auto-injected values based on DDLParser type info
@@ -2272,74 +2314,50 @@ Return ONLY raw JSON.`;
       if (isLogTable && mode === 'insert') {
         mode = 'insert_ignore';
       }
-      
+
       // Find upstream tables transitively (not just direct dependsOn)
       const extractedUpstreamTables = this.getUpstreamTablesTransitive(step.id, intent, graph)
 
-      // Build columnAliases from FK relationships
-      // This maps write column names to upstream row field names
+      // Build columnAliases using CrossDatasourceFKRegistry (O(1) per column)
       const columnAliases: Record<string, string> = {};
       
-      // Get datasource for target table
-      const targetDatasource = multiSchema
-        ? (multiSchema.tableRouting.get(tableName) as string | undefined ?? 'default')
-        : 'default';
-      
       for (const col of mergedColumns) {
-        // Find FK for this column in the target table
-        const fkEdges = (schemaToUse as any).parsed.fkGraph
-          .getOutbound(tableName);
+        // Skip columns already resolved via staticValues
+        if (mergedStaticValues[col] !== undefined) continue;
 
-        if (fkEdges) {
-          const fk = fkEdges.find((e: any) => e.fromColumn === col);
-          
-          if (fk && extractedUpstreamTables.includes(fk.toTable)) {
-            // Check if this is a cross-datasource FK
-            const referencedDatasource = multiSchema
-              ? (multiSchema.tableRouting.get(fk.toTable) as string | undefined ?? 'default')
-              : 'default';
-            
-            const isCrossDatasourceFK = targetDatasource !== referencedDatasource;
-            
-            if (isCrossDatasourceFK) {
-              // Only inject aliases for cross-datasource FKs
-              // Same-datasource FKs are handled by the existing join path
-              columnAliases[col] = fk.toColumn;  // e.g. crm_account_id → id
-              console.log(
-                `[WriteEnrichment] Cross-datasource FK alias: ${col} ← ${fk.toTable}.${fk.toColumn} ` +
-                `(target DS: ${targetDatasource}, ref DS: ${referencedDatasource})`
-              );
-              
-              // Ensure the upstream QueryNode selects the referenced column
-              // Find the upstream QueryNode that fetches from the referenced table
-              for (const [nodeId, node] of graph.nodes) {
-                if (node.kind === 'query') {
-                  const qp = node.payload as any;
-                  const qpTable = qp.intent?.table;
-                  if (qpTable === fk.toTable) {
-                    // Check if the referenced column is already selected
-                    const hasReferencedColumn = qp.intent?.columns?.some(
-                      (c: any) => (c.alias || c.field) === fk.toColumn
-                    );
-                    
-                    if (!hasReferencedColumn) {
-                      // Add the referenced column to the upstream query
-                      qp.intent.columns = qp.intent.columns || [];
-                      qp.intent.columns.push({
-                        field: fk.toColumn,
-                        alias: fk.toColumn
-                      });
-                      console.log(
-                        `[WriteEnrichment] Auto-added referenced column ${fk.toColumn} ` +
-                        `to upstream QueryNode ${nodeId} for cross-datasource FK resolution`
-                      );
-                    }
-                    break; // Use the first matching upstream node
-                  }
-                }
-              }
-            }
+        const fkDef = dataSourceRegistry.resolveCrossDatasourceFK(tableName, col);
+        if (!fkDef) continue;
+
+        // Find the upstream QueryNode that fetches from fkDef.toTable
+        for (const [nodeId, node] of graph.nodes) {
+          if (node.kind !== 'query') continue;
+          const qp = node.payload as any;
+          const tablesInQuery = [
+            qp.intent?.table,
+            ...(qp.intent?.joins?.map((j: any) => j.table) || [])
+          ];
+
+          if (!tablesInQuery.includes(fkDef.toTable)) continue;
+
+          // Find the upstream field aliased from fkDef.toColumn in fkDef.toTable
+          const columnDef = qp.intent?.columns?.find((c: any) =>
+            c.field === fkDef.toColumn &&
+            (c.table === fkDef.toTable || !c.table)
+          );
+
+          if (columnDef) {
+            columnAliases[col] = columnDef.alias || columnDef.field;
+            console.log(
+              `[WriteEnrichment] CrossDS FK alias: ${col} ← ${columnAliases[col]} (${fkDef.toDatasource}.${fkDef.toTable}.${fkDef.toColumn})`
+            );
+          } else {
+            // Auto-add the referenced column to the upstream QueryNode
+            qp.intent.columns = qp.intent.columns || [];
+            qp.intent.columns.push({ field: fkDef.toColumn, table: fkDef.toTable, alias: fkDef.toColumn });
+            columnAliases[col] = fkDef.toColumn;
+            console.log(`[WriteEnrichment] CrossDS FK alias (auto-added): ${col} ← ${fkDef.toColumn}`);
           }
+          break;
         }
       }
 
@@ -2462,8 +2480,9 @@ Return ONLY raw JSON.`;
         columnAliases: Object.keys(columnAliases).length > 0 ? columnAliases : undefined,
         datasource: 'default'
       };
-      
-      console.log('[WriteEnrichment] Final payload:', JSON.stringify(finalPayload, null, 2));
+
+      // Note: Final payload log moved to after DataSourceRouter sets correct datasource
+      // (see enrichNodes loop below where writeConfig.datasource is set)
 
       // Auto-refresh updated_at on every UPDATE
       if (finalPayload.mode === 'update') {

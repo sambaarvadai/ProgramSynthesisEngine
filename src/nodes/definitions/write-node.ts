@@ -16,6 +16,8 @@
  *   batchSize?: number         — rows per INSERT batch (default 100)
  */
 
+const DEBUG = process.env.PEE_DEBUG === 'true';
+
 import type { NodeDefinition } from '../../core/registry/node-registry.js'
 import type { WritePayload } from '../payloads.js'
 import type { DataValue } from '../../core/types/data-value.js'
@@ -113,12 +115,13 @@ export function createWriteNodeDefinition(
             // valueRef format: "$nodeId.fieldName"
             const ref = value as string;
             const [nodeRef, fieldName] = ref.replace('$', '').split('.');
+            const targetField = fieldName || 'id';
             
             // Get upstream rows from execution context
             const upstreamRows = (_ctx as any).nodeOutputs?.get(nodeRef);
             if (upstreamRows && Array.isArray(upstreamRows)) {
               const values = upstreamRows
-                .map((r: any) => r[fieldName])
+                .map((r: any) => r[targetField])
                 .filter((v: any) => v != null);
               
               // Validate lookup results for cross-datasource FK resolution
@@ -202,7 +205,7 @@ export function createWriteNodeDefinition(
       }
 
       // Normalise input to a flat row array
-      const inputRows = extractRows(input)
+      let inputRows = extractRows(input)
       console.log(`[WriteNode] Extracted ${inputRows.length} rows from input`);
 
       // FK validation for INSERT and UPDATE modes
@@ -298,8 +301,15 @@ export function createWriteNodeDefinition(
       }
 
       if (!inputRows.length) {
-        console.log(`[WriteNode] No input rows, returning early`);
-        return input
+        // For INSERT mode with static values, proceed even without input rows
+        // Some columns may be resolved from staticValues instead of upstream
+        if (payload.mode === 'insert' || payload.mode === 'insert_ignore' || payload.mode === 'upsert') {
+          console.log(`[WriteNode] No input rows, but proceeding with INSERT using static values`);
+          inputRows = [{}]; // Create a dummy row for processing
+        } else {
+          console.log(`[WriteNode] No input rows, returning early`);
+          return input
+        }
       }
 
       // Debug: Log what we're working with
@@ -870,6 +880,16 @@ function prepareRows(
   
   // Calculate effectiveColumns using the same resolution logic as row building
   const effectiveColumns = payload.columns.filter(col => {
+    // Check columnAliases for FK-based resolution before dropping
+    if (payload.columnAliases?.[col]) {
+      const sourceField = payload.columnAliases[col]
+      const value = firstRow[sourceField]
+      if (value !== undefined && value !== null) {
+        console.log(`[WriteNode] Resolved column '${col}' via FK alias: ${col} ← ${sourceField}`)
+        return true
+      }
+    }
+    
     const value = getColumnValue(col, firstRow, payload.staticValues, payload.columnAliases, true)
     if (value !== undefined) return true
 
