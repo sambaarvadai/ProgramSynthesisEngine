@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "dev": "tsx watch src/index.ts",
+    "dev": "concurrently \"npm run api:dev\" \"npm run ui:dev\"",
     "start": "node dist/index.js",
     "cli": "tsx src/cli.ts",
     "auth:seed": "npx tsx src/auth/seed-dev-grants.ts",
@@ -23,13 +23,51 @@
     "services:up": "docker compose up -d",
     "services:down": "docker compose down",
     "mock:api": "npx tsx test/fixtures/mock-api/customer-enrichment-server.ts",
-    "test:http": "npx tsx test/fixtures/mock-api/http-node-integration-test.ts"
+    "test:http": "npx tsx test/fixtures/mock-api/http-node-integration-test.ts",
+    "api": "tsx src/api/server.ts",
+    "api:dev": "tsx watch src/api/server.ts",
+    "ui:dev": "cd ui && npm run dev",
+    "test": "jest",
+    "test:api": "jest --testPathPattern=test/api",
+    "test:watch": "jest --watch"
+  },
+  "jest": {
+    "preset": "ts-jest/presets/default-esm",
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    },
+    "transform": {
+      "^.+\\.tsx?$": [
+        "ts-jest",
+        {
+          "useESM": true,
+          "tsconfig": {
+            "module": "esnext",
+            "target": "es2020"
+          }
+        }
+      ]
+    },
+    "moduleFileExtensions": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "json",
+      "node"
+    ]
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.0",
+    "@types/jsonwebtoken": "^9.0.10",
     "better-sqlite3": "^12.8.0",
+    "cors": "^2.8.5",
     "dotenv": "^17.4.1",
     "duckdb": "^1.4.4",
+    "express": "^4.18.2",
+    "express-async-errors": "^3.1.1",
+    "jsonwebtoken": "^9.0.3",
     "node-sql-parser": "^5.4.0",
     "pg": "^8.20.0",
     "uuid": "^9.0.0",
@@ -37,9 +75,18 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.17",
     "@types/dotenv": "^6.1.1",
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
     "@types/pg": "^8.20.0",
+    "@types/supertest": "^6.0.0",
     "@types/uuid": "^9.0.0",
+    "concurrently": "^9.2.1",
+    "jest": "^29.5.0",
+    "supertest": "^6.3.0",
+    "ts-jest": "^29.1.0",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   }

@@ -2011,6 +2011,80 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
           if (DEBUG) console.log(`[SessionColumnInjection] Column ${col} not found in table ${targetTable}`);
         }
       }
+      
+      // Auto-inject timestamp columns based on operation mode
+      const operation = step.config?.operation as string | undefined;
+      const mode = operation?.toLowerCase() === 'update' ? 'update' : 'insert';
+      const AUDIT_TABLES = new Set([
+        'assignments_history', 'audit_logs',
+        'opportunity_stage_history', 'lead_score_events'
+      ]);
+      const isAuditTable = AUDIT_TABLES.has(targetTable);
+      
+      if (mode === 'insert') {
+        // For INSERT: inject created/updated timestamps
+        // For audit tables, use changed_at instead of created_at (created_at is server-generated)
+        if (isAuditTable) {
+          // Use changed_at pattern for audit tables
+          const CHANGED_PATTERN = /^(changed)([_]?)(at|on)?$/i;
+          for (const col of tableDef?.columns.keys() ?? []) {
+            if (CHANGED_PATTERN.test(col)) {
+              autoValues[col] = 'NOW()';
+              if (!exclusions.includes(col)) {
+                exclusions.push(col);
+              }
+              console.log(
+                `[SessionColumnInjection] Injected ${col} = NOW() for audit table: ${targetTable}`
+              );
+            }
+          }
+        } else {
+          // For regular tables, inject created_at and updated_at
+          const TIMESTAMP_PATTERN = /^(created|updated)([_]?)(at|on)?$/i;
+          for (const col of tableDef?.columns.keys() ?? []) {
+            if (TIMESTAMP_PATTERN.test(col)) {
+              autoValues[col] = 'NOW()';
+              if (!exclusions.includes(col)) {
+                exclusions.push(col);
+              }
+              console.log(
+                `[SessionColumnInjection] Injected ${col} = NOW() for ${targetTable} (${resolvedDatasource})`
+              );
+            }
+          }
+        }
+      } else if (mode === 'update') {
+        // For UPDATE: inject updated_at
+        const UPDATED_PATTERN = /^(updated)([_]?)(at|on)?$/i;
+        for (const col of tableDef?.columns.keys() ?? []) {
+          if (UPDATED_PATTERN.test(col)) {
+            autoValues[col] = 'NOW()';
+            if (!exclusions.includes(col)) {
+              exclusions.push(col);
+            }
+            console.log(
+              `[SessionColumnInjection] Injected ${col} = NOW() for UPDATE on ${targetTable} (${resolvedDatasource})`
+            );
+          }
+        }
+      }
+      
+      // Auto-derive action for audit_logs
+      if (targetTable === 'audit_logs') {
+        const modeToAction: Record<string, string> = {
+          'insert':        'create',
+          'update':        'update',
+          'delete':        'delete',
+          'upsert':        'update',
+          'insert_ignore': 'create'
+        };
+        const writeMode = operation?.toLowerCase() ?? 'insert';
+        autoValues['action'] = modeToAction[writeMode] ?? 'system';
+        if (!exclusions.includes('action')) {
+          exclusions.push('action');
+        }
+        console.log(`[SessionColumnInjection] Auto-derived action=${autoValues['action']} for audit_logs`);
+      }
     }
     
     const prompt = `Extract database write configuration from this step description:
@@ -2191,21 +2265,10 @@ Return ONLY raw JSON.`;
               const sourceStep = templateMatch[1]; // e.g., "get_globex_latest_order"
               const templateField = templateMatch[2]; // e.g., "id"
               
-              // Field mapping logic: map common field names to target column names
-              let mappedField = templateField;
-              
-              // Map id -> order_id when the target table is email_log and field comes from orders-like query
-              if (tableName === 'email_log' && templateField === 'id') {
-                mappedField = 'order_id';
-              }
-              
-              // Map id -> customer_id when the target table needs customer_id and field comes from customers-like query  
-              if (fieldName === 'customer_id' && templateField === 'id') {
-                mappedField = 'customer_id';
-              }
-              
-              if (!mergedColumns.includes(mappedField)) {
-                mergedColumns.push(mappedField);
+              // Use the target field name (fieldName) - this is the actual column being written to
+              // The column alias mapping will handle resolving the upstream field
+              if (!mergedColumns.includes(fieldName)) {
+                mergedColumns.push(fieldName);
               }
             } else {
               // If it's a complex template, add the whole field as a column
@@ -2250,54 +2313,6 @@ Return ONLY raw JSON.`;
       // Apply type conversion to auto-injected values based on DDLParser type info
       // (needed for pm schema where columns are TEXT but we insert numbers)
       convertIfNeeded(mergedStaticValues);
-
-      // AUDIT_TABLES: auto-inject timestamp = NOW() for audit/history tables
-      const AUDIT_TABLES = new Set([
-        'assignments_history', 'audit_logs',
-        'opportunity_stage_history', 'lead_score_events'
-      ]);
-
-      if (AUDIT_TABLES.has(tableName)) {
-        // Find the correct timestamp column for this audit table
-        const tableColumns = (schemaToUse as any).parsed.tables
-          .get(tableName)?.columns;
-        
-        // Use changed_at if it exists, else fall back to null
-        // (created_at is server_generated, don't inject it)
-        const timestampCol = tableColumns?.has('changed_at') 
-          ? 'changed_at' 
-          : null;
-        
-        if (timestampCol) {
-          if (!mergedStaticValues[timestampCol]) {
-            mergedStaticValues[timestampCol] = 'NOW()';
-            console.log(`[WriteEnrichment] Auto-injected ${timestampCol} = NOW() for audit table: ${tableName}`);
-          }
-          
-          // Remove timestamp column from dynamic columns (it's not coming from upstream, it's always NOW())
-          const timestampIndex = mergedColumns.indexOf(timestampCol);
-          if (timestampIndex !== -1) {
-            mergedColumns.splice(timestampIndex, 1);
-            console.log(`[WriteEnrichment] Removed ${timestampCol} from dynamic columns for audit table: ${tableName}`);
-          }
-        }
-
-        // Auto-derive action from write mode for audit_logs
-        if (targetTable === 'audit_logs' && !mergedStaticValues['action']) {
-          const modeToAction: Record<string, string> = {
-            'insert':        'create',
-            'update':        'update',
-            'delete':        'delete',
-            'upsert':        'update',
-            'insert_ignore': 'create'
-          };
-          // Derive from the upstream write node's mode if available
-          // For now, default to 'update' since most audit logs are updates
-          const writeMode = config.mode ?? (step.config?.mode as string ?? 'insert');
-          mergedStaticValues['action'] = modeToAction[writeMode] ?? 'system';
-          console.log(`[WriteEnrichment] Auto-derived action=${mergedStaticValues['action']} for audit_logs`);
-        }
-      }
 
       // Special handling: if we're inserting into email_log and have 'id' in availableFields,
       // ensure 'order_id' is included in columns
@@ -2484,22 +2499,42 @@ Return ONLY raw JSON.`;
       // Note: Final payload log moved to after DataSourceRouter sets correct datasource
       // (see enrichNodes loop below where writeConfig.datasource is set)
 
-      // Auto-refresh updated_at on every UPDATE
-      if (finalPayload.mode === 'update') {
-        const hasUpdatedAt = (schemaToUse as any).parsed.tables
-          .get(tableName)?.columns.has('updated_at');
-        
-        if (hasUpdatedAt) {
-          finalPayload.staticValues = finalPayload.staticValues ?? {};
+      // Populate optionalFields - nullable columns without defaults that aren't already specified
+      const optionalFields: Array<{ column: string; type: string; nullable: boolean }> = [];
+      const specifiedColumns = new Set([
+        ...mergedColumns,
+        ...Object.keys(mergedStaticValues)
+      ]);
+      const autoManagedColumns = new Set(['id', 'created_at', 'updated_at', 'deleted_at']);
+      
+      const tableDefForOptional = (schemaToUse as any).parsed.tables.get(tableName);
+      
+      if (tableDefForOptional) {
+        for (const [colName, colDef] of tableDefForOptional.columns.entries()) {
+          // Skip auto-managed columns
+          if (autoManagedColumns.has(colName)) continue;
           
-          // Only set if not already explicitly provided
-          if (!finalPayload.staticValues['updated_at']) {
-            finalPayload.staticValues['updated_at'] = 'NOW()';
-            console.log(
-              `[WriteEnrichment] Auto-added updated_at = NOW() for UPDATE on ${tableName}` 
-            );
-          }
+          // Skip columns already specified in the intent
+          if (specifiedColumns.has(colName)) continue;
+          
+          // Skip columns that are NOT nullable (required columns)
+          if (!colDef.nullable) continue;
+          
+          // Skip columns with default values
+          if (colDef.defaultRaw !== null) continue;
+          
+          // Add as optional field
+          optionalFields.push({
+            column: colName,
+            type: colDef.type ?? 'TEXT',
+            nullable: colDef.nullable
+          });
         }
+      }
+      
+      // Set optionalFields on the step config for API response
+      if (step.config) {
+        (step.config as any).optionalFields = optionalFields;
       }
 
       return finalPayload;

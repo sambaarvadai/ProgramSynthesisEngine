@@ -67,7 +67,19 @@ export class PipelineIntentGenerator {
       .replace(/```\n?/g, '')
       .trim();
 
-    const intent = JSON.parse(clean) as PipelineIntent;
+    let intent: PipelineIntent;
+    try {
+      intent = JSON.parse(clean) as PipelineIntent;
+    } catch (e) {
+      // LLM returned non-JSON (likely asking for clarification)
+      // Return the raw text as an error message in the intent description
+      console.error('[Pipeline Intent Generator] Failed to parse LLM response as JSON:', e);
+      intent = {
+        description: raw, // Use the LLM's clarification text as the description
+        steps: [],
+        params: {}
+      };
+    }
     this.fillDefaults(intent);
 
     // Sanitize LLM-generated budget values

@@ -1,31 +1,21 @@
 import readline from 'node:readline';
-import { PipelineEngine, type PipelineEngineConfig } from './pipeline-engine.js';
+import { PipelineEngine } from './pipeline-engine.js';
 import type { WritePayload } from './nodes/payloads.js';
-import { PostgresBackend } from './storage/index.js';
 import { isTabular, isRecord, isScalar, isCollection, isVoid, toTabular } from './core/types/data-value.js';
 import type { DataValue } from './core/types/data-value.js';
-import { SessionManager } from './session/session-manager.js';
-import { SessionCursorStore, extractCursor, buildWhereFromCursor } from './session/SessionCursor.js';
-// Import error analyzer for detailed LLM-based error analysis
+import { extractCursor, buildWhereFromCursor } from './session/SessionCursor.js';
 import { ErrorAnalyzer } from './core/llm/error-analyzer.js';
 import { grantStore } from './auth/grant-store.js';
 import { auditStore, AuditAction } from './auth/audit-store.js';
 import { apiRegistryStore } from './config/api-registry-store.js';
-import { getDatabaseConfig } from './config/database-config.js';
 import { coerceColumnValue } from './write/coerceColumnValue.js';
-import { connectPeeStore, getPeeStorePool } from './storage/PeeStoreBackend.js';
-import { initPeeStore } from './storage/initPeeStore.js';
+import { getPeeStorePool } from './storage/PeeStoreBackend.js';
 import { persistPipeline } from './storage/PipelinePersistence.js';
-import { VoyageClient } from './cache/VoyageClient.js';
-import { SemanticCache } from './cache/SemanticCache.js';
-import { SchemaStateManager } from './cache/SchemaStateManager.js';
-import { dataSourceRegistry } from './storage/DataSourceRegistry.js';
-import { buildMultiSourceSchema, type MultiSourceSchema, buildCombinedSchemaConfig, stripCreateTypes } from './schema/MultiSourceSchemaBuilder.js';
-import { buildSchemaFromSQL } from './schema/SchemaBuilder.js';
+import { crmSchema } from './schema/crm-schema.js';
 import * as dotenv from 'dotenv';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { readFileSync } from 'fs';
+import { bootstrap } from './bootstrap.js';
 dotenv.config();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -70,152 +60,16 @@ function isWriteIntentComplete(payload: WritePayload): boolean {
 }
 
 async function main() {
-  const dbConfig = getDatabaseConfig();
-  const backend = new PostgresBackend(dbConfig.crmPostgresUrl!);
-  await backend.connect();
-
-  // Build schema per datasource
-  const crmSchema = buildSchemaFromSQL(
-    readFileSync(join(__dirname, '../crm_postgres.sql'), 'utf-8'),
-    { sessionAnchorTables: ['workspaces'] }
-  );
-
-  // Register default CRM datasource with built schema
-  dataSourceRegistry.register({
-    name:        'default',
-    displayName: 'CRM',
-    kind:        'postgres',
-    pool:        (backend as any).pool,
-    backend:     backend,
-    schema:      crmSchema,
-    ddlPath:     join(__dirname, '../crm_postgres.sql'),
-    description: 'Customer relationship management — accounts, contacts, leads, opportunities, tickets, activities, pipelines'
-  });
-
-  // Register PM datasource (non-fatal if unavailable)
-  const pmUrl = process.env.PM_DATABASE_URL;
-  if (pmUrl) {
-    try {
-      const { Pool } = await import('pg');
-      const pmPool    = new Pool({ connectionString: pmUrl, max: 10 });
-      const pmBackend = new PostgresBackend(pmUrl);
-      await pmBackend.connect();
-      
-      // Build PM schema
-      const pmDDLRaw = readFileSync(join(__dirname, '../pee_pm_schema.sql'), 'utf-8');
-      const pmDDL = stripCreateTypes(pmDDLRaw);
-      const pmSchema = buildSchemaFromSQL(
-        pmDDL,
-        { sessionAnchorTables: ['workspaces'] }
-      );
-      
-      console.log('[PM Schema] Tables after preprocessing:', 
-        [...pmSchema.parsed.tables.keys()]);
-      
-      dataSourceRegistry.register({
-        name:        'pm',
-        displayName: 'Project Management',
-        kind:        'postgres',
-        pool:        pmPool,
-        backend:     pmBackend,
-        schema:      pmSchema,
-        ddlPath:     join(__dirname, '../pee_pm_schema.sql'),
-        description: 'Project execution and delivery — projects, milestones, tasks, time logs, team members, project comments'
-      });
-      
-      console.log('[DataSourceRegistry] PM database connected: pee_pm');
-    } catch (e) {
-      console.warn('[DataSourceRegistry] PM database unavailable — continuing without it:', e);
-    }
-  }
-
-  // Declare cross-datasource FK relationships
-  // These are FKs that reference tables in different datasources
-  dataSourceRegistry.declareCrossDatasourceFKs([
-    // projects → CRM
-    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'crm_account_id',
-      toDatasource: 'default', toTable: 'accounts', toColumn: 'id' },
-    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'crm_opportunity_id',
-      toDatasource: 'default', toTable: 'opportunities', toColumn: 'id' },
-    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'crm_contact_id',
-      toDatasource: 'default', toTable: 'contacts', toColumn: 'id' },
-    { fromDatasource: 'pm', fromTable: 'projects', fromColumn: 'owner_user_id',
-      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
-
-    // project_members → CRM
-    { fromDatasource: 'pm', fromTable: 'project_members', fromColumn: 'user_id',
-      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
-
-    // tasks → CRM
-    { fromDatasource: 'pm', fromTable: 'tasks', fromColumn: 'assigned_to_user_id',
-      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
-
-    // time_logs → CRM
-    { fromDatasource: 'pm', fromTable: 'time_logs', fromColumn: 'user_id',
-      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
-
-    // comments → CRM
-    { fromDatasource: 'pm', fromTable: 'comments', fromColumn: 'user_id',
-      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
-
-    // project_activity → CRM
-    { fromDatasource: 'pm', fromTable: 'project_activity', fromColumn: 'user_id',
-      toDatasource: 'default', toTable: 'users', toColumn: 'id' },
-  ]);
-
-  // Build combined schema for pre-selector
-  // Merges all registered schemas into one flat table map
-  const multiSchema  = buildMultiSourceSchema(dataSourceRegistry.all());
-  
-  console.log('[MultiSourceSchema] All routed tables:', 
-    [...multiSchema.tableRouting.keys()].join(', '));
-  console.log('[MultiSourceSchema] Table routing entries:', multiSchema.tableRouting.size);
-  const combinedSchema = buildCombinedSchemaConfig(multiSchema, dataSourceRegistry);
-
-  // Connect to pee_store for pipeline persistence
-  // Non-fatal — if unavailable, continue without persistence
-  let peeStoreAvailable = false;
-  try {
-    peeStoreAvailable = await connectPeeStore();
-    if (peeStoreAvailable) {
-      await initPeeStore();
-    }
-  } catch {
-    console.warn('[PeeStore] Persistence unavailable — continuing without it');
-  }
-
-  // Initialize semantic cache (non-fatal)
-  let semanticCache: SemanticCache | null = null;
-  if (peeStoreAvailable && process.env.VOYAGE_API_KEY) {
-    try {
-      const voyage = new VoyageClient(process.env.VOYAGE_API_KEY);
-
-      const cacheConfig = {
-        threshold: parseFloat(process.env.SEMANTIC_CACHE_THRESHOLD ?? '0.92'),
-        enabled: process.env.SEMANTIC_CACHE_ENABLED !== 'false',
-        workspaceId: 1,
-        sourceType: 'crm'
-      };
-
-      semanticCache = new SemanticCache(
-        voyage,
-        getPeeStorePool(),
-        cacheConfig
-      );
-
-      // Check for schema changes and invalidate if needed
-      const schemaManager = new SchemaStateManager(getPeeStorePool());
-      await schemaManager.checkAndHandleSchemaChange(semanticCache);
-
-      console.log(
-        `[SemanticCache] Ready — threshold: ${cacheConfig.threshold}, ` +
-        `model: voyage-3, source_type: ${cacheConfig.sourceType}`
-      );
-    } catch (e) {
-      console.warn('[SemanticCache] Init failed — cache disabled:', e);
-      semanticCache = null;
-    }
-  }
+  // Bootstrap all services
+  const {
+    pipelineEngine: engine,
+    sessionManager,
+    sessionCursorStore,
+    dataSourceRegistry,
+    semanticCache,
+    crmPool: backend,
+    peeStoreAvailable,
+  } = await bootstrap();
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -229,7 +83,7 @@ async function main() {
   let currentUser: { id: string; username: string; role: string; workspaceId?: number } | null = null;
 
   async function login() {
-    console.log('\n\uFE0F ProgramExecutionEngine CLI');
+    console.log('\uFE0F ProgramExecutionEngine CLI');
     console.log('Please log in to continue.\n');
     
     while (true) {
@@ -353,7 +207,7 @@ async function main() {
 
       const sql = `SELECT * FROM "${table}" WHERE ${conditions.join(' AND ')} LIMIT 1`;
 
-      const result = await backend.rawQuery(sql, values);
+      const result = await backend.query(sql, values);
       return result.rows[0] ?? null;
     } catch (e) {
       console.warn(`[PreFetch] Could not fetch current row: ${e}`);
@@ -493,28 +347,9 @@ async function main() {
     return collected;
   }
 
-  // Now create session manager with authenticated user
-  const sessionManager = new SessionManager(process.env.ANTHROPIC_API_KEY!, currentUser!.id);
-
-  // Create session cursor store for lightweight result pagination
-  const sessionCursorStore = new SessionCursorStore();
-
   // Initialize error analyzer for detailed LLM-based error analysis
   const errorAnalyzer = new ErrorAnalyzer({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY!
-  });
-
-  const engine = new PipelineEngine({
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
-    schema: combinedSchema,
-    storageBackend: backend,
-    sessionCursorStore,
-    multiSchema,
-    budget: {
-      maxLLMCalls: 20,
-      maxIterations: 100,
-      timeoutMs: 60000,
-    },
   });
 
   // API registry command parsing
@@ -779,7 +614,6 @@ async function main() {
   console.log('Type "exit" to quit.\n');
 
   console.log('\ud83d\udd52 Connected to Postgres:', process.env.DATABASE_URL?.replace(/:\/\/.*@/, '://***@'));
-  console.log('\ud83d\udcca Schema:', [...combinedSchema.tables.keys()].join(', '));
   console.log(`\ud83d\udd11 Session ID: ${sessionManager.getSessionId()}`);
   console.log('\ud83d\udce7 Email: Resend API', process.env.RESEND_API_KEY ? '??' : '?? (set RESEND_API_KEY)');
   console.log();
@@ -796,7 +630,7 @@ async function main() {
       });
     }
     
-    await backend.disconnect();
+    await backend.end();
     rl.close();
     process.exit(0);
   });
@@ -2096,7 +1930,7 @@ async function main() {
   }
   
   rl.close();
-  await backend.disconnect();
+  await backend.end();
   console.log('Bye!');
 }
 
