@@ -479,8 +479,8 @@ export class Scheduler {
           description
         );
 
-        // Note: Session cursor storage is now handled by cli.ts after execution
-        // to ensure proper primaryTable detection and table name resolution
+        // Store cursor for API requests (CLI handles this separately)
+        this.config.sessionCursorStore?.set(cursor);
       }
     }
 

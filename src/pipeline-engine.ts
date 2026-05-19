@@ -574,18 +574,24 @@ export class PipelineEngine {
       );
             const currentStaticValues = writePayload.staticValues || {};
             const missingRequired = getUserSuppliedRequired(classifications, currentStaticValues);
-            
-            // Always return WRITE_INCOMPLETE if there are missing columns
+
+            // Check if missing columns are in optionalFields - if so, don't raise error
+            const stepOptionalFields = (step.config as any)?.optionalFields || [];
+            const trulyMissing = missingRequired.filter(m =>
+              !stepOptionalFields.some((of: any) => of.column === m.column)
+            );
+
+            // Always return WRITE_INCOMPLETE if there are missing columns NOT in optionalFields
             // Let the CLI handle separating required vs optional in the form
-            if (missingRequired.length > 0) {
+            if (trulyMissing.length > 0) {
               const tableColumns = (crmSchema as any).parsed.tables.get(writePayload.table)?.columns;
-              const missingList = missingRequired.map(c => {
+              const missingList = trulyMissing.map(c => {
                 const colDef = tableColumns?.get(c.column);
                 const colType = colDef?.type ?? 'TEXT';
                 const isRequired = colDef && !colDef.nullable && colDef.defaultRaw === null;
                 return `${c.column} (${colType}, ${isRequired ? 'required' : 'optional'})`;
               }).join('\n  ');
-              
+
               return {
                 intent,
                 graph,
@@ -593,7 +599,7 @@ export class PipelineEngine {
                   code: 'WRITE_INCOMPLETE',
                   message: `The ${writePayload.mode} into ${writePayload.table} is missing values:\n  ${missingList}`,
                   stepId: step.id,
-                  missingColumns: missingRequired.map(c => {
+                  missingColumns: trulyMissing.map(c => {
                     const colDef = tableColumns?.get(c.column);
                     const isRequired = colDef && !colDef.nullable && colDef.defaultRaw === null;
                     return {
@@ -617,25 +623,38 @@ export class PipelineEngine {
             
             if (!missingColumnsResult.complete) {
               const missing = missingColumnsResult.missing!;
-              const missingList = missing.map(m => 
-                `${m.column}${m.nullable ? ' (optional)' : ' (required)'} - ${m.description}`
-              ).join('\n  ');
-              
-              return {
-                intent,
-                graph,
-                compilationErrors: [{
-                  code: 'WRITE_INCOMPLETE',
-                  message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
-                  stepId: step.id,
-                  missingColumns: missing.map(m => ({
-                    column: m.column,
-                    nullable: m.nullable,
-                    description: m.description
-                  }))
-                }],
-                intentRaw: description,
-              };
+              // Check if missing columns are in optionalFields - if so, don't raise error
+              const stepOptionalFields = (step.config as any)?.optionalFields || [];
+              const missingOptionalFields = missing.filter(m =>
+                stepOptionalFields.some((of: any) => of.column === m.column)
+              );
+
+              // Only raise error for columns NOT in optionalFields
+              const trulyMissing = missing.filter(m =>
+                !stepOptionalFields.some((of: any) => of.column === m.column)
+              );
+
+              if (trulyMissing.length > 0) {
+                const missingList = trulyMissing.map(m =>
+                  `${m.column}${m.nullable ? ' (optional)' : ' (required)'} - ${m.description}`
+                ).join('\n  ');
+
+                return {
+                  intent,
+                  graph,
+                  compilationErrors: [{
+                    code: 'WRITE_INCOMPLETE',
+                    message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
+                    stepId: step.id,
+                    missingColumns: trulyMissing.map(m => ({
+                      column: m.column,
+                      nullable: m.nullable,
+                      description: m.description
+                    }))
+                  }],
+                  intentRaw: description,
+                };
+              }
             }
           }
         }
@@ -752,29 +771,36 @@ export class PipelineEngine {
     const mustPrompt = missingRequired.filter(c => {
       const colDef = tableColumns?.get(c.column);
       if (!colDef) return false;
-      
+
       // Skip nullable columns
       if (colDef.nullable) return false;
-      
+
       // Skip columns with defaults from DDLParser
       if (colDef.defaultRaw !== null) return false;
-      
+
       return true;
     });
-    
+
+    // Check if missing columns are in optionalFields - if so, don't raise error
+    const step = existingPlan.intent.steps.find(s => s.id === stepId);
+    const optionalFields = (step?.config as any)?.optionalFields || [];
+    const trulyMissing = mustPrompt.filter(m =>
+      !optionalFields.some((of: any) => of.column === m.column)
+    );
+
     // If still incomplete, return plan with remaining WRITE_INCOMPLETE error
-    if (mustPrompt.length > 0) {
-      const missingList = mustPrompt.map(c => 
+    if (trulyMissing.length > 0) {
+      const missingList = trulyMissing.map(c =>
         `${c.column} (${c.column}, required) - ${c.column} column`
       ).join('\n  ');
-      
+
       return {
         ...existingPlan,
         compilationErrors: [{
           code: 'WRITE_INCOMPLETE',
           message: `The ${writePayload.mode} into ${writePayload.table} is missing required values:\n  ${missingList}`,
           stepId: stepId,
-          missingColumns: mustPrompt.map(c => ({
+          missingColumns: trulyMissing.map(c => ({
             column: c.column,
             nullable: false,
             description: 'Required field'
@@ -794,10 +820,8 @@ export class PipelineEngine {
     plan: PlanResult,
     params?: Record<string, Value>,
   ): Promise<RunResult> {
-    if (plan.compilationErrors.length > 0) {
-      const compilationError = new PipelineCompilationError(plan.compilationErrors);
-      throw compilationError;
-    }
+    // Allow execution with compilation errors - the form panel will prompt for missing values
+    // The actual write will fail at runtime if values are still missing
 
     // Pre-flight schema validation
     const schemaValidation = await this.schemaValidator.validatePipeline(plan.graph);
@@ -1904,7 +1928,9 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
     
     // Extract existing fields from the original step configuration
     const originalFields = step.config?.fields as Record<string, any> || {};
+    const originalStaticValues = step.config?.staticValues as Record<string, any> || {};
     console.log('[WriteEnrichment] Raw step.config.fields:', step.config?.fields);
+    console.log('[WriteEnrichment] Raw step.config.staticValues:', step.config?.staticValues);
     console.log('[WriteEnrichment] originalFields type:', Array.isArray(originalFields) ? 'array' : 'object');
 
     // Get the correct schema based on table name (datasource not yet set at enrichment time)
@@ -2087,6 +2113,18 @@ Return ONLY the ExprAST JSON object, no markdown, no explanation.`;
       }
     }
     
+    // Extract column aliases from originalFields BEFORE LLM call
+    // to preserve table.field patterns like "opportunity.account_id"
+    const extractedAliases: Record<string, string> = {};
+    for (const [fieldName, fieldValue] of Object.entries(originalFields)) {
+      const fieldValueStr = String(fieldValue);
+      const tableFieldMatch = fieldValueStr.match(/^([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)$/i);
+      if (tableFieldMatch) {
+        const upstreamField = tableFieldMatch[2]; // e.g., "account_id" from "opportunity.account_id"
+        extractedAliases[fieldName] = upstreamField;
+      }
+    }
+
     const prompt = `Extract database write configuration from this step description:
 "${step.description}"
 
@@ -2138,11 +2176,6 @@ IMPORTANT:
 - Do NOT invent or guess column names - use exact names from the schema
 - If mapping upstream fields to target columns, use the target table's column names
 - For email_log, use order_id (from orders table), not a computed max+1
-- FIELD MAPPING: When inserting into email_log from an orders query:
-  * Map 'id' from orders query to 'order_id' column
-  * Map 'customer_id' from orders query to 'customer_id' column
-  * Map 'email' from customers query to 'email' column
-- If availableFields contains 'id' and table is 'email_log', include 'order_id' in columns
 ${exclusions.length > 0 ? `Do not include these columns — auto-resolved: ${exclusions.join(', ')}` : ''}
 ${(() => {
   // Layer 2: Add enum hints for columns the LLM can set
@@ -2237,10 +2270,18 @@ Return ONLY raw JSON.`;
       const mergedColumns: string[] = [];
       // Original static values take precedence over LLM-generated ones
       const mergedStaticValues: Record<string, any> = { ...config.staticValues };
+      // Column aliases for mapping target columns to upstream fields
+      const columnAliases: Record<string, string> = {};
       console.log('[WriteEnrichment] Original fields:', JSON.stringify(originalFields, null, 2));
       console.log('[WriteEnrichment] LLM config columns:', config.columns);
       console.log('[WriteEnrichment] LLM config staticValues:', config.staticValues);
-      
+      console.log('[WriteEnrichment] Extracted aliases:', JSON.stringify(extractedAliases));
+
+      // Apply pre-extracted aliases from originalFields (set before LLM call)
+      for (const [targetCol, upstreamField] of Object.entries(extractedAliases)) {
+        columnAliases[targetCol] = upstreamField;
+      }
+
       // Process original fields
       if (Array.isArray(originalFields)) {
         // Handle array case - just use the field names directly as columns
@@ -2256,7 +2297,7 @@ Return ONLY raw JSON.`;
         console.log('[WriteEnrichment] Processing originalFields as object');
         for (const [fieldName, fieldValue] of Object.entries(originalFields)) {
           const fieldValueStr = String(fieldValue);
-          
+
           // Check if it's a template field (contains {{}})
           if (fieldValueStr.includes('{{') && fieldValueStr.includes('}}')) {
             // Extract the field name from template (e.g., "{{step.id}}" -> "id")
@@ -2264,7 +2305,7 @@ Return ONLY raw JSON.`;
             if (templateMatch) {
               const sourceStep = templateMatch[1]; // e.g., "get_globex_latest_order"
               const templateField = templateMatch[2]; // e.g., "id"
-              
+
               // Use the target field name (fieldName) - this is the actual column being written to
               // The column alias mapping will handle resolving the upstream field
               if (!mergedColumns.includes(fieldName)) {
@@ -2275,6 +2316,30 @@ Return ONLY raw JSON.`;
               if (!mergedColumns.includes(fieldName)) {
                 mergedColumns.push(fieldName);
               }
+            }
+          } else if (fieldValueStr.match(/^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$/i)) {
+            // Handle table.field pattern (e.g., "opportunity.id", "opportunity.account_id")
+            // This is a field reference from upstream, not a literal value
+            const tableFieldMatch = fieldValueStr.match(/^([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)$/i);
+            if (tableFieldMatch) {
+              const upstreamTable = tableFieldMatch[1]; // e.g., "opportunity"
+              const upstreamField = tableFieldMatch[2]; // e.g., "id"
+              console.log(`[WriteEnrichment] Detected table.field reference: ${fieldName} = ${fieldValueStr} (table=${upstreamTable}, field=${upstreamField})`);
+              
+              // Add the target field name to columns (not staticValues)
+              if (!mergedColumns.includes(fieldName)) {
+                mergedColumns.push(fieldName);
+              }
+              
+              // Store the mapping for column alias resolution
+              // This will be used later to map fieldName to upstreamField
+              if (!columnAliases[fieldName]) {
+                columnAliases[fieldName] = upstreamField;
+                console.log(`[WriteEnrichment] Added column alias: ${fieldName} ← ${upstreamField}`);
+              }
+            } else {
+              // Fallback: treat as literal
+              mergedStaticValues[fieldName] = fieldValue;
             }
           } else if (fieldValue === fieldName) {
             // Field name used as its own value - LLM hallucination
@@ -2334,45 +2399,133 @@ Return ONLY raw JSON.`;
       const extractedUpstreamTables = this.getUpstreamTablesTransitive(step.id, intent, graph)
 
       // Build columnAliases using CrossDatasourceFKRegistry (O(1) per column)
-      const columnAliases: Record<string, string> = {};
+      // columnAliases is already declared earlier
       
       for (const col of mergedColumns) {
         // Skip columns already resolved via staticValues
         if (mergedStaticValues[col] !== undefined) continue;
 
+        // Skip columns that already have an alias from table.field pattern
+        if (columnAliases[col] !== undefined) continue;
+
+        // First try cross-datasource FK resolution
         const fkDef = dataSourceRegistry.resolveCrossDatasourceFK(tableName, col);
-        if (!fkDef) continue;
+        if (fkDef) {
+          // Find the upstream QueryNode that fetches from fkDef.toTable
+          for (const [nodeId, node] of graph.nodes) {
+            if (node.kind !== 'query') continue;
+            const qp = node.payload as any;
+            const tablesInQuery = [
+              qp.intent?.table,
+              ...(qp.intent?.joins?.map((j: any) => j.table) || [])
+            ];
 
-        // Find the upstream QueryNode that fetches from fkDef.toTable
-        for (const [nodeId, node] of graph.nodes) {
-          if (node.kind !== 'query') continue;
-          const qp = node.payload as any;
-          const tablesInQuery = [
-            qp.intent?.table,
-            ...(qp.intent?.joins?.map((j: any) => j.table) || [])
-          ];
+            if (!tablesInQuery.includes(fkDef.toTable)) continue;
 
-          if (!tablesInQuery.includes(fkDef.toTable)) continue;
-
-          // Find the upstream field aliased from fkDef.toColumn in fkDef.toTable
-          const columnDef = qp.intent?.columns?.find((c: any) =>
-            c.field === fkDef.toColumn &&
-            (c.table === fkDef.toTable || !c.table)
-          );
-
-          if (columnDef) {
-            columnAliases[col] = columnDef.alias || columnDef.field;
-            console.log(
-              `[WriteEnrichment] CrossDS FK alias: ${col} ← ${columnAliases[col]} (${fkDef.toDatasource}.${fkDef.toTable}.${fkDef.toColumn})`
+            // Find the upstream field aliased from fkDef.toColumn in fkDef.toTable
+            const columnDef = qp.intent?.columns?.find((c: any) =>
+              c.field === fkDef.toColumn &&
+              (c.table === fkDef.toTable || !c.table)
             );
-          } else {
-            // Auto-add the referenced column to the upstream QueryNode
-            qp.intent.columns = qp.intent.columns || [];
-            qp.intent.columns.push({ field: fkDef.toColumn, table: fkDef.toTable, alias: fkDef.toColumn });
-            columnAliases[col] = fkDef.toColumn;
-            console.log(`[WriteEnrichment] CrossDS FK alias (auto-added): ${col} ← ${fkDef.toColumn}`);
+
+            if (columnDef) {
+              columnAliases[col] = columnDef.alias || columnDef.field;
+              console.log(
+                `[WriteEnrichment] CrossDS FK alias: ${col} ← ${columnAliases[col]} (${fkDef.toDatasource}.${fkDef.toTable}.${fkDef.toColumn})`
+              );
+            } else {
+              // Auto-add the referenced column to the upstream QueryNode
+              qp.intent.columns = qp.intent.columns || [];
+              qp.intent.columns.push({ field: fkDef.toColumn, table: fkDef.toTable, alias: fkDef.toColumn, _autoInjected: true });
+              columnAliases[col] = fkDef.toColumn;
+              console.log(`[WriteEnrichment] CrossDS FK alias (auto-added): ${col} ← ${fkDef.toColumn}`);
+            }
+            break;
           }
-          break;
+          continue;
+        }
+
+        // If no cross-datasource FK alias found, check same-datasource fkGraph
+        if (!columnAliases[col]) {
+          const dsName = resolvedDatasource ?? 'default'
+          const dsConfig = dataSourceRegistry.get(dsName)
+          const fkEdges = (dsConfig?.schema as any)?.parsed?.fkGraph?.getOutbound(tableName) ?? []
+
+          for (const edge of fkEdges) {
+            if (edge.fromColumn !== col) continue
+
+            // Find upstream node that covers edge.toTable
+            for (const [nodeId, node] of graph.nodes) {
+              if (node.kind !== 'query') continue
+              const qp = node.payload as any
+              const tablesInQuery = [
+                qp.intent?.table,
+                ...(qp.intent?.joins?.map((j: any) => j.table) || [])
+              ]
+              if (!tablesInQuery.includes(edge.toTable)) continue
+
+              const columnDef = qp.intent?.columns?.find((c: any) =>
+                c.field === edge.toColumn &&
+                (c.table === edge.toTable || !c.table)
+              )
+
+              if (columnDef) {
+                columnAliases[col] = columnDef.alias || columnDef.field
+              } else {
+                // Auto-add to upstream query
+                qp.intent.columns = qp.intent.columns || []
+                qp.intent.columns.push({
+                  field: edge.toColumn,
+                  table: edge.toTable,
+                  alias: edge.toColumn,
+                  _autoInjected: true
+                })
+                columnAliases[col] = edge.toColumn
+              }
+              break
+            }
+            if (columnAliases[col]) break
+          }
+        }
+
+        // Try same-datasource FK resolution using schema.foreignKeys
+        const schemaFKs = (schemaToUse as any).foreignKeys || [];
+        const sameDSFK = schemaFKs.find((fk: any) =>
+          fk.fromTable === tableName && fk.fromColumn === col
+        );
+
+        if (sameDSFK) {
+          // Find the upstream QueryNode that fetches from sameDSFK.toTable
+          for (const [nodeId, node] of graph.nodes) {
+            if (node.kind !== 'query') continue;
+            const qp = node.payload as any;
+            const tablesInQuery = [
+              qp.intent?.table,
+              ...(qp.intent?.joins?.map((j: any) => j.table) || [])
+            ];
+
+            if (!tablesInQuery.includes(sameDSFK.toTable)) continue;
+
+            // Find the upstream field aliased from sameDSFK.toColumn in sameDSFK.toTable
+            const columnDef = qp.intent?.columns?.find((c: any) =>
+              c.field === sameDSFK.toColumn &&
+              (c.table === sameDSFK.toTable || !c.table)
+            );
+
+            if (columnDef) {
+              columnAliases[col] = columnDef.alias || columnDef.field;
+              console.log(
+                `[WriteEnrichment] SameDS FK alias: ${col} ← ${columnAliases[col]} (${sameDSFK.toTable}.${sameDSFK.toColumn})`
+              );
+            } else {
+              // Auto-add the referenced column to the upstream QueryNode
+              qp.intent.columns = qp.intent.columns || [];
+              qp.intent.columns.push({ field: sameDSFK.toColumn, table: sameDSFK.toTable, alias: sameDSFK.toColumn, _autoInjected: true });
+              columnAliases[col] = sameDSFK.toColumn;
+              console.log(`[WriteEnrichment] SameDS FK alias (auto-added): ${col} ← ${sameDSFK.toColumn}`);
+            }
+            break;
+          }
         }
       }
 
@@ -2499,39 +2652,50 @@ Return ONLY raw JSON.`;
       // Note: Final payload log moved to after DataSourceRouter sets correct datasource
       // (see enrichNodes loop below where writeConfig.datasource is set)
 
-      // Populate optionalFields - nullable columns without defaults that aren't already specified
-      const optionalFields: Array<{ column: string; type: string; nullable: boolean }> = [];
+      // Populate optionalFields - columns without defaults that aren't already specified
+      // Include both nullable and required columns so user can provide values for required fields
+      const optionalFields: Array<{ column: string; type: string; nullable: boolean; enumValues?: string[] }> = [];
       const specifiedColumns = new Set([
         ...mergedColumns,
         ...Object.keys(mergedStaticValues)
       ]);
       const autoManagedColumns = new Set(['id', 'created_at', 'updated_at', 'deleted_at']);
-      
+
       const tableDefForOptional = (schemaToUse as any).parsed.tables.get(tableName);
-      
+      const constraints = (schemaToUse as any).parsed?.constraints;
+
       if (tableDefForOptional) {
         for (const [colName, colDef] of tableDefForOptional.columns.entries()) {
           // Skip auto-managed columns
           if (autoManagedColumns.has(colName)) continue;
-          
+
           // Skip columns already specified in the intent
           if (specifiedColumns.has(colName)) continue;
-          
-          // Skip columns that are NOT nullable (required columns)
-          if (!colDef.nullable) continue;
-          
+
           // Skip columns with default values
           if (colDef.defaultRaw !== null) continue;
-          
-          // Add as optional field
+
+          // Check for enum constraint
+          const colKey = `${tableName}.${colName}`;
+          const constraint = constraints?.get(colKey);
+          let fieldType = colDef.type ?? 'TEXT';
+          let enumValues: string[] | undefined = undefined;
+
+          if (constraint?.typed?.kind === 'enum') {
+            fieldType = 'enum';
+            enumValues = constraint.typed.values.map((v: string) => v.toLowerCase());
+          }
+
+          // Add as optional field (both nullable and required columns)
           optionalFields.push({
             column: colName,
-            type: colDef.type ?? 'TEXT',
-            nullable: colDef.nullable
+            type: fieldType,
+            nullable: colDef.nullable,
+            enumValues
           });
         }
       }
-      
+
       // Set optionalFields on the step config for API response
       if (step.config) {
         (step.config as any).optionalFields = optionalFields;

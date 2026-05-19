@@ -31,8 +31,9 @@ export type PlanStep = {
 
 export type OptionalField = {
   column: string
-  type: 'text' | 'number' | 'date' | 'boolean' | 'integer'
+  type: 'text' | 'number' | 'date' | 'boolean' | 'integer' | 'enum'
   nullable: boolean
+  enumValues?: string[]
 }
 
 export type ResolvedField = {
@@ -47,11 +48,14 @@ export type Plan = {
   steps: PlanStep[]
   estimatedLLMCalls: number
   compilationErrors: CompilationError[]
+  params?: Record<string, string>
 }
 
 export type CompilationError = {
   code: string
   message: string
+  stepId?: string
+  missingColumns?: Array<{ column: string; nullable: boolean; description: string }>
 }
 
 export type ExecutionEvent =

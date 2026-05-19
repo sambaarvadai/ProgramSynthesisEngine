@@ -39,6 +39,7 @@ export interface PlanRequest {
 export interface ExecuteRequest {
   planId: string
   optionalValues?: Record<string, Record<string, any>>
+  params?: Record<string, any>
 }
 
 export interface OptionalFieldsUpdate {
@@ -56,6 +57,7 @@ export interface PlanStep {
     column: string
     type: string
     nullable: boolean
+    enumValues?: string[]
   }>
   resolvedFields?: Array<{
     column: string
@@ -70,6 +72,7 @@ export interface PlanResponse {
   steps: PlanStep[]
   estimatedLLMCalls: number
   compilationErrors: any[]
+  params?: Record<string, string>
 }
 
 // In-memory plan store with TTL

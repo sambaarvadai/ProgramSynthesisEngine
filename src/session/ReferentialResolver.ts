@@ -65,7 +65,12 @@ export function buildCursorSystemPromptFragment(cursor: SessionCursor): string {
     '',
     'If the user references this result with "this", "these", ' +
     '"it", "them", or "the [entity]", use the above context to ' +
-    'resolve the target. Use actual IDs or filter directly in the ' +
-    'plan — do NOT emit unresolved $param references.',
+    'resolve the target.',
+    '',
+    'IMPORTANT: When writing to a table that references the prior result:',
+    '- Use the resolved IDs or filter to query the upstream table',
+    '- Keep the foreign key column as a DYNAMIC column (in "columns"), NOT as a static value',
+    '- Do NOT hardcode the resolved ID in staticValues',
+    '- Example: If writing to projects with crm_opportunity_id, query opportunities table with the resolved ID, then map opportunity.id to crm_opportunity_id as a dynamic column',
   ].join('\n');
 }

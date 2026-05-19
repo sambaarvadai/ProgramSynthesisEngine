@@ -67,7 +67,7 @@ export const api = {
     return res.json()
   },
 
-  async executePlan(conversationId: string, planId: string, optionalValues: Record<string, Record<string, unknown>>) {
+  async executePlan(conversationId: string, planId: string, optionalValues: Record<string, Record<string, unknown>>, params?: Record<string, string>) {
     const res = await fetch(`${API_URL}/api/execute/${conversationId}/execute`, {
       method: 'POST',
       headers: {
@@ -75,7 +75,7 @@ export const api = {
         'Accept': 'application/json',
         ...getAuthHeaders()
       },
-      body: JSON.stringify({ planId, optionalValues })
+      body: JSON.stringify({ planId, optionalValues, params })
     })
     if (!res.ok) throw new Error('Failed to execute plan')
     return res.json()
@@ -83,11 +83,12 @@ export const api = {
 
   // Plans
   async updateOptionalFields(
+    conversationId: string,
     planId: string,
     stepId: string,
     values: Record<string, unknown>
   ): Promise<{ ok: boolean }> {
-    const res = await fetch(`${API_URL}/api/conversations/${planId}/plans/${planId}/optional-fields`, {
+    const res = await fetch(`${API_URL}/api/conversations/${conversationId}/plans/${planId}/optional-fields`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -96,6 +97,19 @@ export const api = {
       body: JSON.stringify({ stepId, values })
     })
     if (!res.ok) throw new Error('Failed to update optional fields')
+    return res.json()
+  },
+
+  // Cache
+  async clearCache(conversationId: string): Promise<{ success: boolean; clearedEntries: number }> {
+    const res = await fetch(`${API_URL}/api/execute/${conversationId}/clear-cache`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders()
+      }
+    })
+    if (!res.ok) throw new Error('Failed to clear cache')
     return res.json()
   },
 

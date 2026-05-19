@@ -7,7 +7,6 @@ import { useExecutionStore } from '@/store/execution'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { StepBadge } from './step-badge'
-import { api } from '@/lib/api'
 
 interface PlanCardProps {
   plan: Plan
@@ -15,38 +14,11 @@ interface PlanCardProps {
 
 export function PlanCard({ plan }: PlanCardProps) {
   const setCurrentPlan = useConversationStore((state) => state.setCurrentPlan)
-  const addMessage = useConversationStore((state) => state.addMessage)
-  const activeConversationId = useConversationStore((state) => state.activeConversationId)
-  const startExecution = useExecutionStore((state) => state.startExecution)
-  const stopExecution = useExecutionStore((state) => state.stopExecution)
-  const setPipelineResult = useExecutionStore((state) => state.setPipelineResult)
-  const [isExecuting, setIsExecuting] = useState(false)
+  const setActiveTab = useExecutionStore((state) => state.setActiveTab)
 
-  const handleConfirm = async () => {
-    if (!activeConversationId) return
-
-    setIsExecuting(true)
-    try {
-      startExecution()
-      const result = await api.executePlan(activeConversationId, plan.planId, {})
-      setPipelineResult(result.output)
-      
-      // Add execution description as a chat message
-      if (result.description) {
-        addMessage({
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content: result.description,
-          timestamp: new Date().toISOString()
-        })
-      }
-    } catch (error) {
-      console.error('Execution error:', error)
-    } finally {
-      stopExecution()
-      setIsExecuting(false)
-      setCurrentPlan(null)
-    }
+  const handleConfirm = () => {
+    useConversationStore.getState().confirmPlan()
+    setActiveTab('form')
   }
 
   const handleRefine = () => {
@@ -61,6 +33,7 @@ export function PlanCard({ plan }: PlanCardProps) {
   const hasOptionalFields = plan.steps.some(
     (step) => step.optionalFields && step.optionalFields.length > 0
   )
+  const hasCompilationErrors = plan.compilationErrors && plan.compilationErrors.length > 0
 
   return (
     <Card className="border-blue-200 bg-blue-50">
@@ -69,7 +42,7 @@ export function PlanCard({ plan }: PlanCardProps) {
       </CardHeader>
       <CardContent className="space-y-4">
         <p className="text-sm text-gray-700">{plan.description}</p>
-        
+
         <div className="space-y-2">
           <h4 className="text-sm font-medium">Steps</h4>
           {plan.steps.map((step) => (
@@ -80,7 +53,7 @@ export function PlanCard({ plan }: PlanCardProps) {
           ))}
         </div>
 
-        {plan.compilationErrors.length > 0 && (
+        {hasCompilationErrors && (
           <div className="text-sm text-red-600">
             <p className="font-medium">Compilation Errors:</p>
             {plan.compilationErrors.map((error, i) => (
@@ -90,11 +63,8 @@ export function PlanCard({ plan }: PlanCardProps) {
         )}
 
         <div className="flex gap-2 pt-2">
-          <Button onClick={handleConfirm} size="sm" disabled={isExecuting}>
-            {isExecuting && (
-              <div className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
-            )}
-            {isExecuting ? 'Executing...' : hasOptionalFields ? 'Configure' : 'Execute'}
+          <Button onClick={handleConfirm} size="sm">
+            {hasOptionalFields || hasCompilationErrors ? 'Configure' : 'Execute'}
           </Button>
           <Button onClick={handleRefine} variant="outline" size="sm">
             Refine

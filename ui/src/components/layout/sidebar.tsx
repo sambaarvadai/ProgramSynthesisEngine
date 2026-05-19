@@ -2,7 +2,7 @@
 
 import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
-import { Plus } from 'lucide-react'
+import { Plus, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useConversationStore } from '@/store/conversation'
 import { useExecutionStore } from '@/store/execution'
@@ -13,7 +13,7 @@ interface SidebarProps {
 
 export function Sidebar({ activeId }: SidebarProps) {
   const router = useRouter()
-  const { setActiveConversation, activeWorkspaceId } = useConversationStore()
+  const { setActiveConversation, activeWorkspaceId, activeConversationId } = useConversationStore()
 
   const handleNewConversation = async () => {
     try {
@@ -30,12 +30,30 @@ export function Sidebar({ activeId }: SidebarProps) {
     }
   }
 
+  const handleClearCache = async () => {
+    if (!activeConversationId) return
+    try {
+      const response = await api.clearCache(activeConversationId)
+      if (response.success) {
+        console.log(`Cleared ${response.clearedEntries} cache entries`)
+        alert(`Cleared ${response.clearedEntries} cache entries`)
+      }
+    } catch (error) {
+      console.error('Failed to clear cache:', error)
+      alert('Failed to clear cache')
+    }
+  }
+
   return (
     <div className="border-r bg-gray-50 flex flex-col">
-      <div className="p-3 border-b">
+      <div className="p-3 border-b space-y-2">
         <Button className="w-full justify-start" size="sm" onClick={handleNewConversation}>
           <Plus className="mr-2 h-4 w-4" />
           New Conversation
+        </Button>
+        <Button className="w-full justify-start" size="sm" variant="outline" onClick={handleClearCache}>
+          <Trash2 className="mr-2 h-4 w-4" />
+          Clear Cache
         </Button>
       </div>
       <div className="flex-1 overflow-y-auto p-2">

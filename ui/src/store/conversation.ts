@@ -6,6 +6,7 @@ interface ConversationStore {
   activeWorkspaceId: string | null
   messages: Message[]
   currentPlan: Plan | null
+  lastPlan: Plan | null
   planningStage: string | null
   isPlanning: boolean
   sessionCursor: string | null
@@ -28,6 +29,7 @@ export const useConversationStore = create<ConversationStore>((set) => ({
   activeWorkspaceId: null,
   messages: [],
   currentPlan: null,
+  lastPlan: null,
   planningStage: null,
   isPlanning: false,
   sessionCursor: null,
@@ -36,8 +38,15 @@ export const useConversationStore = create<ConversationStore>((set) => ({
   setActiveConversation: (id) => set({ activeConversationId: id }),
   setActiveWorkspace: (id) => set({ activeWorkspaceId: id }),
   clearMessages: () => set({ messages: [] }),
-  addMessage: (msg) => set((state) => ({ messages: [...state.messages, msg] })),
-  setCurrentPlan: (plan) => set({ currentPlan: plan }),
+  addMessage: (msg) => set((state) => ({
+    messages: [...state.messages, msg],
+    // Clear plan when user sends a new message to prevent showing stale plan from previous turn
+    ...(msg.role === 'user' ? { currentPlan: null } : {})
+  })),
+  setCurrentPlan: (plan) => set((state) => ({ 
+    currentPlan: plan,
+    ...(plan ? { lastPlan: plan } : {})
+  })),
   setPlanningStage: (stage) => set({ planningStage: stage }),
   setIsPlanning: (v) => set({ isPlanning: v }),
   setSessionCursor: (cursor) => set({ sessionCursor: cursor }),

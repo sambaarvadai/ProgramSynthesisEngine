@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect } from 'react'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Button } from '@/components/ui/button'
 import { OptionalForm } from './optional-form'
 import { ResolvedFields } from './resolved-fields'
 import { PreviewTab } from './preview-tab'
@@ -15,6 +15,7 @@ export function ContentPane() {
   const pipelineResult = useExecutionStore((state) => state.pipelineResult)
   const lastCreatedRow = useExecutionStore((state) => state.lastCreatedRow)
   const currentPlan = useConversationStore((state) => state.currentPlan)
+  const pendingConfirmation = useConversationStore((state) => state.pendingConfirmation)
 
   useEffect(() => {
     // Auto-switch to preview tab when results are available
@@ -30,26 +31,43 @@ export function ContentPane() {
     }
   }, [currentPlan, setActiveTab])
 
+  useEffect(() => {
+    // Auto-switch to form tab when pendingConfirmation becomes true
+    if (pendingConfirmation) {
+      setActiveTab('form')
+    }
+  }, [pendingConfirmation, setActiveTab])
+
   return (
-    <div className="border-l bg-white flex flex-col flex-1 min-w-0">
-      <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col">
-        <div className="border-b">
-          <TabsList className="w-full justify-start rounded-none h-12 px-2">
-            <TabsTrigger value="form">Form</TabsTrigger>
-            <TabsTrigger value="preview">Preview</TabsTrigger>
-            <TabsTrigger value="plan">Plan</TabsTrigger>
-          </TabsList>
-        </div>
-        <TabsContent value="form" className="flex-1 overflow-y-auto m-0">
-          <OptionalForm />
-        </TabsContent>
-        <TabsContent value="preview" className="flex-1 overflow-y-auto m-0">
-          <PreviewTab />
-        </TabsContent>
-        <TabsContent value="plan" className="flex-1 overflow-y-auto m-0">
-          <PlanTab />
-        </TabsContent>
-      </Tabs>
+    <div className="border-l bg-white flex flex-col h-full overflow-hidden">
+      <div className="border-b flex-shrink-0 h-12 flex items-center px-2 gap-2">
+        <Button
+          variant={activeTab === 'form' ? 'default' : 'ghost'}
+          size="sm"
+          onClick={() => setActiveTab('form')}
+        >
+          Form
+        </Button>
+        <Button
+          variant={activeTab === 'preview' ? 'default' : 'ghost'}
+          size="sm"
+          onClick={() => setActiveTab('preview')}
+        >
+          Preview
+        </Button>
+        <Button
+          variant={activeTab === 'plan' ? 'default' : 'ghost'}
+          size="sm"
+          onClick={() => setActiveTab('plan')}
+        >
+          Plan
+        </Button>
+      </div>
+      <div className="flex-1 overflow-y-auto min-h-0">
+        {activeTab === 'form' && <OptionalForm />}
+        {activeTab === 'preview' && <PreviewTab />}
+        {activeTab === 'plan' && <PlanTab />}
+      </div>
     </div>
   )
 }

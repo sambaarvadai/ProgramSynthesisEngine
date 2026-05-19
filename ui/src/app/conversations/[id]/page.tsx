@@ -22,7 +22,7 @@ export default function ConversationPage({ params }: ConversationPageProps) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated)
   const setActiveConversation = useConversationStore((state) => state.setActiveConversation)
   
-  const [chatWidth, setChatWidth] = useState(400)
+  const [chatWidth, setChatWidth] = useState(500)
   const [isResizing, setIsResizing] = useState(false)
   const chatPanelRef = useRef<HTMLDivElement>(null)
 
@@ -66,7 +66,7 @@ export default function ConversationPage({ params }: ConversationPageProps) {
       const containerRect = chatPanelRef.current.parentElement?.getBoundingClientRect()
       if (!containerRect) return
       
-      const newWidth = e.clientX - containerRect.left - 260 // Subtract sidebar width
+      const newWidth = e.clientX - containerRect.left - 240 // Subtract sidebar width
       if (newWidth >= 300 && newWidth <= 800) {
         setChatWidth(newWidth)
       }
@@ -89,12 +89,12 @@ export default function ConversationPage({ params }: ConversationPageProps) {
 
   return (
     <Shell>
-      <div className="w-[260px] flex-shrink-0">
+      <div className="w-[240px] flex-shrink-0">
         <Sidebar activeId={id} />
       </div>
-      <div 
+      <div
         ref={chatPanelRef}
-        className="flex flex-col border-r min-w-0 relative"
+        className="flex flex-col border-r min-w-0 relative p-4 flex-shrink-0"
         style={{ width: `${chatWidth}px` }}
       >
         <MessageThread />
@@ -104,7 +104,9 @@ export default function ConversationPage({ params }: ConversationPageProps) {
           onMouseDown={handleMouseDown}
         />
       </div>
-      <ContentPane />
+      <div className="flex-1 min-w-0">
+        <ContentPane />
+      </div>
     </Shell>
   )
 }

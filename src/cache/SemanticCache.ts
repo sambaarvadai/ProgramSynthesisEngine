@@ -3,6 +3,7 @@ import { VoyageClient } from './VoyageClient.js';
 import { serializePlan, deserializePlan } from './PlanSerializer.js';
 import type { PipelineIntent } from '../compiler/pipeline/pipeline-intent.js';
 import type { PlanResult } from '../pipeline-engine.js';
+import type { PipelineGraph } from '../core/graph/index.js';
 
 export interface CacheHit {
   intent: PipelineIntent;
@@ -18,6 +19,58 @@ export interface CacheConfig {
   enabled: boolean;
   workspaceId: number;
   sourceType: string;   // e.g. 'crm', 'api', 'file'
+}
+
+/**
+ * Strip execution-time values from a pipeline graph before caching.
+ * This ensures cached plans store only structure, not user-entered values.
+ */
+function stripExecutionValues(graph: PipelineGraph): PipelineGraph {
+  // Deep clone to avoid mutating the original graph
+  // Convert Maps to plain objects for JSON serialization, then convert back
+  const serialized = JSON.stringify(graph, (key, value) => {
+    if (value instanceof Map) {
+      return { __type: 'Map', value: Array.from(value.entries()) };
+    }
+    return value;
+  });
+
+  const stripped = JSON.parse(serialized, (key, value) => {
+    if (value && value.__type === 'Map') {
+      return new Map(value.value);
+    }
+    return value;
+  });
+
+  // Now strip execution values from the cloned graph
+  for (const [nodeId, node] of stripped.nodes.entries()) {
+    const typedNode = node as any;
+    if (typedNode.kind === 'write') {
+      const payload = typedNode.payload as any;
+      // Strip user-entered values — keep only structure
+      payload.staticValues = {};
+      payload.columnAliases = undefined;
+      // Keep structural fields
+      // payload.upstreamTables = payload.upstreamTables;
+      // payload.columns = payload.columns;
+      // payload.mode = payload.mode;
+      // payload.table = payload.table;
+    }
+
+    if (typedNode.kind === 'query') {
+      const payload = typedNode.payload as any;
+      // Strip auto-added columns that were injected for FK alias resolution
+      // Keep the original intent columns — those come from the LLM
+      // Only strip columns where _autoInjected flag is present
+      if (payload.intent?.columns) {
+        payload.intent.columns = payload.intent.columns.filter(
+          (col: any) => !col._autoInjected
+        );
+      }
+    }
+  }
+
+  return stripped;
 }
 
 export class SemanticCache {
@@ -136,7 +189,10 @@ export class SemanticCache {
     try {
       const embedding = await this.voyage.embed(nlInput);
       const vectorStr = `[${embedding.join(',')}]`;
-      const serialized = serializePlan(plan);
+      // Strip execution values before storing in cache
+      const strippedGraph = stripExecutionValues(plan.graph);
+      const planToStore = { ...plan, graph: strippedGraph };
+      const serialized = serializePlan(planToStore);
 
       console.debug('[SemanticCache] Serialized plan size:', JSON.stringify(serialized).length);
       console.debug('[SemanticCache] plan_json will be stored');

@@ -44,8 +44,32 @@ async function handlePlanJson(req: Request, res: Response) {
       const cacheHit = await services.semanticCache.lookup(message)
       if (cacheHit) {
         console.log('[API] Cache HIT for plan generation')
-        planResult = cacheHit.plan
-        isCacheHit = true
+        // Re-enrich the cached plan for the current session
+        // This ensures session-scoped values and FK aliases are resolved for the current user/workspace
+        try {
+          const userId = services.sessionManager.getUserId()
+          const schema = services.pipelineEngine['config'].schema
+          if (!schema) {
+            throw new Error('Schema not configured')
+          }
+          // Re-enrich nodes to resolve session-scoped values and FK aliases
+          // enrichNodes mutates the graph in place and returns a fieldMap
+          await services.pipelineEngine['enrichNodes'](
+            cacheHit.plan.graph,
+            cacheHit.intent,
+            schema,
+            userId,
+            services.pipelineEngine['config'].multiSchema
+          )
+          planResult = cacheHit.plan
+          isCacheHit = true
+        } catch (e) {
+          console.warn('[API] Cache re-enrichment failed, falling through to full plan generation:', e)
+          // Fall through to full plan generation if re-enrichment fails
+          planResult = await services.pipelineEngine.plan(message, {
+            sessionHistory: services.sessionManager.getHistory(),
+          })
+        }
       } else {
         console.log('[API] Cache MISS, generating new plan')
         // Plan the pipeline
@@ -61,17 +85,6 @@ async function handlePlanJson(req: Request, res: Response) {
       })
     }
     console.log('[API] Plan result received:', planResult)
-
-    if (planResult.compilationErrors.length > 0) {
-      res.status(400).json({
-        error: {
-          code: 'COMPILATION_ERROR',
-          message: 'Plan compilation failed',
-          errors: planResult.compilationErrors,
-        },
-      })
-      return
-    }
 
     // Convert to API response format
     const planId = crypto.randomUUID()
@@ -93,7 +106,42 @@ async function handlePlanJson(req: Request, res: Response) {
       description: planResult.intent.description,
       steps,
       estimatedLLMCalls: 0,
-      compilationErrors: [],
+      compilationErrors: planResult.compilationErrors.map(err => ({
+        code: err.code,
+        message: err.message,
+        stepId: err.stepId,
+        missingColumns: err.missingColumns?.map(col => {
+          // Handle different shapes of missingColumns
+          if ('column' in col && 'nullable' in col) {
+            return {
+              column: col.column,
+              nullable: col.nullable ?? true,
+              description: col.description || `Required field for ${err.stepId}`
+            }
+          } else if ('column' in col) {
+            // WRITE_FIELD_UNRESOLVABLE format
+            return {
+              column: col.column,
+              nullable: true,
+              description: (col as any).suggestion || `Required field for ${err.stepId}`
+            }
+          } else if ('name' in col) {
+            // Alternative format with 'name' instead of 'column'
+            return {
+              column: col.name,
+              nullable: (col as any).required !== true,
+              description: `Required field for ${err.stepId}`
+            }
+          }
+          // Fallback
+          return {
+            column: String(col),
+            nullable: true,
+            description: `Required field for ${err.stepId}`
+          }
+        }) ?? []
+      })),
+      params: planResult.intent.params,
     }
 
     // Store the plan for execution
@@ -145,7 +193,7 @@ async function handleExecuteJson(req: Request, res: Response) {
     return
   }
 
-  const { planId, optionalValues } = req.body as ExecuteRequest
+  const { planId, optionalValues, params } = req.body as ExecuteRequest
   if (!planId) {
     res.status(400).json({
       error: {
@@ -171,7 +219,7 @@ async function handleExecuteJson(req: Request, res: Response) {
     console.log('[API] Starting pipeline execution')
     const startTime = Date.now()
 
-    const result = await services.pipelineEngine.execute(stored.plan, undefined)
+    const result = await services.pipelineEngine.execute(stored.plan, params || {})
 
     const durationMs = Date.now() - startTime
     console.log('[API] Pipeline execution complete, duration:', durationMs)
@@ -324,8 +372,28 @@ export function executeRoutes(): Router {
           const cacheHit = await semanticCache.lookup(message)
           if (cacheHit) {
             console.log('[API] Cache HIT for plan generation (SSE)')
-            planResult = cacheHit.plan
-            isCacheHit = true
+            // Re-enrich the cached plan for the current session
+            try {
+              const userId = sessionManager.getUserId()
+              const schema = pipelineEngine['config'].schema
+              if (!schema) {
+                throw new Error('Schema not configured')
+              }
+              // Re-enrich nodes to resolve session-scoped values and FK aliases
+              await pipelineEngine['enrichNodes'](
+                cacheHit.plan.graph,
+                cacheHit.intent,
+                schema,
+                userId,
+                pipelineEngine['config'].multiSchema
+              )
+              planResult = cacheHit.plan
+              isCacheHit = true
+            } catch (e) {
+              console.warn('[API] Cache re-enrichment failed (SSE), falling through to full plan generation:', e)
+              // Fall through to full plan generation if re-enrichment fails
+              planResult = null
+            }
           } else {
             console.log('[API] Cache MISS, generating new plan (SSE)')
           }
@@ -344,22 +412,6 @@ export function executeRoutes(): Router {
           })
         }
         console.log('[API] Plan result received:', planResult)
-
-        if (planResult.compilationErrors.length > 0) {
-          console.log('[API] Compilation errors:', planResult.compilationErrors)
-          const planId = crypto.randomUUID()
-          // Store the plan even with compilation errors so it can be re-configured
-          storePlan(planId, planResult.graph, planResult)
-          sseWrite(res, 'plan', {
-            planId,
-            description: planResult.intent.description,
-            steps: [],
-            estimatedLLMCalls: 0,
-            compilationErrors: planResult.compilationErrors,
-          })
-          sseDone(res)
-          return
-        }
 
         // Convert to API response format
         console.log('[API] Converting plan to response format')
@@ -382,7 +434,42 @@ export function executeRoutes(): Router {
           description: planResult.intent.description,
           steps,
           estimatedLLMCalls: 0,
-          compilationErrors: [],
+          compilationErrors: planResult.compilationErrors.map(err => ({
+            code: err.code,
+            message: err.message,
+            stepId: err.stepId,
+            missingColumns: err.missingColumns?.map(col => {
+              // Handle different shapes of missingColumns
+              if ('column' in col && 'nullable' in col) {
+                return {
+                  column: col.column,
+                  nullable: col.nullable ?? true,
+                  description: col.description || `Required field for ${err.stepId}`
+                }
+              } else if ('column' in col) {
+                // WRITE_FIELD_UNRESOLVABLE format
+                return {
+                  column: col.column,
+                  nullable: true,
+                  description: (col as any).suggestion || `Required field for ${err.stepId}`
+                }
+              } else if ('name' in col) {
+                // Alternative format with 'name' instead of 'column'
+                return {
+                  column: col.name,
+                  nullable: (col as any).required !== true,
+                  description: `Required field for ${err.stepId}`
+                }
+              }
+              // Fallback
+              return {
+                column: String(col),
+                nullable: true,
+                description: `Required field for ${err.stepId}`
+              }
+            }) ?? []
+          })),
+          params: planResult.intent.params,
         }
 
         console.log('[API] Plan response:', planResponse)
@@ -452,7 +539,7 @@ export function executeRoutes(): Router {
       return
     }
 
-    const { planId, optionalValues } = req.body as ExecuteRequest
+    const { planId, optionalValues, params } = req.body as ExecuteRequest
     if (!planId) {
       console.log('[API] ERROR: planId is required')
       res.status(400).json({
@@ -501,7 +588,7 @@ export function executeRoutes(): Router {
         const { pipelineEngine, semanticCache } = services!
         const startTime = Date.now()
 
-        const result = await pipelineEngine.execute(stored.plan, undefined)
+        const result = await pipelineEngine.execute(stored.plan, params || {})
 
         const durationMs = Date.now() - startTime
         console.log('[API] Pipeline execution complete, duration:', durationMs)
@@ -549,6 +636,48 @@ export function executeRoutes(): Router {
         sseDone(res)
       }
     })()
+  })
+
+  // POST /api/execute/:conversationId/clear-cache - Clear semantic cache
+  router.post('/:conversationId/clear-cache', async (req: Request, res: Response) => {
+    console.log('[API] POST /api/execute/:conversationId/clear-cache called')
+
+    if (!services) {
+      res.status(500).json({
+        error: {
+          code: 'SERVICES_NOT_INITIALIZED',
+          message: 'Services not initialized',
+        },
+      })
+      return
+    }
+
+    if (!services.semanticCache) {
+      res.status(503).json({
+        error: {
+          code: 'CACHE_NOT_AVAILABLE',
+          message: 'Semantic cache not available',
+        },
+      })
+      return
+    }
+
+    try {
+      const count = await services.semanticCache.invalidateAll('Manual cache clear requested by user')
+      console.log(`[API] Cleared ${count} cache entries`)
+      res.json({
+        success: true,
+        clearedEntries: count,
+      })
+    } catch (error) {
+      console.error('[API] Clear cache error:', error)
+      res.status(500).json({
+        error: {
+          code: 'CLEAR_CACHE_ERROR',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        },
+      })
+    }
   })
 
   return router

@@ -432,10 +432,13 @@ export function createWriteNodeDefinition(
         })
         
         console.log('WriteNode Debug - resolvedRows (first 2):', JSON.stringify(resolvedRows.slice(0, 2), null, 2))
-        
+
+        // Normalize enum values to lowercase to match CHECK constraints
+        const normalizedPayload = normalizeEnumValues(payload, targetSchema)
+
         // Use resolved rows for insertion
         const { dataRows, effectiveColumns } = prepareRows(resolvedRows, {
-          ...payload,
+          ...normalizedPayload,
           columns: Object.keys(fields)
         })
         
@@ -499,24 +502,22 @@ export function createWriteNodeDefinition(
         }
         
         // For UPDATE/DELETE operations, return summary result instead of input rows
-        if (payload.mode === 'update' || payload.mode === 'delete') {
           console.log(`[WriteNode] Template execution returning summary for ${payload.mode}`);
           return createWriteSummaryResult(payload.table, payload.mode, 0, payload.staticWhere, payload.staticValues)
         }
         
-        console.log(`[WriteNode] Execution completed, returning input`);
-        return input
-      }
+        // Normalize enum values to lowercase to match CHECK constraints
+        const normalizedPayload = normalizeEnumValues(payload, targetSchema)
 
-      // Fallback to original logic for non-template cases
-      console.log(`[WriteNode] Using fallback execution path (no template fields)`);
-      // Validate and normalise columns present in actual rows
-      const { dataRows, effectiveColumns, dynamicColumns } = prepareRows(inputRows, payload)
-      console.log(`[WriteNode] Fallback - effectiveColumns: ${effectiveColumns.length}, dynamicColumns: ${dynamicColumns.length}, dataRows: ${dataRows.length}`);
+        // Fallback to original logic for non-template cases
+        console.log(`[WriteNode] Using fallback execution path (no template fields)`);
+        // Validate and normalise columns present in actual rows
+        const { dataRows, effectiveColumns, dynamicColumns } = prepareRows(inputRows, normalizedPayload)
+        console.log(`[WriteNode] Fallback - effectiveColumns: ${effectiveColumns.length}, dynamicColumns: ${dynamicColumns.length}, dataRows: ${dataRows.length}`);
 
-      // Row-driven bulk UPDATE path
-      // Fires when whereColumns specifies which upstream field to use as WHERE
-      // and inputRows contains the actual values for that field
+        // Row-driven bulk UPDATE path
+        // Fires when whereColumns specifies which upstream field to use as WHERE
+        // and inputRows contains the actual values for that field
 
       const whereCol = payload.whereColumns?.[0];
       const hasRowDrivenWhere =
@@ -858,6 +859,36 @@ function createWriteSummaryResult(
       rows: [resultRow]
     },
     schema
+  }
+}
+
+function normalizeEnumValues(
+  payload: WritePayload,
+  targetSchema: any
+): WritePayload {
+  const constraints = (targetSchema as any).parsed?.constraints
+  if (!constraints) return payload
+
+  const normalizedStaticValues: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(payload.staticValues ?? {})) {
+    const colKey = `${payload.table}.${key}`
+    const constraint = constraints.get(colKey)
+    if (constraint?.typed?.kind === 'enum' && typeof value === 'string') {
+      const normalized = value.toLowerCase()
+      const validValues = constraint.typed.values ?? []
+      if (validValues.length > 0 && validValues.includes(normalized)) {
+        normalizedStaticValues[key] = normalized
+      } else {
+        normalizedStaticValues[key] = value
+      }
+    } else {
+      normalizedStaticValues[key] = value
+    }
+  }
+
+  return {
+    ...payload,
+    staticValues: normalizedStaticValues
   }
 }
 
